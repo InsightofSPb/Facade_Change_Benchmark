@@ -1,0 +1,7 @@
+{
+  "asset_roots": [
+    {"name": "LPOSS", "path": "/home/sasha/LPOSS", "max_depth": 5, "max_entries": 20000},
+    {"name": "Semantic_Change_Detection_Comparison", "path": "/home/sasha/Semantic_Change_Detection_Comparison", "max_depth": 5, "max_entries": 20000}
+  ],
+  "asset_metadata": []
+}

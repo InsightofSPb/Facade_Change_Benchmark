@@ -28,7 +28,7 @@ def select_pair(manifest, reference_id, source_id, allow_inferred=False):
         if row["image_status"] != "ready":
             raise ValueError(f"Image {row['image_id']} is {row['image_status']}")
         if row["metadata_status"] != "reviewed" and not allow_inferred:
-            raise ValueError("Review this pair in metadata_review.csv, rebuild with --overrides; or explicitly allow inferred metadata")
+            raise ValueError("Review this pair in metadata_review.csv and use prepare --overrides; or explicitly allow inferred metadata")
         if row.get("year") is None or not row.get("view_id"):
             raise ValueError("Pair requires known year and view_id, even with --allow-inferred-metadata")
     if reference["view_id"] != source["view_id"]:
@@ -65,6 +65,9 @@ def save_diagnostics(out: Path, warped: dict, alignment, canvas) -> dict:
     # Preview downscaling is separate from native scientific arrays.
     yy, xx = np.ogrid[:canvas.height, :canvas.width]
     checker = np.where(((xx // 128 % 2) == (yy // 128 % 2))[..., None], warped["reference"], warped["source"])
+    checker[warped["reference_only"]] = warped["reference"][warped["reference_only"]]
+    checker[warped["source_only"]] = warped["source"][warped["source_only"]]
+    checker[~(warped["reference_support"] | warped["source_support"])] = 40
     preview = Image.fromarray(checker)
     preview.thumbnail((1400, 1000))
     preview.save(out / "checkerboard_preview.jpg", quality=92)
@@ -105,11 +108,14 @@ def save_diagnostics(out: Path, warped: dict, alignment, canvas) -> dict:
                "mean_rgb_difference_on_overlap": mean_difference,
                "interpretation": "Alignment diagnostics only; no damage labels, F1 or AP"}
     write_json(out / "diagnostics.json", metrics)
-    figures = [("Наложение, только пересечение", "overlay_preview.jpg"),
+    figures = [("Исходная опора", "original_reference_preview.jpg"),
+               ("Исходный поздний кадр", "original_source_preview.jpg"),
+               ("Наложение, только пересечение", "overlay_preview.jpg"),
                ("Шахматное совмещение", "checkerboard_preview.jpg"),
                ("Абсолютная RGB-разность", "residual_preview.jpg")]
     figures += [("Деталь: опора / поздний кадр / разность; исходный масштаб", name) for name in detail_files]
-    markup = "".join(f'<figure><figcaption>{html.escape(title)}</figcaption><img src="{name}"></figure>' for title, name in figures)
+    markup = "".join(f'<figure><figcaption>{html.escape(title)}</figcaption><img src="{name}"></figure>'
+                     for title, name in figures if (out / name).is_file())
     (out / "gallery.html").write_text(
         '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Проверка совмещения</title>'
         '<style>body{font:16px system-ui;max-width:1500px;margin:32px auto;padding:16px;background:#f4f4f4}'
@@ -123,26 +129,54 @@ def save_diagnostics(out: Path, warped: dict, alignment, canvas) -> dict:
         f"Matches/inliers: {metrics['matches']}/{metrics['inliers']}\n"
         f"Median inlier reprojection error (native ref pixels): {metrics['inlier_reprojection_median_px']:.4f}\n"
         f"Overlap pixels: {count}\nNew geometric support: {metrics['source_only_pixels']} pixels\n"
-        "Status: needs_visual_review. RGB difference is not a damage mask.\n"
+        f"Routing gate: {'passed' if metrics.get('quality_gate', {}).get('passed', True) else 'rejected'}; "
+        "visual review required. RGB difference is not a damage mask.\n"
         "Gallery: gallery.html; numerical diagnostics: diagnostics.json; provenance: run.json\n", encoding="utf-8")
     return metrics
+
+
+def alignment_quality(result, warped, min_inliers=30, min_inlier_ratio=.2,
+                      min_hull_fraction=.1, min_overlap_fraction=.2):
+    """Explicit routing heuristics; passing them does not certify dense alignment."""
+    diagnostics = result.diagnostics
+    overlap = int(warped["overlap"].sum()) / max(1, int(warped["reference_support"].sum()))
+    checks = {"inliers": (diagnostics["inliers"], min_inliers),
+              "inlier_ratio": (diagnostics["inlier_ratio"], min_inlier_ratio),
+              "source_inlier_hull_fraction": (diagnostics["source_inlier_hull_fraction"], min_hull_fraction),
+              "reference_inlier_hull_fraction": (diagnostics["reference_inlier_hull_fraction"], min_hull_fraction),
+              "overlap_fraction": (overlap, min_overlap_fraction)}
+    reasons = [f"{name}={value:.4g} below {threshold:.4g}"
+               for name, (value, threshold) in checks.items() if value < threshold]
+    return {"passed": not reasons, "reasons": reasons,
+            "interpretation": "Routing heuristic only; visual review and physical visibility remain unresolved"}
 
 
 def run_pair(manifest_path, reference_id, source_id, out, method="sift", checkpoint=None,
              device="cpu", max_side=1024, ransac_threshold=3., confidence=.4,
              seed=42, max_canvas_pixels=50_000_000, max_canvas_side=16000,
-             allow_inferred_metadata=False) -> dict:
+             allow_inferred_metadata=False, trust_checkpoint=False, download_weights=False,
+             min_inliers=30, min_inlier_ratio=.2, min_hull_fraction=.1,
+             min_overlap_fraction=.2, matchers=None) -> dict:
     config = {"manifest_path": str(Path(manifest_path).resolve()), "manifest_sha256": sha256(manifest_path),
               "reference_id": str(reference_id), "source_id": str(source_id), "method": method,
-              "checkpoint": str(Path(checkpoint).resolve()) if checkpoint else None, "device": device,
+              "checkpoint": str(Path(checkpoint).expanduser().resolve()) if checkpoint not in (None, "auto") else "auto",
+              "device": device, "trust_checkpoint": trust_checkpoint, "download_weights": download_weights,
               "max_side": max_side, "ransac_threshold": ransac_threshold, "confidence": confidence,
               "seed": seed, "max_canvas_pixels": max_canvas_pixels, "max_canvas_side": max_canvas_side,
-              "allow_inferred_metadata": allow_inferred_metadata}
+              "allow_inferred_metadata": allow_inferred_metadata,
+              "quality_thresholds": {"min_inliers": min_inliers, "min_inlier_ratio": min_inlier_ratio,
+                                     "min_hull_fraction": min_hull_fraction,
+                                     "min_overlap_fraction": min_overlap_fraction}}
     out = new_directory(out)
     record = run_record("pair_alignment", config)
     write_json(out / "run.json", record)
     start = time.monotonic()
     try:
+        if method not in {"sift", "loftr", "cascade"}:
+            raise ValueError(f"Unsupported method {method}")
+        if min_inliers < 4 or any(not 0 <= value <= 1 for value in
+                                 (min_inlier_ratio, min_hull_fraction, min_overlap_fraction)):
+            raise ValueError("Quality gates require min_inliers >=4 and fractions in [0,1]")
         manifest = read_json(manifest_path)
         reference, source = select_pair(manifest, reference_id, source_id, allow_inferred_metadata)
         record["observations"] = {"reference": reference, "source": source}
@@ -156,22 +190,57 @@ def run_pair(manifest_path, reference_id, source_id, out, method="sift", checkpo
             if rgb.shape[:2] != (row["height"], row["width"]):
                 raise ValueError("Decoded dimensions differ from manifest")
             arrays.extend([rgb, opaque])
-        if method == "sift":
-            matcher = SIFTMatcher()
-        elif method == "loftr":
-            matcher = LoFTRMatcher(checkpoint, device, confidence)
-        else:
-            raise ValueError(f"Unsupported method {method}")
-        result = align(*arrays, matcher, max_side, ransac_threshold, seed)
+        for label, array in (("reference", arrays[0]), ("source", arrays[2])):
+            preview = Image.fromarray(array)
+            preview.thumbnail((1000, 1000))
+            preview.save(out / f"original_{label}_preview.jpg", quality=92)
+        matchers = {} if matchers is None else matchers
+        attempts = []
+        chosen = None
+        for candidate in (("sift", "loftr") if method == "cascade" else (method,)):
+            print(f"  Matching {candidate}: {reference_id} -> {source_id}", flush=True)
+            try:
+                if candidate not in matchers:
+                    matchers[candidate] = SIFTMatcher() if candidate == "sift" else LoFTRMatcher(
+                        checkpoint, device, confidence, trust_checkpoint=trust_checkpoint,
+                        download_weights=download_weights)
+                result = align(*arrays, matchers[candidate], max_side, ransac_threshold, seed)
+                canvas = expanded_canvas(arrays[0].shape, arrays[2].shape, result.source_to_reference,
+                                         max_canvas_pixels, max_canvas_side)
+                warped = warp_pair(*arrays, canvas)
+                if not warped["overlap"].any():
+                    raise ValueError("No fully supported geometric overlap")
+                quality = alignment_quality(result, warped, min_inliers, min_inlier_ratio,
+                                            min_hull_fraction, min_overlap_fraction)
+                attempts.append({"method": candidate, "status": "completed", "quality": quality,
+                                 "diagnostics": dict(result.diagnostics),
+                                 "source_to_reference": result.source_to_reference.tolist()})
+                chosen = (candidate, result, canvas, warped, quality)
+                if quality["passed"] or method != "cascade":
+                    break
+            except Exception as exc:
+                attempts.append({"method": candidate, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+                if method != "cascade":
+                    record["attempts"] = attempts
+                    raise
+        record["attempts"] = attempts
+        if chosen is None:
+            raise RuntimeError("; ".join(f"{a['method']}: {a.get('error', 'rejected')}" for a in attempts))
+        selected, result, canvas, warped, quality = chosen
+        result.diagnostics.update(requested_method=method, selected_method=selected,
+                                  quality_gate=quality, attempts=attempts)
         record["matcher"] = result.matches.metadata
-        canvas = expanded_canvas(arrays[0].shape, arrays[2].shape, result.source_to_reference,
-                                 max_canvas_pixels, max_canvas_side)
+        record["selected_method"] = selected
+        record["quality_gate"] = quality
         write_json(out / "geometry.json", canvas.as_dict())
-        warped = warp_pair(*arrays, canvas)
         metrics = save_diagnostics(out, warped, result, canvas)
         record["elapsed_seconds"] = time.monotonic() - start
-        finish_record(out, record, "completed_needs_review")
+        finish_record(out, record, "completed_needs_review" if quality["passed"] else "completed_rejected")
         return metrics
+    except KeyboardInterrupt:
+        record["elapsed_seconds"] = time.monotonic() - start
+        finish_record(out, record, "interrupted", "Interrupted by user")
+        raise
     except Exception as exc:
         record["elapsed_seconds"] = time.monotonic() - start
         finish_record(out, record, "failed", f"{type(exc).__name__}: {exc}")

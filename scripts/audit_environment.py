@@ -52,6 +52,8 @@ import numpy as np
 info = {"version": torch.__version__, "file": torch.__file__, "compiled_cuda": torch.version.cuda,
         "weights_only": "weights_only" in inspect.signature(torch.load).parameters,
         "cuda_kernel_execution": "not_tested"}
+info["default_safe_checkpoint_loader_available"] = info["weights_only"]
+info["trusted_legacy_checkpoint_loader_available"] = not info["weights_only"] and callable(torch.load)
 try:
     a = np.zeros((2, 3), dtype=np.float32)
     info["numpy_bridge"] = bool(np.array_equal(torch.from_numpy(a).numpy(), a))
@@ -163,7 +165,12 @@ def main(argv=None):
         "manifest_imports": manifest_ready, "sift_imports_and_features": sift_ready,
         "cpu_project_tests_passed": tests["status"] == "ok",
         "loftr_import_prerequisites": loftr_imports,
-        "loftr_checkpoint_loader_supported": loftr_imports and bool(torch_details.get("weights_only")),
+        "loftr_checkpoint_loader_supported": loftr_imports and bool(
+            torch_details.get("weights_only") or torch_details.get("trusted_legacy_checkpoint_loader_available")),
+        "loftr_default_safe_checkpoint_loader_supported": loftr_imports and bool(torch_details.get("weights_only")),
+        "loftr_trusted_legacy_checkpoint_loader_available": loftr_imports and bool(
+            torch_details.get("trusted_legacy_checkpoint_loader_available")),
+        "loftr_checkpoint_requires_explicit_trust": loftr_imports and not bool(torch_details.get("weights_only")),
         "torch_cuda_available": torch_details.get("cuda_available"),
         "loftr_checkpoint_and_inference": "not_tested"})
     report.update(status="completed", finished_utc=datetime.now(timezone.utc).isoformat())
@@ -183,7 +190,9 @@ def main(argv=None):
         lines.append("OpenCV metadata/runtime mismatch: " + json.dumps(cv_packages) + " vs imported cv2=" + cv_version
                      + ". Imports/tests determine functionality; do not reinstall automatically.")
     if good("torch") and not torch_details.get("weights_only"):
-        lines.append("Torch imports, but this LoFTR adapter requires torch.load(weights_only=True), which is unavailable.")
+        lines.append("Torch lacks weights_only: default safe checkpoint loading is unavailable; "
+                     "the adapter supports explicitly trusted weights with --trust-checkpoint. "
+                     "No checkpoint was loaded by this audit.")
     lines += ["", "Readiness: " + json.dumps(report["readiness"], ensure_ascii=False),
               "Tests: " + tests["status"] + " " + json.dumps(tests.get("details", {})),
               "LoFTR weights/inference and real facade data were not tested.",

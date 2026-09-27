@@ -1,10 +1,12 @@
 """Small interchangeable SIFT/LoFTR matchers, shared native-coordinate estimator."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import inspect
 from pathlib import Path
 from typing import Protocol
+import warnings
 import numpy as np
 
 from .geometry import proxy_transform, transform_points
@@ -75,34 +77,110 @@ class SIFTMatcher:
                        "nfeatures": 8000, "contrast_threshold": .01, "edge_threshold": 10})
 
 
+LOFTR_OUTDOOR_URL = "https://cmp.felk.cvut.cz/~mishkdmy/models/loftr_outdoor.ckpt"
+
+
+def resolve_loftr_checkpoint(torch, checkpoint=None, download_weights=False):
+    """Resolve a supplied file or the standard Torch cache; download only on request."""
+    if checkpoint and str(checkpoint) != "auto":
+        path = Path(checkpoint).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"LoFTR checkpoint not found: {path}")
+        return path, "explicit_local"
+    cache = Path(torch.hub.get_dir()) / "checkpoints"
+    for name in ("loftr_outdoor.ckpt", "outdoor_ds.ckpt"):
+        path = cache / name
+        if path.is_file():
+            return path.resolve(), "torch_cache"
+    if not download_weights:
+        raise FileNotFoundError(
+            f"No LoFTR outdoor checkpoint in {cache}; supply --checkpoint PATH "
+            "or use --download-weights once to fetch the official outdoor weights"
+        )
+    cache.mkdir(parents=True, exist_ok=True)
+    path = cache / "loftr_outdoor.ckpt"
+    torch.hub.download_url_to_file(LOFTR_OUTDOOR_URL, str(path), progress=True)
+    return path.resolve(), "official_download"
+
+
+def load_loftr_state(torch, checkpoint, trust_checkpoint=False):
+    """Keep safe deserialization by default, with explicit legacy-Torch opt-in."""
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        loader = "weights_only"
+    elif trust_checkpoint:
+        warnings.warn(
+            "Using legacy torch.load for an explicitly trusted LoFTR checkpoint",
+            RuntimeWarning, stacklevel=2,
+        )
+        state = torch.load(checkpoint, map_location="cpu")
+        loader = "legacy_pickle_explicitly_trusted"
+    else:
+        raise RuntimeError(
+            "This Torch predates weights_only. For weights whose origin you trust, "
+            "pass --trust-checkpoint; the legacy loader will be recorded in run.json."
+        )
+    if not isinstance(state, Mapping):
+        raise ValueError("LoFTR checkpoint must contain a state_dict mapping")
+    state = state.get("state_dict", state)
+    if not isinstance(state, Mapping) or not state or not all(
+        isinstance(key, str) and torch.is_tensor(value) for key, value in state.items()
+    ):
+        raise ValueError("LoFTR state_dict must be a nonempty string-to-tensor mapping")
+    return dict(state), loader
+
+
+def loftr_inputs(gray, support):
+    """Pad to stride 8; supply coarse masks without Kornia's full-mask resize bug."""
+    gray, support = np.asarray(gray), np.asarray(support)
+    if gray.ndim != 2 or support.shape != gray.shape or gray.dtype != np.uint8:
+        raise ValueError("LoFTR expects uint8 grayscale and same-shape support")
+    if min(gray.shape) < 8:
+        raise ValueError("LoFTR proxy dimensions must each be at least 8 pixels")
+    padding = ((0, (-gray.shape[0]) % 8), (0, (-gray.shape[1]) % 8))
+    image = np.pad(gray, padding)
+    mask = np.pad(support.astype(bool), padding)
+    h, w = image.shape
+    # LoFTR's coarse backbone has stride 8. Requiring all pixels in each cell
+    # excludes padding/alpha; native-coordinate support is checked again below.
+    coarse = mask.reshape(h // 8, 8, w // 8, 8).all(axis=(1, 3))
+    return image, coarse
+
+
 class LoFTRMatcher:
-    def __init__(self, checkpoint, device="cpu", confidence=.4):
-        if not checkpoint or not Path(checkpoint).is_file():
-            raise ValueError("LoFTR requires --checkpoint pointing to a local compatible state_dict; no automatic download")
-        if not 0 <= confidence <= 1:
-            raise ValueError("LoFTR confidence must be in [0,1]")
+    def __init__(self, checkpoint=None, device="cpu", confidence=.4,
+                 trust_checkpoint=False, download_weights=False):
+        if not np.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("LoFTR confidence must be finite and in [0,1]")
         try:
             import torch
+            import kornia
             from kornia.feature import LoFTR
         except ImportError as exc:
-            raise RuntimeError("LoFTR requires torch and kornia; install in the local GPU environment") from exc
+            raise RuntimeError("LoFTR requires torch and kornia in the selected environment") from exc
         if device != "cpu" and not device.startswith("cuda"):
             raise ValueError("Device must be cpu or cuda[:index]")
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable; no silent CPU fallback")
-        if "weights_only" not in inspect.signature(torch.load).parameters:
-            raise RuntimeError("This LoFTR loader needs torch.load(weights_only=True); select a compatible existing environment. CPU manifest/SIFT do not need Torch.")
         self.torch, self.device, self.confidence = torch, device, confidence
+        checkpoint, origin = resolve_loftr_checkpoint(torch, checkpoint, download_weights)
         digest = sha256(checkpoint)
-        state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        state = state.get("state_dict", state)
+        state, loader = load_loftr_state(torch, checkpoint, trust_checkpoint)
         self.model = LoFTR(pretrained=None)
         self.model.load_state_dict(state, strict=True)
+        del state
         if sha256(checkpoint) != digest:
             raise ValueError("Checkpoint changed while loading")
-        self.metadata = {"id": "kornia-loftr-v1", "checkpoint_sha256": digest,
-                         "checkpoint_path": str(Path(checkpoint).resolve()), "device": device,
-                         "confidence_threshold": confidence, "checkpoint_load": "strict; weights_only"}
+        self.metadata = {
+            "id": "kornia-loftr-v2", "checkpoint_sha256": digest,
+            "checkpoint_path": str(checkpoint), "checkpoint_origin": origin,
+            "checkpoint_download_url": LOFTR_OUTDOOR_URL if origin == "official_download" else None,
+            "device": device, "confidence_threshold": confidence,
+            "checkpoint_load": loader, "checkpoint_strict": True,
+            "trust_checkpoint_requested": bool(trust_checkpoint),
+            "torch_version": torch.__version__, "kornia_version": kornia.__version__,
+            "mask_policy": "all_supported_8x8_coarse_cells_then_full_resolution_point_filter",
+        }
         if device.startswith("cuda"):
             free, total = torch.cuda.mem_get_info(device)
             self.metadata["cuda_memory_before_model_bytes"] = {"free": free, "total": total}
@@ -113,16 +191,20 @@ class LoFTRMatcher:
         torch = self.torch
         inputs = {}
         for i, (gray, support) in enumerate(((source_gray, source_support), (reference_gray, reference_support))):
-            padding = ((0, (-gray.shape[0]) % 8), (0, (-gray.shape[1]) % 8))
-            inputs[f"image{i}"] = torch.from_numpy(np.pad(gray, padding)).float()[None, None].to(self.device) / 255
-            inputs[f"mask{i}"] = torch.from_numpy(np.pad(support, padding)).bool()[None].to(self.device)
+            image, coarse = loftr_inputs(gray, support)
+            inputs[f"image{i}"] = torch.from_numpy(image).float()[None, None].to(self.device) / 255
+            inputs[f"mask{i}"] = torch.from_numpy(coarse)[None].to(self.device)
         with torch.inference_mode():
             result = self.model(inputs)
         source = result["keypoints0"].detach().cpu().numpy()
         reference = result["keypoints1"].detach().cpu().numpy()
         confidence = result["confidence"].detach().cpu().numpy()
         keep = (confidence >= self.confidence) & valid_locations(source, source_support) & valid_locations(reference, reference_support)
-        return Matches(source[keep], reference[keep], self.metadata)
+        metadata = dict(self.metadata)
+        metadata["source_padded_shape"] = list(inputs["image0"].shape[-2:])
+        metadata["reference_padded_shape"] = list(inputs["image1"].shape[-2:])
+        metadata["raw_matches"] = len(confidence)
+        return Matches(source[keep], reference[keep], metadata)
 
 
 @dataclass

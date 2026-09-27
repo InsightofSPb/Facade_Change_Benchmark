@@ -11,7 +11,7 @@ dependencies = ["numpy>=1.26,<3", "Pillow>=10,<13"]
 
 [project.optional-dependencies]
 align = ["opencv-python-headless==4.12.0.88"]
-loftr = ["opencv-python-headless==4.12.0.88", "torch>=2.2", "kornia>=0.7,<0.9"]
+loftr = ["opencv-python-headless==4.12.0.88", "torch>=1.12.1", "kornia>=0.7,<0.9"]
 
 [project.scripts]
 facade = "facade_change.cli:main"
