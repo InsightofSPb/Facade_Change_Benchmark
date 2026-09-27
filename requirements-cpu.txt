@@ -1,0 +1,4 @@
+# Verified on Python 3.12 in the 2026-09-27 bootstrap smoke run.
+numpy==2.2.6
+Pillow==11.3.0
+opencv-python-headless==4.12.0.88
