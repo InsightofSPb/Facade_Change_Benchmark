@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Protocol
 import numpy as np
@@ -89,6 +90,8 @@ class LoFTRMatcher:
             raise ValueError("Device must be cpu or cuda[:index]")
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable; no silent CPU fallback")
+        if "weights_only" not in inspect.signature(torch.load).parameters:
+            raise RuntimeError("This LoFTR loader needs torch.load(weights_only=True); select a compatible existing environment. CPU manifest/SIFT do not need Torch.")
         self.torch, self.device, self.confidence = torch, device, confidence
         digest = sha256(checkpoint)
         state = torch.load(checkpoint, map_location="cpu", weights_only=True)
@@ -155,7 +158,8 @@ def align(reference_rgb, reference_opaque, source_rgb, source_opaque, matcher: M
     def coverage(points, shape):
         hull = cv2.convexHull(points.astype(np.float32))
         return float(cv2.contourArea(hull) / (shape[0] * shape[1]))
-    diagnostics = {"matches": len(inliers), "inliers": int(inliers.sum()), "inlier_ratio": float(inliers.mean()),
+    diagnostics = {"opencv_runtime_version": cv2.__version__, "matches": len(inliers),
+                   "inliers": int(inliers.sum()), "inlier_ratio": float(inliers.mean()),
                    "inlier_reprojection_median_px": float(np.median(errors[inliers])),
                    "inlier_reprojection_p95_px": float(np.percentile(errors[inliers], 95)),
                    "source_inlier_hull_fraction": coverage(matches.source[inliers], source_rgb.shape),

@@ -49,19 +49,29 @@ info = {"version": cv2.__version__, "file": cv2.__file__, "sift": True, "magsac"
 import inspect
 import torch
 import numpy as np
-a = np.zeros((2, 3), dtype=np.float32)
-assert np.array_equal(torch.from_numpy(a).numpy(), a), "Torch/NumPy bridge failed"
-assert "weights_only" in inspect.signature(torch.load).parameters, "torch.load lacks weights_only"
-cuda = torch.cuda.is_available()
 info = {"version": torch.__version__, "file": torch.__file__, "compiled_cuda": torch.version.cuda,
-        "cuda_available": cuda, "device_count": torch.cuda.device_count() if cuda else 0,
-        "numpy_bridge": True, "weights_only": True}
+        "weights_only": "weights_only" in inspect.signature(torch.load).parameters,
+        "cuda_kernel_execution": "not_tested"}
+try:
+    a = np.zeros((2, 3), dtype=np.float32)
+    info["numpy_bridge"] = bool(np.array_equal(torch.from_numpy(a).numpy(), a))
+except Exception as exc:
+    info.update(numpy_bridge=False, numpy_bridge_error=str(exc))
+try:
+    info["cuda_available"] = torch.cuda.is_available()
+    info["device_count"] = torch.cuda.device_count() if info["cuda_available"] else 0
+except Exception as exc:
+    info.update(cuda_available=None, cuda_query_error=str(exc))
 """,
     "kornia": """
 import kornia
 from kornia.feature import LoFTR
 info = {"version": kornia.__version__, "file": kornia.__file__, "loftr_class_imported": True,
         "weights_loaded": False, "inference_tested": False}
+""",
+    "project_cpu": """
+from facade_change import cli, data, geometry, pipeline
+info = {"project_cpu_imports": True, "cli_file": cli.__file__}
 """,
 }
 TEST_CODE = """
@@ -116,11 +126,11 @@ def main(argv=None):
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
     source_paths = sorted((ROOT / "facade_change").glob("*.py")) + sorted((ROOT / "tests").glob("*.py")) + [Path(__file__).resolve()]
-    report = {"schema_version": 1, "run_id": out.name, "status": "running",
+    report = {"schema_version": 2, "run_id": out.name, "status": "running",
               "started_utc": datetime.now(timezone.utc).isoformat(), "python": platform.python_version(),
               "executable": sys.executable, "prefix": sys.prefix,
               "conda_environment": os.environ.get("CONDA_DEFAULT_ENV"), "virtual_env": os.environ.get("VIRTUAL_ENV"),
-              "python_supported": sys.version_info >= (3, 10), "installed_distributions": packages,
+              "python_supported": sys.version_info >= (3, 9), "installed_distributions": packages,
               "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths},
               "git": capture(["git", "rev-parse", "HEAD"], 5), "probes": {}}
     write_json(out / "audit.json", report)
@@ -134,7 +144,7 @@ def main(argv=None):
         report["nvidia_smi"] = {"returncode": None, "stdout": "", "stderr": "nvidia-smi not found"}
     def good(name):
         return report["probes"][name]["status"] == "ok"
-    manifest_ready = report["python_supported"] and good("numpy") and good("pillow")
+    manifest_ready = report["python_supported"] and good("numpy") and good("pillow") and good("project_cpu")
     sift_ready = manifest_ready and good("opencv")
     tests = {"status": "not_requested"}
     if args.run_tests:
@@ -147,15 +157,19 @@ def main(argv=None):
             (out / "tests.log").write_text(tests["stdout"] + tests["stderr"], encoding="utf-8")
         else:
             tests = {"status": "not_run_missing_prerequisites"}
+    torch_details = report["probes"]["torch"].get("details", {})
+    loftr_imports = sift_ready and good("torch") and good("kornia") and bool(torch_details.get("numpy_bridge"))
     report.update(tests=tests, readiness={
         "manifest_imports": manifest_ready, "sift_imports_and_features": sift_ready,
         "cpu_project_tests_passed": tests["status"] == "ok",
-        "loftr_import_prerequisites": sift_ready and good("torch") and good("kornia"),
+        "loftr_import_prerequisites": loftr_imports,
+        "loftr_checkpoint_loader_supported": loftr_imports and bool(torch_details.get("weights_only")),
+        "torch_cuda_available": torch_details.get("cuda_available"),
         "loftr_checkpoint_and_inference": "not_tested"})
     report.update(status="completed", finished_utc=datetime.now(timezone.utc).isoformat())
     write_json(out / "audit.json", report)
     lines = ["Facade environment audit", f"Environment: {report['conda_environment'] or report['virtual_env'] or 'system/unknown'}",
-             f"Python: {report['python']} ({report['executable']})", f"Python >=3.10: {report['python_supported']}",
+             f"Python: {report['python']} ({report['executable']})", f"Python >=3.9: {report['python_supported']}",
              "Installed distributions: " + json.dumps(packages, ensure_ascii=False), ""]
     for name, result in report["probes"].items():
         lines.append(f"{name}: {result['status']}")
@@ -163,6 +177,13 @@ def main(argv=None):
             lines.append("  " + json.dumps(result["details"], ensure_ascii=False))
         if result["stderr"].strip():
             lines.append("  " + "\n  ".join(result["stderr"].strip().splitlines()[-8:]))
+    cv_version = report["probes"]["opencv"].get("details", {}).get("version")
+    cv_packages = {name: version for name, version in packages.items() if name.startswith("opencv-") and version}
+    if cv_version and any(not (version == cv_version or version.startswith(cv_version + ".")) for version in cv_packages.values()):
+        lines.append("OpenCV metadata/runtime mismatch: " + json.dumps(cv_packages) + " vs imported cv2=" + cv_version
+                     + ". Imports/tests determine functionality; do not reinstall automatically.")
+    if good("torch") and not torch_details.get("weights_only"):
+        lines.append("Torch imports, but this LoFTR adapter requires torch.load(weights_only=True), which is unavailable.")
     lines += ["", "Readiness: " + json.dumps(report["readiness"], ensure_ascii=False),
               "Tests: " + tests["status"] + " " + json.dumps(tests.get("details", {})),
               "LoFTR weights/inference and real facade data were not tested.",
