@@ -39,7 +39,40 @@ python -m facade_change demo --out runs/cloud-demo-001
 
 ## Первый локальный запуск
 
-Команды выполняются из корня нового репозитория. Отдельное окружение сохраняет старое `lposs`:
+Сначала используем имеющуюся среду, например `lposs`. Из корня репозитория выполни:
+
+```bash
+conda activate lposs
+python -B scripts/audit_environment.py --run-tests --out runs/env-lposs-001
+cat runs/env-lposs-001/summary.txt
+```
+
+Аудит не устанавливает и не обновляет пакеты. Проверяются реальные импорты, SIFT/MAGSAC,
+связка PyTorch–NumPy, наличие LoFTR в Kornia и состояние GPU. Веса не загружаются.
+Короткие CPU-тесты выполняются при наличии базовых зависимостей. Результаты аудита сохраняются
+в новой директории; подробности неудачного импорта остаются в audit.json, тестов — в tests.log.
+Код возврата 2 означает, что текущая среда не прошла все проверки CPU-основы.
+Отсутствие Torch/Kornia не мешает отдельной проверке COCO и запуску SIFT.
+
+При необходимости сравни вторую существующую среду:
+
+```bash
+conda activate scd_bench
+python -B scripts/audit_environment.py --run-tests --out runs/env-scd-bench-001
+```
+
+После выбора рабочей среды команды выполняются прямо из корня, установка проекта не нужна:
+
+```bash
+cp -n configs/paths.example.json configs/local.json
+python -m facade_change manifest --config configs/local.json --out runs/manifest-001
+```
+
+Пины requirements-cpu.txt задают проверенное окружение Cloud/CI; локальная среда может иметь
+другие версии. До результатов аудита не запускай setup_cloud.sh и не обновляй её зависимости.
+Импорт LoFTR не подтверждает совместимость конкретных весов: это следующий отдельный smoke.
+
+Создание отдельной среды остаётся запасным вариантом, если существующие окажутся непригодны:
 
 ```bash
 python3 -m venv .venv
