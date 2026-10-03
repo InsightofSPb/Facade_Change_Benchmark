@@ -141,6 +141,120 @@ class UnifiedPreparationTests(unittest.TestCase):
                 self.assertTrue((out / crop[key]).is_file())
         self.assertEqual(read_json(out / "run.json")["status"], "completed_needs_review")
 
+    def test_directory_images_outside_coco_are_never_prepared(self):
+        inputs = self.config.parent
+        Image.fromarray(np.full((384, 512, 3), 177, np.uint8)).save(inputs / "images/outside_2025.png")
+        out = self.root / "coco-only"
+        summary = self.runner.run_dataset(self.config, out)
+        manifest = read_json(out / "prepared/manifest.json")
+        self.assertEqual(len(manifest["images"]), 20)
+        self.assertTrue(all(row["file_name"] != "outside_2025.png" for row in manifest["images"]))
+        self.assertEqual(summary["preparation"]["image_splits"], {"train": 14, "val": 2, "test": 4})
+        index = read_json(out / summary["index_path"])
+        self.assertEqual(index["image_selection"], "current_coco_images_only")
+        self.assertTrue(all(int(crop["source_id"]) < 20 and int(crop["reference_id"]) < 20
+                            for crop in index["crops"]))
+
+    def test_expansion_preserves_gold_and_extends_current_coco_through_crops(self):
+        first = self.root / "gold"
+        self.runner.run_dataset(self.config, first, prepare_only=True)
+        original_split = read_json(first / "prepared/split.json")
+        building = next(name for name, split in original_split["building_assignments"].items() if split == "train")
+        prepared = read_json(first / "prepared/manifest.json")
+        reference = next(row for row in prepared["images"] if row["building_id"] == building)
+        with Image.open(reference["image_path"]) as image:
+            original = np.array(image)
+        inputs = self.config.parent
+        coco = read_json(inputs / "coco.json")
+        with (inputs / "reviewed.csv").open(encoding="utf-8", newline="") as stream:
+            metadata = list(csv.DictReader(stream))
+        for i in range(10):
+            image_id = 20 + i
+            name = f"extension{i}_2030.png"
+            array = original.copy()
+            array[0, 0] = [i, 200, 255]
+            Image.fromarray(array).save(inputs / "images" / name)
+            coco["images"].append({"id": image_id, "file_name": name, "width": 512, "height": 384})
+            metadata.append({"image_id": image_id, "view_id": reference["view_id"] if i == 0 else f"new_view{i}",
+                             "building_id": building if i == 0 else f"new_building{i}",
+                             "year": 2030, "reviewed": "true", "notes": "Synthetic extension"})
+        write_json(inputs / "coco.json", coco)
+        with (inputs / "reviewed.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(metadata[0]))
+            writer.writeheader()
+            writer.writerows(metadata)
+        config = read_json(self.config)
+        config["previous_split"] = str(first / "prepared/split.json")
+        write_json(self.config, config)
+        out = self.root / "expanded"
+        summary = self.runner.run_dataset(self.config, out)
+        self.assertTrue(summary["previous_split_applied"])
+        self.assertEqual(summary["preparation"]["image_splits"], {"train": 21, "val": 3, "test": 6})
+        split = read_json(out / "prepared/split.json")
+        self.assertEqual(split["gold_cohort"], original_split["gold_cohort"])
+        for group, partition in original_split["building_assignments"].items():
+            self.assertEqual(split["building_assignments"][group], partition)
+        manifest = read_json(out / "prepared/manifest.json")
+        self.assertEqual(sum(row["gold_member"] for row in manifest["images"]), 20)
+        added = next(row for row in manifest["images"] if row["image_id"] == 20)
+        self.assertEqual(added["split"], "train")
+        index = read_json(out / summary["index_path"])
+        added_crops = [row for row in index["crops"] if row["source_id"] == 20]
+        self.assertGreater(len(added_crops), 0)
+        self.assertTrue(all(row["split"] == "train" and row["reference_gold_member"]
+                            and not row["source_gold_member"] for row in added_crops))
+
+    def test_reused_manifest_cannot_add_or_remove_coco_members(self):
+        first = self.root / "first"
+        self.runner.run_dataset(self.config, first, prepare_only=True)
+        manifest_path = first / "inventory/manifest.json"
+        manifest = read_json(manifest_path)
+        original_images = manifest["images"][:]
+        config = read_json(self.config)
+        config["manifest_path"] = str(manifest_path)
+        write_json(self.config, config)
+        mutations = [original_images + [{**original_images[0], "image_id": 999}],
+                     original_images[:-1],
+                     [{**row, "file_name": "different.png"} if i == 0 else row
+                      for i, row in enumerate(original_images)]]
+        for i, rows in enumerate(mutations):
+            with self.subTest(mutation=i):
+                manifest["images"] = rows
+                write_json(manifest_path, manifest)
+                with self.assertRaisesRegex(ValueError, "exactly.*COCO"):
+                    self.runner.run_dataset(self.config, self.root / f"invalid-members-{i}", prepare_only=True)
+
+    def test_previous_split_is_rejected_in_dev_mode(self):
+        config = read_json(self.config)
+        config.update(previous_split="old/split.json", split={"mode": "dev"})
+        write_json(self.config, config)
+        with self.assertRaisesRegex(ValueError, "previous_split.*reviewed"):
+            self.runner.load_config(self.config)
+
+    def test_missing_gold_image_is_reported_as_issue_in_unified_run(self):
+        first = self.root / "gold"
+        self.runner.run_dataset(self.config, first, prepare_only=True)
+        manifest = read_json(first / "prepared/manifest.json")
+        missing_hash = manifest["images"][-1]["sha256"]
+        inputs = self.config.parent
+        coco = read_json(inputs / "coco.json")
+        coco["images"].pop()
+        write_json(inputs / "coco.json", coco)
+        with (inputs / "reviewed.csv").open(encoding="utf-8", newline="") as stream:
+            metadata = list(csv.DictReader(stream))[:-1]
+        with (inputs / "reviewed.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(metadata[0]))
+            writer.writeheader()
+            writer.writerows(metadata)
+        config = read_json(self.config)
+        config["previous_split"] = str(first / "prepared/split.json")
+        write_json(self.config, config)
+        out = self.root / "missing-gold"
+        summary = self.runner.run_dataset(self.config, out, prepare_only=True)
+        self.assertEqual(summary["status"], "completed_with_issues")
+        self.assertEqual(summary["preparation"]["missing_gold_sha256"], [missing_hash])
+        self.assertIn(missing_hash, (out / "summary.txt").read_text(encoding="utf-8"))
+
     def test_reuse_inventory_never_decodes_originals_for_split_changes(self):
         first = self.root / "first"
         self.runner.run_dataset(self.config, first, prepare_only=True)

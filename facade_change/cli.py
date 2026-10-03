@@ -51,6 +51,7 @@ def parser():
     prep.add_argument("--manifest", required=True, dest="manifest_path")
     prep.add_argument("--out", required=True)
     prep.add_argument("--overrides")
+    prep.add_argument("--previous-split", help="Previous reviewed split.json; preserve gold cohort and building assignments")
     prep.add_argument("--split-mode", choices=["dev", "reviewed"], default="dev")
     prep.add_argument("--pair-policy", choices=["adjacent", "first-anchor", "all"], default="adjacent")
     prep.add_argument("--seed", type=int, default=42)

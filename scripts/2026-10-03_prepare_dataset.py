@@ -26,7 +26,7 @@ def load_config(path):
         "crops": {"tile_size": 256, "stride": 128, "min_valid_fraction": .8,
                   "method": "cascade", "controls": 1},
     }
-    allowed = {"coco_json", "image_roots", "manifest_path", "metadata_csv", "pair_policy", *defaults}
+    allowed = {"coco_json", "image_roots", "manifest_path", "metadata_csv", "previous_split", "pair_policy", *defaults}
     if not isinstance(config, dict) or set(config) - allowed:
         raise ValueError("Config must be an object with only supported dataset options")
     for name, values in defaults.items():
@@ -47,6 +47,8 @@ def load_config(path):
         raise ValueError("Split fractions must sum to 1, with positive train and nonnegative val/test")
     if not isinstance(split["mode"], str) or split["mode"] not in {"reviewed", "dev"}:
         raise ValueError("split.mode must be reviewed or dev")
+    if config.get("previous_split") is not None and split["mode"] != "reviewed":
+        raise ValueError("previous_split requires split.mode=reviewed")
     integers = {"split.seed": split["seed"], "alignment.limit": alignment["limit"],
                 "alignment.max_side": alignment["max_side"], "crops.tile_size": crops["tile_size"],
                 "crops.stride": crops["stride"], "crops.controls": crops["controls"]}
@@ -86,7 +88,7 @@ def load_config(path):
     if not isinstance(roots, list) or not roots:
         raise ValueError("image_roots must be a nonempty list")
     config["image_roots"] = sorted({absolute(root) for root in roots})
-    for key in ("manifest_path", "metadata_csv"):
+    for key in ("manifest_path", "metadata_csv", "previous_split"):
         config[key] = absolute(config[key]) if config.get(key) is not None else None
     if alignment["checkpoint"] != "auto":
         alignment["checkpoint"] = absolute(alignment["checkpoint"])
@@ -106,18 +108,29 @@ def run_dataset(config_path, out, prepare_only=False):
             raise ValueError("Reused manifest COCO path/hash disagrees with coco_json; build a fresh inventory")
         if sorted({str(Path(root).expanduser().resolve()) for root in source.get("image_roots", [])}) != config["image_roots"]:
             raise ValueError("Reused manifest image_roots disagree with config; build a fresh inventory")
+        coco_images = read_json(config["coco_json"])["images"]
+        expected = {str(row["id"]): (row["file_name"], row["width"], row["height"]) for row in coco_images}
+        actual = {str(row["image_id"]): (row.get("file_name"), row.get("coco_width"), row.get("coco_height"))
+                  for row in manifest["images"]}
+        if len(expected) != len(coco_images) or len(actual) != len(manifest["images"]) or actual != expected:
+            raise ValueError("Reused manifest must contain exactly the current COCO images and dimensions; "
+                             "build a fresh inventory")
     metadata_hash = sha256(config["metadata_csv"]) if config["metadata_csv"] else None
+    previous_split_hash = sha256(config["previous_split"]) if config["previous_split"] else None
     out = new_directory(out)
     record = run_record("dataset", {**config, "config_path": str(config_path),
                                    "input_config_sha256": sha256(config_path), "prepare_only": prepare_only,
                                    "runner_sha256": sha256(Path(__file__)),
                                    "coco_sha256": annotation_hash,
                                    "manifest_sha256": sha256(manifest_path) if manifest_path else None,
-                                   "metadata_sha256": metadata_hash})
+                                   "metadata_sha256": metadata_hash,
+                                   "previous_split_sha256": previous_split_hash,
+                                   "image_selection": "current_coco_images_only"})
     write_json(out / "run.json", record)
     normalized_config = out / (record["started_utc"][:10] + "_config.json")
     write_json(normalized_config, config)
     summary = {"status": "running", "inventory_reused": manifest_path is not None,
+               "image_selection": "current_coco_images_only", "previous_split_applied": False,
                "crop_count": 0, "crop_splits": {}, "index_path": None, "alignment": None}
     try:
         if manifest is None:
@@ -138,7 +151,9 @@ def run_dataset(config_path, out, prepare_only=False):
         prepared = prepare_dataset(manifest_path, out / "prepared", overrides=config["metadata_csv"],
                                    split_mode="dev" if needs_review else split["mode"],
                                    pair_policy=config["pair_policy"], seed=split["seed"],
-                                   val_fraction=split["val"], test_fraction=split["test"])
+                                   val_fraction=split["val"], test_fraction=split["test"],
+                                   previous_split=None if needs_review else config["previous_split"])
+        summary["previous_split_applied"] = bool(config["previous_split"]) and not needs_review
         summary.update(preparation=prepared["summary"], metadata_review="prepared/metadata_review.csv",
                        group_review="prepared/group_review.csv")
         if needs_review:
@@ -165,17 +180,22 @@ def run_dataset(config_path, out, prepare_only=False):
                                       "reference_rgb": (path / "reference_rgb.png").as_posix(),
                                       "source_rgb": (path / "source_rgb.png").as_posix(),
                                       "geometric_overlap": (path / "geometric_overlap.png").as_posix(),
+                                      "reference_gold_member": images[str(crop["reference_id"])].get("gold_member", False),
+                                      "source_gold_member": images[str(crop["source_id"])].get("gold_member", False),
                                       "original_reference_path": images[str(crop["reference_id"])]["image_path"],
                                       "original_source_path": images[str(crop["source_id"])]["image_path"]})
-            index = {"schema_version": 1, "source_annotations": {"path": config["coco_json"],
+            index = {"schema_version": 1, "image_selection": "current_coco_images_only",
+                     "source_annotations": {"path": config["coco_json"],
                      "sha256": annotation_hash, "categories": prepared["categories"]},
                      "semantic_masks": {"rasterized": False}, "temporal_ground_truth": "not_created",
                      "split": read_json(out / "prepared/split.json"), "pairs": prepared["pairs"], "crops": crop_rows}
             index_name = record["started_utc"][:10] + "_dataset_index.json"
             if sha256(config["coco_json"]) != annotation_hash:
                 raise ValueError("Source COCO changed during dataset preparation")
+            if previous_split_hash and sha256(config["previous_split"]) != previous_split_hash:
+                raise ValueError("Previous split changed during dataset preparation")
             write_json(out / index_name, index)
-            issues = summary["input_issues"] or (summary["alignment"] and any(
+            issues = summary["input_issues"] or prepared["summary"]["missing_gold_sha256"] or (summary["alignment"] and any(
                 summary["alignment"][key] for key in ("failed_runs", "rejected_runs", "derivative_failures")))
             summary.update(crop_count=len(crop_rows), crop_splits=dict(Counter(row["split"] for row in crop_rows)),
                            index_path=index_name, status="completed_with_issues" if issues else
@@ -186,6 +206,8 @@ def run_dataset(config_path, out, prepare_only=False):
             f"Crops: {summary['crop_count']}; splits: {summary['crop_splits']}\n"
             f"Metadata review: {summary['metadata_review']}\nGroup review: {summary['group_review']}\n"
             f"Dataset index: {summary['index_path']}\n"
+            f"Missing gold images: {prepared['summary']['missing_gold_sha256']}\n"
+            "Only images listed in the current COCO are selected; other directory images are excluded.\n"
             "COCO semantic masks were not rasterized; temporal ground truth was not created.\n",
             encoding="utf-8")
         record["summary"] = summary
