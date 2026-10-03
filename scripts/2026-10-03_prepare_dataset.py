@@ -37,7 +37,7 @@ def load_config(path):
         if not isinstance(supplied, dict) or set(supplied) - set(values):
             raise ValueError(f"Unsupported {name} options; expected {sorted(values)}")
         config[name] = {**values, **supplied}
-    config.setdefault("pair_policy", "adjacent")
+    config.setdefault("pair_policy", "first-anchor")
     config.setdefault("metadata_rules", str(DEFAULT_METADATA_RULES))
     if not isinstance(config["pair_policy"], str) or config["pair_policy"] not in {"adjacent", "first-anchor", "all"}:
         raise ValueError("pair_policy must be adjacent, first-anchor or all")

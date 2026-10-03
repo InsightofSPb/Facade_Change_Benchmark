@@ -70,7 +70,8 @@ python -B scripts/2026-10-03_prepare_dataset.py \
   --out runs/2026-10-03-dataset-001
 ```
 
-По умолчанию используются соседние даты, каскад SIFT→LoFTR, все пригодные пары,
+По умолчанию все поздние даты одного вида совмещаются с его самым ранним
+пригодным снимком (`first-anchor`); используются каскад SIFT→LoFTR, все пригодные пары,
 кропы 256×256 со stride 128 и минимальной геометрической поддержкой 0.8. Для
 первого просмотра можно поставить `alignment.limit=3`; итоговая подготовка
 использует `0`. LoFTR ищет существующие веса; скачивание требует отдельного
@@ -180,7 +181,7 @@ conda activate lposs
 
 python -B -m facade_change prepare \
   --manifest runs/manifest-001/manifest.json \
-  --split-mode dev --pair-policy adjacent \
+  --split-mode dev --pair-policy first-anchor \
   --out runs/2026-09-27-prepared-dev-001
 ```
 
@@ -223,15 +224,25 @@ explorer.exe "$(wslpath -w /home/sasha/Facade_Change_Benchmark/runs/2026-09-27-m
 ### Независимое сравнение SIFT и LoFTR на gold
 
 После подготовки `runs/2026-10-03-gold/prepared/manifest.json` можно отдельно
-сравнить методы, даже если последующая генерация кропов была прервана:
+сравнить методы, даже если последующая генерация кропов была прервана.
+Для перехода от старых соседних пар к самой ранней опоре сохрани назначения
+зданий через `previous-split` и пересобери только метаданные:
+
+```bash
+python -B -m facade_change prepare \
+  --manifest runs/2026-10-03-gold/prepared/manifest.json \
+  --split-mode reviewed --pair-policy first-anchor \
+  --previous-split runs/2026-10-03-gold/prepared/split.json \
+  --out runs/2026-10-03-first-anchor
+```
 
 ```bash
 python -B -m facade_change batch \
-  --manifest runs/2026-10-03-gold/prepared/manifest.json \
+  --manifest runs/2026-10-03-first-anchor/manifest.json \
   --methods sift loftr --limit 0 \
   --max-side 1024 --ransac-threshold 3 \
   --device cuda:0 --checkpoint auto --trust-checkpoint \
-  --out runs/2026-10-03-alignment
+  --out runs/2026-10-03-alignment-first-anchor
 ```
 
 Оба метода выполняются независимо для каждой выбранной пары. Совмещения лежат
@@ -322,7 +333,7 @@ cp runs/manifest-001/metadata_review.csv runs/2026-09-27-metadata-review.csv
 python -B -m facade_change prepare \
   --manifest runs/manifest-001/manifest.json \
   --overrides runs/2026-09-27-metadata-review.csv \
-  --split-mode reviewed --pair-policy adjacent \
+  --split-mode reviewed --pair-policy first-anchor \
   --val-fraction 0.10 --test-fraction 0.20 --seed 42 \
   --out runs/2026-09-27-prepared-reviewed-001
 ```

@@ -34,7 +34,7 @@ class PreparationTests(unittest.TestCase):
         before = self.manifest.read_bytes()
         result = prepare_dataset(self.manifest, self.root / "prepared")
         self.assertEqual(self.manifest.read_bytes(), before)
-        self.assertEqual([(p["reference_id"], p["source_id"]) for p in result["pairs"]], [(1, 2), (2, 3)])
+        self.assertEqual([(p["reference_id"], p["source_id"]) for p in result["pairs"]], [(1, 2), (1, 3)])
         self.assertEqual([row["split"] for row in result["images"]], ["dev", "dev", "dev", "excluded"])
         self.assertIn("unknown_view", result["images"][-1]["preparation_exclusion_reasons"])
         self.assertEqual(result["inventory_summary"]["annotation_count"], 7)
@@ -54,6 +54,52 @@ class PreparationTests(unittest.TestCase):
                 result = prepare_dataset(self.manifest, self.root / policy, pair_policy=policy)
                 self.assertEqual({(p["reference_id"], p["source_id"]) for p in result["pairs"]}, pairs)
                 self.assertTrue(all(p["source_year"] > p["reference_year"] for p in result["pairs"]))
+
+    def test_first_anchor_selects_one_earliest_photo_stably_after_id_reindex(self):
+        earliest_other = {**self.row(1), "file_name": "a/wall_2010_b.png"}
+        earliest_anchor = {**self.row(9), "file_name": "z/deadbeef-wall_2010_a.png"}
+        rows = [self.row(3, year=2020), earliest_other, self.row(2, year=2015), earliest_anchor,
+                self.row(4, "side", year=2008), self.row(5, "side", year=2024)]
+        self.save(rows)
+        first = prepare_dataset(self.manifest, self.root / "first")
+        self.assertEqual({(p["reference_id"], p["source_id"]) for p in first["pairs"]},
+                         {(9, 2), (9, 3), (4, 5)})
+        self.assertEqual(len(first["images"]), len(rows))
+        self.assertTrue(all(row["split"] == "dev" for row in first["images"]))
+        for row in rows:
+            row["image_id"] = 100 - row["image_id"]
+        self.save(list(reversed(rows)))
+        second = prepare_dataset(self.manifest, self.root / "second")
+        self.assertEqual({(p["reference_id"], p["source_id"]) for p in second["pairs"]},
+                         {(91, 98), (91, 97), (96, 95)})
+        first_by_id = {row["image_id"]: row for row in first["images"]}
+        second_by_id = {row["image_id"]: row for row in second["images"]}
+        for result, by_id in ((first, first_by_id), (second, second_by_id)):
+            wall_anchors = [by_id[p["reference_id"]] for p in result["pairs"] if p["view_id"] == "wall"]
+            self.assertTrue(all(row["file_name"] == earliest_anchor["file_name"] and
+                                row["sha256"] == earliest_anchor["sha256"] for row in wall_anchors))
+            self.assertTrue(all(p["source_year"] > p["reference_year"] for p in result["pairs"]))
+        self.assertEqual(len(second["images"]), len(rows))
+
+    def test_switch_to_first_anchor_preserves_gold_buildings_and_originals(self):
+        rows = [self.row(3 * group + date + 1, f"view{group}", year=year,
+                         building=f"building{group}", reviewed=True)
+                for group in range(3) for date, year in enumerate((2010, 2015, 2020))]
+        self.save(rows)
+        first = prepare_dataset(self.manifest, self.root / "adjacent", split_mode="reviewed",
+                                pair_policy="adjacent")
+        previous = self.root / "adjacent/split.json"
+        second = prepare_dataset(self.manifest, self.root / "anchor", split_mode="reviewed",
+                                 previous_split=previous)
+        old_split, new_split = read_json(previous), read_json(self.root / "anchor/split.json")
+        for field in ("building_assignments", "gold_cohort", "historical_cohort", "extended_cohort"):
+            self.assertEqual(new_split[field], old_split[field])
+        self.assertEqual([row["split"] for row in second["images"]], [row["split"] for row in first["images"]])
+        self.assertEqual(second["summary"]["current_gold_image_count"], len(rows))
+        self.assertEqual({(p["reference_id"], p["source_id"]) for p in second["pairs"]},
+                         {(1, 2), (1, 3), (4, 5), (4, 6), (7, 8), (7, 9)})
+        self.assertNotEqual(first["pairs"], second["pairs"])
+        validate_partitions(second["images"])
 
     def test_reviewed_overrides_split_physical_buildings_and_quarantine_rest(self):
         rows = [self.row(1, "front"), self.row(2, "back"), self.row(3, "other"),

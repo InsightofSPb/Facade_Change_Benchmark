@@ -143,7 +143,7 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
 
 
 def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
-                    pair_policy="adjacent", seed=42, val_fraction=.10, test_fraction=.20,
+                    pair_policy="first-anchor", seed=42, val_fraction=.10, test_fraction=.20,
                     assets_config=None, previous_split=None) -> dict:
     """Prepare metadata without opening source photographs or rasterizing COCO.
 
@@ -152,6 +152,8 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
     with explicit exclusion reasons. ``previous_split`` freezes historical building
     ownership and the initial gold cohort while new buildings target the same image
     fractions. Image continuity uses source bytes rather than COCO numeric ids.
+    ``first-anchor`` uses one earliest-year photo per view, breaking ties by
+    normalized basename and SHA-256 without dropping other original observations.
     No crop or temporal ground truth is implied.
     """
     if split_mode not in {"dev", "reviewed"}:
@@ -287,10 +289,13 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                 year_pairs = zip(years, years[1:])
             elif pair_policy == "first-anchor":
                 year_pairs = ((years[0], year) for year in years[1:])
+                anchor = min(by_year[years[0]], key=lambda row: (
+                    normalized_name(Path(row["file_name"]).name), row["sha256"]))
             else:
                 year_pairs = combinations(years, 2)
             for earlier, later in year_pairs:
-                for reference, source in product(by_year[earlier], by_year[later]):
+                references = [anchor] if pair_policy == "first-anchor" else by_year[earlier]
+                for reference, source in product(references, by_year[later]):
                     pair = {"pair_id": f"{reference['image_id']}-{source['image_id']}",
                             "reference_id": reference["image_id"], "source_id": source["image_id"],
                             "reference_year": earlier, "source_year": later, "view_id": view,

@@ -58,7 +58,7 @@ class DatasetAuditTests(unittest.TestCase):
         self.assertEqual(audit["preparation"]["pair_count"], 3)
         prepared = read_json(out / "dataset/prepared/manifest.json")
         self.assertEqual({(p["reference_id"], p["source_id"]) for p in prepared["pairs"]},
-                         {(1070, 1071), (1071, 1072), (1071, 1073)})
+                         {(1070, 1071), (1070, 1072), (1070, 1073)})
         self.assertEqual(audit["unreviewed_ready_image_count"], 2)
         self.assertEqual(audit["unreviewed_eligible_image_count"], 1)
         self.assertEqual(audit["pairing_status"], {"pair_candidate": 4, "metadata_or_image_unresolved": 1,

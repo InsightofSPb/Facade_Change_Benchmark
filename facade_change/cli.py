@@ -53,7 +53,7 @@ def parser():
     prep.add_argument("--overrides")
     prep.add_argument("--previous-split", help="Previous reviewed split.json; preserve gold cohort and building assignments")
     prep.add_argument("--split-mode", choices=["dev", "reviewed"], default="dev")
-    prep.add_argument("--pair-policy", choices=["adjacent", "first-anchor", "all"], default="adjacent")
+    prep.add_argument("--pair-policy", choices=["adjacent", "first-anchor", "all"], default="first-anchor")
     prep.add_argument("--seed", type=int, default=42)
     prep.add_argument("--val-fraction", type=float, default=.10)
     prep.add_argument("--test-fraction", type=float, default=.20)

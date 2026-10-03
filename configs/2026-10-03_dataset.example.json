@@ -6,7 +6,7 @@
   "metadata_rules": "2026-10-03_metadata_rules.json",
   "previous_split": null,
   "split": {"train": 0.70, "val": 0.10, "test": 0.20, "seed": 42, "mode": "reviewed"},
-  "pair_policy": "adjacent",
+  "pair_policy": "first-anchor",
   "alignment": {
     "methods": ["cascade"],
     "device": "cuda",
