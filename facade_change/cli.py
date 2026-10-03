@@ -80,6 +80,30 @@ def parser():
     crop.add_argument("--min-valid-fraction", type=float, default=.8)
     crop.add_argument("--split", choices=["dev", "train", "val", "test"], default="dev")
     crop.add_argument("--group-id")
+    dataset_crops = sub.add_parser("crop-dataset", help="Export accepted existing batch geometry; preserve prepared splits")
+    dataset_crops.add_argument("--batch-run", required=True)
+    dataset_crops.add_argument("--out", required=True)
+    dataset_crops.add_argument("--methods", nargs="+", choices=["loftr", "sift", "cascade"], default=["loftr", "sift"],
+                               help="Priority order; at most one accepted alignment per pair")
+    dataset_crops.add_argument("--tile-size", type=int, default=256)
+    dataset_crops.add_argument("--stride", type=int, default=128)
+    dataset_crops.add_argument("--min-valid-fraction", type=float, default=.8)
+    dataset_crops.add_argument("--controls", type=int, default=0,
+                               help="Total source crops for procedural controls across the dataset")
+    dataset_crops.add_argument("--seed", type=int, default=42)
+    geo = sub.add_parser("geoscd", help="GeoSCD geometry-only dense alignment trial; no SAM/change detector")
+    geo.add_argument("--manifest", required=True, dest="manifest_path")
+    geo.add_argument("--out", required=True)
+    geo.add_argument("--geoscd-root", required=True, help="Clean pinned official GeoSCD checkout")
+    geo.add_argument("--checkpoint", required=True, help="Existing local VGGT-1B model.pt; never downloaded here")
+    geo.add_argument("--pair", action="append", dest="pairs", help="REFERENCE_ID:SOURCE_ID; repeat for explicit pairs")
+    geo.add_argument("--limit", type=int, default=3, help="Pair limit; 0 means all selected pairs")
+    geo.add_argument("--split", choices=["all", "dev", "train", "val", "test"], default="all")
+    geo.add_argument("--device", default="cuda:0")
+    geo.add_argument("--resolution", type=int, choices=[518], default=518,
+                     help="Use the VGGT grid directly, avoiding extra intrinsic/depth resize")
+    geo.add_argument("--seed", type=int, default=42)
+    geo.add_argument("--comparison-run", help="Existing SIFT/LoFTR batch on the same manifest")
     controlled = sub.add_parser("controlled", help="Procedural state/nuisance factorial and sham controls")
     controlled.add_argument("--crops-path", required=True)
     controlled.add_argument("--out", required=True)
@@ -118,6 +142,12 @@ def main(argv=None):
         elif command == "crops":
             from .derived import build_crops
             result = build_crops(**args)
+        elif command == "crop-dataset":
+            from .crop_dataset import prepare_crop_dataset
+            result = prepare_crop_dataset(**args)
+        elif command == "geoscd":
+            from .geoscd import run_geoscd
+            result = run_geoscd(**args)
         elif command == "controlled":
             from .derived import controlled_examples
             result = controlled_examples(**args)
@@ -133,6 +163,10 @@ def main(argv=None):
         if command == "align" and not result["quality_gate"]["passed"]:
             return 2
         if command == "batch" and any(result[name] for name in ("failed_runs", "rejected_runs", "derivative_failures")):
+            return 2
+        if command == "geoscd" and result["failed_runs"]:
+            return 2
+        if command == "crop-dataset" and result.get("derivative_failures", 0):
             return 2
         return 0
     except Exception as exc:
