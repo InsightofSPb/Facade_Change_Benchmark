@@ -105,7 +105,9 @@ def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
     return result
 
 
-def build_manifest(config_path: str | Path, out: str | Path, overrides=None) -> dict:
+def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
+                   previous_manifest=None) -> dict:
+    """Inventory the current COCO; reuse verified RGB metadata by image identity."""
     config_path = Path(config_path).expanduser().resolve()
     config = read_json(config_path)
     # Paths in the config are relative to the config's directory, never the shell cwd.
@@ -114,27 +116,44 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None) -> 
         return str(p.resolve() if p.is_absolute() else (config_path.parent / p).resolve())
     coco_path = Path(absolute(config["coco_json"]))
     roots = [absolute(root) for root in config["image_roots"]]
+    coco_hash = sha256(coco_path)
     coco = read_json(coco_path)
     images = coco["images"]
     ids = {str(row["id"]) for row in images}
     if len(ids) != len(images):
         raise ValueError("Duplicate COCO image ids")
+    previous_path = Path(previous_manifest).expanduser().resolve() if previous_manifest else None
+    previous_hash = sha256(previous_path) if previous_path else None
+    previous_names = defaultdict(list)
+    if previous_path:
+        previous = read_json(previous_path)
+        for row in previous["images"]:
+            name = normalized_name(Path(str(row.get("file_name") or "")).name)
+            if name:
+                previous_names[name].append(row)
+    current_names = Counter(normalized_name(Path(image["file_name"]).name) for image in images)
     metadata = read_overrides(overrides, ids)
     resolver = ImageResolver(roots)
     config = {"coco_json": str(coco_path), "image_roots": roots,
-              "coco_sha256": sha256(coco_path),
+              "coco_sha256": coco_hash,
+              "previous_manifest_path": str(previous_path) if previous_path else None,
+              "previous_manifest_sha256": previous_hash,
               "overrides_sha256": sha256(overrides) if overrides else None}
     out = new_directory(out)
     record = run_record("manifest", config)
     write_json(out / "run.json", record)
     try:
         rows = []
+        reused_count = decoded_count = inherited_count = 0
         for image in images:
             row = {"image_id": image["id"], "file_name": image["file_name"],
                    "coco_path": image.get("path"), "coco_width": image["width"],
-                   "coco_height": image["height"], "split": "unassigned"}
+                   "coco_height": image["height"], "split": "unassigned",
+                   "inventory_validation": "not_resolved"}
             row.update(filename_metadata(image["file_name"]))
-            row.update(metadata.get(str(image["id"]), {}))
+            name = normalized_name(Path(image["file_name"]).name)
+            old_rows = previous_names.get(name, [])
+            old = old_rows[0] if len(old_rows) == current_names[name] == 1 else None
             path, rule, candidates = resolver.resolve(image)
             row.update(image_path=str(path) if path else None, resolution_rule=rule,
                        image_status="missing" if rule == "not_found" else "ambiguous")
@@ -143,14 +162,37 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None) -> 
             if path:
                 try:
                     before = sha256(path)
-                    rgb, support = load_rgb(path)
+                    same_identity = bool(old and old.get("image_status") == "ready"
+                                         and old.get("sha256") == before
+                                         and type(old.get("width")) is int and type(old.get("height")) is int
+                                         and (old.get("width"), old.get("height")) == (image["width"], image["height"]))
+                    opaque = old.get("opaque_fraction") if old else None
+                    cache_complete = (same_identity and isinstance(opaque, (int, float))
+                                      and not isinstance(opaque, bool) and 0 <= opaque <= 1)
+                    if cache_complete:
+                        w, h = old["width"], old["height"]
+                        opaque_fraction = old["opaque_fraction"]
+                        row.update(inventory_validation="reused_sha256_checked", reused_from_image_id=old["image_id"])
+                    else:
+                        row["inventory_validation"] = "decoded"
+                        decoded_count += 1
+                        rgb, support = load_rgb(path)
+                        h, w = rgb.shape[:2]
+                        opaque_fraction = float(support.mean())
                     if sha256(path) != before:
                         raise ValueError("Image changed during inspection")
-                    h, w = rgb.shape[:2]
-                    row.update(width=w, height=h, sha256=before, opaque_fraction=float(support.mean()))
+                    if cache_complete:
+                        reused_count += 1
+                    row.update(width=w, height=h, sha256=before, opaque_fraction=opaque_fraction)
                     row["image_status"] = "ready" if (w, h) == (image["width"], image["height"]) else "dimension_mismatch"
+                    if same_identity and row["image_status"] == "ready" and old.get("metadata_status") == "reviewed":
+                        row.update({key: old[key] for key in ("view_id", "building_id", "year", "metadata_notes") if key in old})
+                        row.update(metadata_status="reviewed", metadata_source="previous_manifest",
+                                   metadata_inherited_from_image_id=old["image_id"])
+                        inherited_count += 1
                 except (OSError, ValueError) as exc:
                     row.update(image_status="decode_error", error=str(exc))
+            row.update(metadata.get(str(image["id"]), {}))
             rows.append(row)
         paths = Counter(row["image_path"] for row in rows if row["image_path"])
         for row in rows:
@@ -160,6 +202,8 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None) -> 
         cats = coco.get("categories", [])
         category_ids = {cat["id"] for cat in cats}
         summary = {"image_count": len(rows), "annotation_count": len(anns),
+                   "reused_image_count": reused_count, "decoded_image_count": decoded_count,
+                   "inherited_reviewed_metadata_count": inherited_count,
                    "category_count": len(cats), "image_status": dict(Counter(r["image_status"] for r in rows)),
                    "metadata_status": dict(Counter(r["metadata_status"] for r in rows)),
                    "annotation_nonpositive_area_ids": [a["id"] for a in anns if a.get("area", 1) <= 0],
@@ -177,8 +221,14 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None) -> 
         (out / "summary.txt").write_text(
             f"COCO images: {len(rows)}\nAnnotations: {len(anns)}\n"
             f"Image status: {summary['image_status']}\nMetadata status: {summary['metadata_status']}\n"
+            f"Reused verified RGB metadata: {reused_count}; decode attempts: {decoded_count}; "
+            f"inherited reviewed metadata: {inherited_count}.\n"
             "Filename candidates require review; no split or temporal ground truth has been created.\n",
             encoding="utf-8")
+        if sha256(coco_path) != coco_hash:
+            raise ValueError("Source COCO changed during inspection")
+        if previous_path and sha256(previous_path) != previous_hash:
+            raise ValueError("Previous manifest changed during inspection")
         status = "completed" if all(r["image_status"] == "ready" for r in rows) else "completed_with_issues"
         finish_record(out, record, status)
         return result
