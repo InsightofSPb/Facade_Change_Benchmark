@@ -7,6 +7,23 @@ from facade_change.io import write_json
 
 
 class FilenameRulesTests(unittest.TestCase):
+    def test_confirmed_single_frame_views_keep_pushkinskaya_buildings_separate(self):
+        mappings = [("Nevskii_84_86_right", "Nevskii_84_86"),
+                    ("Pushkinskaya_9", "Pushkinskaya_9"),
+                    ("Pushkinskaya_6", "Pushkinskaya_6"),
+                    ("Pushkinskaya_7", "Pushkinskaya_7"),
+                    ("Kamenoostrovskii_prospect_1_3", "Kamenoostrovskii_prospect_1_3"),
+                    ("Bolshaya_Monetnaya_10", "Bolshaya_Monetnaya_10")]
+        rows = [{"image_id": 1000 + i, "file_name": f"{view}_2026.jpg"}
+                for i, (view, _) in enumerate(mappings)]
+        rules = read_filename_rules(DEFAULT_METADATA_RULES, rows)
+        self.assertEqual(set(rules), {str(row["image_id"]) for row in rows})
+        for row, (view, building) in zip(rows, mappings):
+            rule = rules[str(row["image_id"])]
+            self.assertEqual((rule["view_id"], rule["building_id"], rule["year"]), (view, building, 2026))
+            self.assertEqual(rule["metadata_status"], "reviewed")
+        self.assertNotEqual(rules["1002"]["building_id"], rules["1003"]["building_id"])
+
     def test_view_rules_use_current_ids_and_only_terminal_filename_years(self):
         rows = [{"image_id": 701, "file_name": "deadbeef-house_left_2024.png"},
                 {"id": 903, "file_name": "house_left_2026.png"},

@@ -432,5 +432,35 @@
     "view_id": "zakharievskaya_9",
     "building_id": "zakharievskaya_9",
     "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshaya_Monetnaya_10",
+    "building_id": "Bolshaya_Monetnaya_10",
+    "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
+  },
+  {
+    "view_id": "Kamenoostrovskii_prospect_1_3",
+    "building_id": "Kamenoostrovskii_prospect_1_3",
+    "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
+  },
+  {
+    "view_id": "Nevskii_84_86_right",
+    "building_id": "Nevskii_84_86",
+    "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
+  },
+  {
+    "view_id": "Pushkinskaya_6",
+    "building_id": "Pushkinskaya_6",
+    "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
+  },
+  {
+    "view_id": "Pushkinskaya_7",
+    "building_id": "Pushkinskaya_7",
+    "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
+  },
+  {
+    "view_id": "Pushkinskaya_9",
+    "building_id": "Pushkinskaya_9",
+    "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
   }
 ]
