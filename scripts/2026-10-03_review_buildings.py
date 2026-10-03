@@ -37,7 +37,8 @@ def review_buildings(manifest_path, out):
                 or type(year) is not int or not 1800 <= year <= 2100):
             unresolved.append(row)
             continue
-        address = proposed_building(row["view_id"])
+        address = row.get("building_id") if row.get("metadata_status") == "reviewed" else None
+        address = address or proposed_building(row["view_id"])
         groups[(address or row["view_id"]).casefold()].append(row)
     addresses = [proposed_building(rows[0]["view_id"]) for rows in groups.values()]
     overlaps = possible_group_overlaps([value for value in addresses if value])
@@ -48,14 +49,14 @@ def review_buildings(manifest_path, out):
                      if r.get("metadata_status") == "reviewed" and r.get("building_id")}
         building = next(iter(confirmed)) if len(confirmed) == 1 else proposed
         notes = []
-        if not proposed:
+        if not proposed and not confirmed:
             notes.append("Address lacks a house number; confirm building_id")
         if len(confirmed) > 1:
             notes.append("Conflicting confirmed building IDs: " + ";".join(sorted(confirmed)))
-        if proposed in overlaps:
-            notes.append("Check shared address with: " + ";".join(overlaps[proposed]))
         reviewed = bool(building) and len(confirmed) == 1 and all(
             r.get("metadata_status") == "reviewed" and r.get("building_id") == building for r in rows)
+        if proposed in overlaps and not reviewed:
+            notes.append("Check shared address with: " + ";".join(overlaps[proposed]))
         result.append({"building_id": building or "", "view_ids": ";".join(sorted({r["view_id"] for r in rows})),
                        "image_count": len(rows), "years": ";".join(map(str, sorted({r["year"] for r in rows}))),
                        "reviewed": "true" if reviewed else "false", "notes": "; ".join(notes)})

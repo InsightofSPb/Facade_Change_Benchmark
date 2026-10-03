@@ -154,20 +154,35 @@ def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
 
 
 def read_filename_rules(path, images) -> dict:
-    """Apply confirmed filename mappings to current IDs; absent files stay absent."""
+    """Apply confirmed views, then filename exceptions, to current image IDs."""
     if path is None:
         return {}
     rules = read_json(path)
     if not isinstance(rules, list):
         raise ValueError("Metadata rules must be a JSON list")
-    by_name = defaultdict(list)
+    by_name, by_view = defaultdict(list), defaultdict(list)
     for row in images:
-        by_name[normalized_name(Path(row["file_name"]).name)].append(row)
-    result, seen = {}, set()
+        name = Path(row["file_name"]).name
+        by_name[normalized_name(name)].append(row)
+        candidate = filename_metadata(name)
+        if candidate["view_id"]:
+            by_view[candidate["view_id"]].append((row, candidate["year"]))
+    view_rules, filename_rules, seen = {}, [], set()
     for rule in rules:
         if not isinstance(rule, dict) or any(not isinstance(rule.get(k), str) or not rule[k].strip()
-                for k in ("file_name", "view_id", "building_id")):
-            raise ValueError("Each metadata rule needs file_name, view_id and building_id")
+                for k in ("view_id", "building_id")):
+            raise ValueError("Each metadata rule needs view_id and building_id")
+        if "file_name" not in rule:
+            if "year" in rule:
+                raise ValueError("View metadata rules omit year; it comes from the filename")
+            view = rule["view_id"].strip()
+            old = view_rules.get(view)
+            if old and old["building_id"].strip() != rule["building_id"].strip():
+                raise ValueError(f"Conflicting building assignments for view rule: {view}")
+            view_rules.setdefault(view, rule)
+            continue
+        if not isinstance(rule["file_name"], str) or not rule["file_name"].strip():
+            raise ValueError("Filename metadata rules need a nonempty file_name")
         year = rule.get("year")
         if isinstance(year, bool) or not isinstance(year, int) or not 1800 <= year <= 2100:
             raise ValueError("Each metadata rule needs a valid integer year")
@@ -175,10 +190,19 @@ def read_filename_rules(path, images) -> dict:
         if name in seen or len(by_name[name]) > 1:
             raise ValueError(f"Duplicate or ambiguous metadata rule: {name}")
         seen.add(name)
+        filename_rules.append((name, rule))
+    result = {}
+    for view, rule in view_rules.items():
+        for image, year in by_view[view]:
+            key = str(image.get("image_id", image.get("id")))
+            result[key] = {"view_id": view, "building_id": rule["building_id"].strip(),
+                           "year": year, "metadata_status": "reviewed", "metadata_source": "view_rules",
+                           "metadata_notes": rule.get("notes", "Human-confirmed view mapping")}
+    for name, rule in filename_rules:
         for image in by_name[name]:
             key = str(image.get("image_id", image.get("id")))
             result[key] = {"view_id": rule["view_id"].strip(), "building_id": rule["building_id"].strip(),
-                           "year": year, "metadata_status": "reviewed", "metadata_source": "filename_rules",
+                           "year": rule["year"], "metadata_status": "reviewed", "metadata_source": "filename_rules",
                            "metadata_notes": rule.get("notes", "Human-confirmed filename mapping")}
     return result
 

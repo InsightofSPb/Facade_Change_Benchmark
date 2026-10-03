@@ -1,19 +1,436 @@
 [
-  {"file_name":"man_7_1.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2009},
-  {"file_name":"man_7_2.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2011},
-  {"file_name":"man_7_3.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2013},
-  {"file_name":"manezhnyi_7_2016.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2016},
-  {"file_name":"manezhnyi_7_2019.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2019},
-  {"file_name":"manezhnyi_7_2021.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2021},
-  {"file_name":"manezhnyi_7_2022.png","view_id":"manezhnyi_7","building_id":"manezhnyi_7","year":2022},
-  {"file_name":"Voskova_12_2024.jpg","view_id":"Voskova_12","building_id":"Voskova_12","year":2024},
-  {"file_name":"Voskova_12_2025.jpg","view_id":"Voskova_12","building_id":"Voskova_12","year":2025},
-  {"file_name":"Voskova_12_2026_v1.jpg","view_id":"Voskova_12","building_id":"Voskova_12","year":2026,"notes":"Two 2026 observations retained; phone/Yandex filename assignment unspecified"},
-  {"file_name":"Voskova_12_2026_v2.jpg","view_id":"Voskova_12","building_id":"Voskova_12","year":2026,"notes":"Two 2026 observations retained; phone/Yandex filename assignment unspecified"},
-  {"file_name":"ryileeva_26_2.png","view_id":"ryileeva_26","building_id":"ryileeva_26","year":2024},
-  {"file_name":"ryileeva_26_3.png","view_id":"ryileeva_26","building_id":"ryileeva_26","year":2023},
-  {"file_name":"ryileeva_26_2019.png","view_id":"ryileeva_26","building_id":"ryileeva_26","year":2019},
-  {"file_name":"ryileeva_26_2021.png","view_id":"ryileeva_26","building_id":"ryileeva_26","year":2021},
-  {"file_name":"ryileeva_26_2022.png","view_id":"ryileeva_26","building_id":"ryileeva_26","year":2022},
-  {"file_name":"ryileeva_26_2025.png","view_id":"ryileeva_26","building_id":"ryileeva_26","year":2025}
+  {
+    "file_name": "man_7_1.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2009
+  },
+  {
+    "file_name": "man_7_2.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2011
+  },
+  {
+    "file_name": "man_7_3.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2013
+  },
+  {
+    "file_name": "manezhnyi_7_2016.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2016
+  },
+  {
+    "file_name": "manezhnyi_7_2019.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2019
+  },
+  {
+    "file_name": "manezhnyi_7_2021.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2021
+  },
+  {
+    "file_name": "manezhnyi_7_2022.png",
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "year": 2022
+  },
+  {
+    "file_name": "Voskova_12_2024.jpg",
+    "view_id": "Voskova_12",
+    "building_id": "Voskova_12",
+    "year": 2024
+  },
+  {
+    "file_name": "Voskova_12_2025.jpg",
+    "view_id": "Voskova_12",
+    "building_id": "Voskova_12",
+    "year": 2025
+  },
+  {
+    "file_name": "Voskova_12_2026_v1.jpg",
+    "view_id": "Voskova_12",
+    "building_id": "Voskova_12",
+    "year": 2026,
+    "notes": "Two 2026 observations retained; phone/Yandex filename assignment unspecified"
+  },
+  {
+    "file_name": "Voskova_12_2026_v2.jpg",
+    "view_id": "Voskova_12",
+    "building_id": "Voskova_12",
+    "year": 2026,
+    "notes": "Two 2026 observations retained; phone/Yandex filename assignment unspecified"
+  },
+  {
+    "file_name": "ryileeva_26_2.png",
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "year": 2024
+  },
+  {
+    "file_name": "ryileeva_26_3.png",
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "year": 2023
+  },
+  {
+    "file_name": "ryileeva_26_2019.png",
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "year": 2019
+  },
+  {
+    "file_name": "ryileeva_26_2021.png",
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "year": 2021
+  },
+  {
+    "file_name": "ryileeva_26_2022.png",
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "year": 2022
+  },
+  {
+    "file_name": "ryileeva_26_2025.png",
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "year": 2025
+  },
+  {
+    "view_id": "9-ya_linia_VO_16-18",
+    "building_id": "9-ya_linia_VO_16-18",
+    "notes": "Owner-confirmed building grouping, 2026-10-03; separate building groups, do not merge address ranges"
+  },
+  {
+    "view_id": "9-ya_linia_VO_18",
+    "building_id": "9-ya_linia_VO_18",
+    "notes": "Owner-confirmed building grouping, 2026-10-03; separate building groups, do not merge address ranges"
+  },
+  {
+    "view_id": "Antonenko8",
+    "building_id": "Antonenko8",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshaya_Monetnaya_35_15",
+    "building_id": "Bolshaya_Monetnaya_35_15",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshaya_Podiacheskaya_36",
+    "building_id": "Bolshaya_Podiacheskaya_36",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshaya_Posadskaya_1",
+    "building_id": "Bolshaya_Posadskaya_1",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_104_balcony",
+    "building_id": "Bolshoi_prospect_petrogradskoii_104",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_104_ornament",
+    "building_id": "Bolshoi_prospect_petrogradskoii_104",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_10b_balcony",
+    "building_id": "Bolshoi_prospect_petrogradskoii_10b",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_10b_balcony_bottom",
+    "building_id": "Bolshoi_prospect_petrogradskoii_10b",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_10b_left",
+    "building_id": "Bolshoi_prospect_petrogradskoii_10b",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_10b_right",
+    "building_id": "Bolshoi_prospect_petrogradskoii_10b",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_83_balcony",
+    "building_id": "Bolshoi_prospect_petrogradskoii_83",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_83_ornament",
+    "building_id": "Bolshoi_prospect_petrogradskoii_83",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_83_ornamentbalcony",
+    "building_id": "Bolshoi_prospect_petrogradskoii_83",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Bolshoi_prospect_petrogradskoii_83_vase",
+    "building_id": "Bolshoi_prospect_petrogradskoii_83",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Dekabristov_46_closeup",
+    "building_id": "Dekabristov_46",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Dekabristov_46_closeup_right",
+    "building_id": "Dekabristov_46",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Graphtio_1",
+    "building_id": "Graphtio_1",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Grazjdanskaya_19",
+    "building_id": "Grazjdanskaya_19",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Grazjdanskaya_28",
+    "building_id": "Grazjdanskaya_28",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Instrumentalnaya_3a_chuch_left",
+    "building_id": "Instrumentalnaya_3a",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kadetskaay_linia_1",
+    "building_id": "Kadetskaay_linia_1",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kamennoostrovskii_61",
+    "building_id": "Kamennoostrovskii_61",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kamennoostrovskii_67",
+    "building_id": "Kamennoostrovskii_67",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kamennoostrovskii_67_top",
+    "building_id": "Kamennoostrovskii_67",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kamennoostrovskii_75_right",
+    "building_id": "Kamennoostrovskii_75",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kamenoostrovskii_13_2_balcony",
+    "building_id": "Kamenoostrovskii_13_2",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kamenoostrovskii_13_2_ornament",
+    "building_id": "Kamenoostrovskii_13_2",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Kaznacheiskaya",
+    "building_id": "Kaznacheiskaya_2",
+    "notes": "Owner-confirmed building grouping, 2026-10-03; distinct facade parts, shared building"
+  },
+  {
+    "view_id": "Kaznacheiskaya_2",
+    "building_id": "Kaznacheiskaya_2",
+    "notes": "Owner-confirmed building grouping, 2026-10-03; distinct facade parts, shared building"
+  },
+  {
+    "view_id": "Malaya_Monetnaya_5",
+    "building_id": "Malaya_Monetnaya_5",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Malii_Prospect_17",
+    "building_id": "Malii_Prospect_17",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Nikolskii_pereulok_5",
+    "building_id": "Nikolskii_pereulok_5",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Nikolskii_pereulok_7",
+    "building_id": "Nikolskii_pereulok_7",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ProfPopova4v_balcony",
+    "building_id": "ProfPopova4v",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ProfPopova4v_balconyv2",
+    "building_id": "ProfPopova4v",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ProfPopova4v_ornament",
+    "building_id": "ProfPopova4v",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ProfPopova4v_ornament3",
+    "building_id": "ProfPopova4v",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ProfPopova4v_repairs",
+    "building_id": "ProfPopova4v",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ProfPopova4v_roof",
+    "building_id": "ProfPopova4v",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Srednii_prospekt_VO_27",
+    "building_id": "Srednii_prospekt_VO_27",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Strelninskaya_6",
+    "building_id": "Strelninskaya_6",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Lenina_46_balcony",
+    "building_id": "Ulitsa_Lenina_46",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Lenina_46_balcony_right",
+    "building_id": "Ulitsa_Lenina_46",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Lenina_46_facade",
+    "building_id": "Ulitsa_Lenina_46",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Lva_Tolstogo_4",
+    "building_id": "Ulitsa_Lva_Tolstogo_4",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Mira_15_wall_left",
+    "building_id": "Ulitsa_Mira_15",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Mira_15_wall_right",
+    "building_id": "Ulitsa_Mira_15",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Ulitsa_Mira_17_wall",
+    "building_id": "Ulitsa_Mira_17",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Voronejskaya_9_7",
+    "building_id": "Voronejskaya_9_7",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Voskova_10",
+    "building_id": "Voskova_10",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Voskova_12",
+    "building_id": "Voskova_12",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "Vsevoloda_Vishnevskogo_9",
+    "building_id": "Vsevoloda_Vishnevskogo_9",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "baskov_32",
+    "building_id": "baskov_32",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "baskov_34",
+    "building_id": "baskov_34",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "chaickovskogo_42",
+    "building_id": "chaickovskogo_42",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "krasnoarmeyskaya_8_14",
+    "building_id": "krasnoarmeyskaya_8_14",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "manezhnyi_7",
+    "building_id": "manezhnyi_7",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "marata_44",
+    "building_id": "marata_44",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "marata_54_34",
+    "building_id": "marata_54_34",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ruzovskaya_9",
+    "building_id": "ruzovskaya_9",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "ryileeva_26",
+    "building_id": "ryileeva_26",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "vereiskaya_13_11",
+    "building_id": "vereiskaya_13_11",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "zakharievskaya_1",
+    "building_id": "zakharievskaya_1",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  },
+  {
+    "view_id": "zakharievskaya_9",
+    "building_id": "zakharievskaya_9",
+    "notes": "Owner-confirmed building grouping, 2026-10-03"
+  }
 ]

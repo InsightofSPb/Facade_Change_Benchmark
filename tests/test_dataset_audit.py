@@ -60,6 +60,7 @@ class DatasetAuditTests(unittest.TestCase):
         self.assertEqual({(p["reference_id"], p["source_id"]) for p in prepared["pairs"]},
                          {(1070, 1071), (1071, 1072), (1071, 1073)})
         self.assertEqual(audit["unreviewed_ready_image_count"], 2)
+        self.assertEqual(audit["unreviewed_eligible_image_count"], 1)
         self.assertEqual(audit["pairing_status"], {"pair_candidate": 4, "metadata_or_image_unresolved": 1,
                                                 "single_year_view": 1})
         with (out / "metadata_review_with_names.csv").open(encoding="utf-8", newline="") as handle:

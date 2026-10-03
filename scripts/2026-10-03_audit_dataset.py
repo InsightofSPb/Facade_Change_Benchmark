@@ -151,6 +151,8 @@ def run_audit(config_path, previous_manifest, out, metadata_fixes=None):
                  "pairing_status": dict(Counter(r["pairing_status"] for r in review_rows)),
                  "unreviewed_ready_image_count": sum(r["image_status"] == "ready" and
                                                       r["reviewed"] != "true" for r in review_rows),
+                 "unreviewed_eligible_image_count": sum(not r["preparation_exclusion_reasons"] and (
+                     r.get("metadata_status") != "reviewed" or not r.get("building_id")) for r in prepared["images"]),
                  "images_without_annotations": [r["image_id"] for r in review_rows if not r["annotation_count"]],
                  "scope": "COCO metadata and image bytes; semantic masks not rasterized; "
                           "temporal pairs are candidates, geometry not checked; exploratory dev only"}
@@ -163,8 +165,9 @@ def run_audit(config_path, previous_manifest, out, metadata_fixes=None):
             f"Image status: {inventory['summary']['image_status']}\n"
             f"Reused with SHA-256 check: {inventory['summary']['reused_image_count']}; "
             f"decoded: {inventory['summary']['decoded_image_count']}\n"
-            f"Confirmed filename fixes: {len(fixed_names)}\n"
+            f"Confirmed metadata mappings: {len(fixed_names)}\n"
             f"Unreviewed ready images: {audit['unreviewed_ready_image_count']}\n"
+            f"Unreviewed eligible images: {audit['unreviewed_eligible_image_count']}\n"
             f"Images without annotations: {len(audit['images_without_annotations'])}\n"
             f"Annotation metadata issues: { {key: len(value) for key, value in annotation_issues.items()} }\n"
             f"Pairing status: {audit['pairing_status']}\n"

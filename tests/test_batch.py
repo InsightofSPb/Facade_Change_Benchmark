@@ -271,6 +271,40 @@ class UnifiedPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "COCO|coco"):
             self.runner.run_dataset(self.config, self.root / "stale", prepare_only=True)
 
+    def test_view_rules_confirm_cached_inventory_without_csv_or_rgb_decode(self):
+        config = read_json(self.config)
+        config.update(metadata_csv=None, metadata_rules=None)
+        write_json(self.config, config)
+        build_manifest(self.config, self.root / "cached")
+        manifest_path = self.root / "cached/manifest.json"
+        before = manifest_path.read_bytes()
+        cached = read_json(manifest_path)
+        self.assertTrue(all(row["metadata_status"] == "inferred" and row["building_id"] is None
+                            for row in cached["images"]))
+        rules_path = self.config.parent / "view_rules.json"
+        write_json(rules_path, [{"view_id": f"building{group:02d}", "building_id": f"physical{group}"}
+                               for group in range(10)])
+        config.update(manifest_path=str(manifest_path), metadata_rules=str(rules_path))
+        write_json(self.config, config)
+        out = self.root / "confirmed-cache"
+        with patch("facade_change.data.load_rgb", side_effect=AssertionError("Cached RGB must not decode")):
+            summary = self.runner.run_dataset(self.config, out, prepare_only=True)
+        self.assertEqual(summary["status"], "completed")
+        self.assertTrue(summary["inventory_reused"])
+        self.assertFalse((out / "inventory").exists())
+        self.assertEqual(manifest_path.read_bytes(), before)
+        prepared = read_json(out / "prepared/manifest.json")
+        self.assertEqual([(row["view_id"], row["year"]) for row in prepared["images"]],
+                         [(row["view_id"], row["year"]) for row in cached["images"]])
+        self.assertTrue(all(row["metadata_status"] == "reviewed" and row["gold_member"]
+                            and row["building_id"] == f"physical{row['image_id'] // 2}"
+                            for row in prepared["images"]))
+        split = read_json(out / "prepared/split.json")
+        self.assertFalse(split["development_only"])
+        self.assertEqual(len(split["gold_cohort"]), 20)
+        self.assertEqual(len(prepared["pairs"]), 10)
+        self.assertEqual(summary["preparation"]["image_splits"], {"train": 14, "val": 2, "test": 4})
+
     def test_preprocessing_keeps_raw_source_and_reuses_validated_inventory(self):
         coco_path = self.config.parent / "coco.json"
         coco = read_json(coco_path)

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from facade_change.data import DEFAULT_METADATA_RULES, read_filename_rules
 from facade_change.io import read_json, write_json
 
 
@@ -13,6 +14,30 @@ spec.loader.exec_module(review)
 
 
 class BuildingReviewTests(unittest.TestCase):
+    def test_confirmed_aliases_share_building_but_confirmed_address_groups_stay_separate(self):
+        views = ["Kaznacheiskaya", "Kaznacheiskaya_2",
+                 "9-ya_linia_VO_16-18", "9-ya_linia_VO_18"]
+        rows = [{"image_id": 500 + i, "file_name": f"{view}_2025.png", "image_status": "ready",
+                 "year": 2025, "view_id": view, "metadata_status": "inferred", "building_id": None}
+                for i, view in enumerate(views)]
+        rules = read_filename_rules(DEFAULT_METADATA_RULES, rows)
+        for row in rows:
+            row.update(rules[str(row["image_id"])])
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            manifest = root / "manifest.json"
+            write_json(manifest, {"images": rows})
+            groups, summary = review.review_buildings(manifest, root / "review")
+        by_building = {group["building_id"]: group for group in groups}
+        self.assertEqual(set(by_building), {"Kaznacheiskaya_2", "9-ya_linia_VO_16-18", "9-ya_linia_VO_18"})
+        self.assertEqual(by_building["Kaznacheiskaya_2"]["view_ids"], "Kaznacheiskaya;Kaznacheiskaya_2")
+        self.assertEqual(by_building["Kaznacheiskaya_2"]["image_count"], 2)
+        for view in views[2:]:
+            self.assertEqual(by_building[view]["view_ids"], view)
+            self.assertEqual(by_building[view]["image_count"], 1)
+        self.assertTrue(all(group["reviewed"] == "true" for group in groups))
+        self.assertEqual(summary["eligible_images"], 4)
+
     def test_detail_groups_preserve_address_numbers_and_house_letters(self):
         for view, expected in [("Bolshoi_10b_balcony_bottom", "Bolshoi_10b"),
                                ("Kamenoostrovskii_13_2_ornament", "Kamenoostrovskii_13_2"),
