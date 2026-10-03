@@ -271,6 +271,27 @@ class UnifiedPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "COCO|coco"):
             self.runner.run_dataset(self.config, self.root / "stale", prepare_only=True)
 
+    def test_preprocessing_keeps_raw_source_and_reuses_validated_inventory(self):
+        coco_path = self.config.parent / "coco.json"
+        coco = read_json(coco_path)
+        coco["annotations"].append({**coco["annotations"][0], "id": 101, "area": 0})
+        write_json(coco_path, coco)
+        before = coco_path.read_bytes()
+        build_manifest(self.config, self.root / "raw-inventory")
+        config = read_json(self.config)
+        config["manifest_path"] = str(self.root / "raw-inventory/manifest.json")
+        write_json(self.config, config)
+        out = self.root / "cleaned"
+        with patch("facade_change.data.load_rgb", side_effect=AssertionError("Unchanged RGB decoded")):
+            summary = self.runner.run_dataset(self.config, out, prepare_only=True)
+        self.assertEqual(coco_path.read_bytes(), before)
+        self.assertEqual(summary["annotation_preprocessing"]["summary"]["removed_annotation_count"], 1)
+        index = read_json(out / summary["index_path"])
+        self.assertEqual(index["source_annotations"]["original_path"], str(coco_path))
+        self.assertNotEqual(index["source_annotations"]["path"], str(coco_path))
+        self.assertEqual(len(read_json(index["source_annotations"]["path"])["annotations"]), 1)
+        self.assertEqual(len(read_json(out / "prepared/manifest.json")["images"]), 20)
+
     def test_unreviewed_metadata_emits_tables_without_alignment(self):
         config = read_json(self.config)
         config["metadata_csv"] = None

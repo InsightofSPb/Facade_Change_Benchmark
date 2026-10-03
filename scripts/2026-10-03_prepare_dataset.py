@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import sys
 from collections import Counter
@@ -10,7 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from facade_change.batch import run_batch
-from facade_change.data import build_manifest, read_overrides
+from facade_change.data import (DEFAULT_METADATA_RULES, REVIEW_FIELDS, build_manifest,
+                                preprocess_coco, read_filename_rules, read_overrides)
 from facade_change.io import finish_record, new_directory, read_json, run_record, sha256, write_json
 from facade_change.preparation import prepare_dataset
 
@@ -26,7 +28,8 @@ def load_config(path):
         "crops": {"tile_size": 256, "stride": 128, "min_valid_fraction": .8,
                   "method": "cascade", "controls": 1},
     }
-    allowed = {"coco_json", "image_roots", "manifest_path", "metadata_csv", "previous_split", "pair_policy", *defaults}
+    allowed = {"coco_json", "image_roots", "manifest_path", "metadata_csv", "metadata_rules",
+               "previous_split", "pair_policy", *defaults}
     if not isinstance(config, dict) or set(config) - allowed:
         raise ValueError("Config must be an object with only supported dataset options")
     for name, values in defaults.items():
@@ -35,6 +38,7 @@ def load_config(path):
             raise ValueError(f"Unsupported {name} options; expected {sorted(values)}")
         config[name] = {**values, **supplied}
     config.setdefault("pair_policy", "adjacent")
+    config.setdefault("metadata_rules", str(DEFAULT_METADATA_RULES))
     if not isinstance(config["pair_policy"], str) or config["pair_policy"] not in {"adjacent", "first-anchor", "all"}:
         raise ValueError("pair_policy must be adjacent, first-anchor or all")
     split, alignment, crops = (config[name] for name in defaults)
@@ -88,7 +92,7 @@ def load_config(path):
     if not isinstance(roots, list) or not roots:
         raise ValueError("image_roots must be a nonempty list")
     config["image_roots"] = sorted({absolute(root) for root in roots})
-    for key in ("manifest_path", "metadata_csv", "previous_split"):
+    for key in ("manifest_path", "metadata_csv", "metadata_rules", "previous_split"):
         config[key] = absolute(config[key]) if config.get(key) is not None else None
     if alignment["checkpoint"] != "auto":
         alignment["checkpoint"] = absolute(alignment["checkpoint"])
@@ -99,7 +103,9 @@ def run_dataset(config_path, out, prepare_only=False):
     """Run all requested stages in a new directory; preserve partial results on failure."""
     config_path = Path(config_path).expanduser().resolve()
     config = load_config(config_path)
+    input_coco = config["coco_json"]
     annotation_hash = sha256(config["coco_json"])
+    input_annotation_hash = annotation_hash
     manifest_path = Path(config["manifest_path"]) if config["manifest_path"] else None
     manifest = read_json(manifest_path) if manifest_path else None
     if manifest is not None:
@@ -116,6 +122,7 @@ def run_dataset(config_path, out, prepare_only=False):
             raise ValueError("Reused manifest must contain exactly the current COCO images and dimensions; "
                              "build a fresh inventory")
     metadata_hash = sha256(config["metadata_csv"]) if config["metadata_csv"] else None
+    rules_hash = sha256(config["metadata_rules"]) if config["metadata_rules"] else None
     previous_split_hash = sha256(config["previous_split"]) if config["previous_split"] else None
     out = new_directory(out)
     record = run_record("dataset", {**config, "config_path": str(config_path),
@@ -124,6 +131,7 @@ def run_dataset(config_path, out, prepare_only=False):
                                    "coco_sha256": annotation_hash,
                                    "manifest_sha256": sha256(manifest_path) if manifest_path else None,
                                    "metadata_sha256": metadata_hash,
+                                   "metadata_rules_sha256": rules_hash,
                                    "previous_split_sha256": previous_split_hash,
                                    "image_selection": "current_coco_images_only"})
     write_json(out / "run.json", record)
@@ -133,11 +141,32 @@ def run_dataset(config_path, out, prepare_only=False):
                "image_selection": "current_coco_images_only", "previous_split_applied": False,
                "crop_count": 0, "crop_splits": {}, "index_path": None, "alignment": None}
     try:
+        preprocessing = preprocess_coco(input_coco, out / "preprocessed")
+        summary["annotation_preprocessing"] = preprocessing
+        cache_path = None
+        if preprocessing["summary"]["removed_annotation_count"]:
+            config["coco_json"] = preprocessing["coco_path"]
+            annotation_hash = sha256(config["coco_json"])
+            cache_path = manifest_path
+            manifest = None
+            write_json(normalized_config, config)
         if manifest is None:
-            manifest = build_manifest(normalized_config, out / "inventory")
+            manifest = build_manifest(normalized_config, out / "inventory", previous_manifest=cache_path)
             manifest_path = out / "inventory/manifest.json"
         summary["input_issues"] = sum(row.get("image_status") != "ready" for row in manifest["images"])
-        overrides = read_overrides(config["metadata_csv"], {str(row["image_id"]) for row in manifest["images"]})
+        rules = read_filename_rules(config["metadata_rules"], manifest["images"])
+        overrides = {**rules, **read_overrides(config["metadata_csv"],
+                                              {str(row["image_id"]) for row in manifest["images"]})}
+        override_path = config["metadata_csv"]
+        if rules:
+            override_path = out / "metadata_overrides.csv"
+            with override_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=REVIEW_FIELDS)
+                writer.writeheader()
+                writer.writerows({"image_id": key, "view_id": value["view_id"],
+                                  "building_id": value["building_id"], "year": value["year"],
+                                  "reviewed": "true", "notes": value.get("metadata_notes", "")}
+                                 for key, value in overrides.items())
         incomplete = []
         for original in manifest["images"]:
             row = {**original, **overrides.get(str(original["image_id"]), {})}
@@ -148,7 +177,7 @@ def run_dataset(config_path, out, prepare_only=False):
                 incomplete.append(row["image_id"])
         split = config["split"]
         needs_review = split["mode"] == "reviewed" and bool(incomplete)
-        prepared = prepare_dataset(manifest_path, out / "prepared", overrides=config["metadata_csv"],
+        prepared = prepare_dataset(manifest_path, out / "prepared", overrides=override_path,
                                    split_mode="dev" if needs_review else split["mode"],
                                    pair_policy=config["pair_policy"], seed=split["seed"],
                                    val_fraction=split["val"], test_fraction=split["test"],
@@ -186,7 +215,9 @@ def run_dataset(config_path, out, prepare_only=False):
                                       "original_source_path": images[str(crop["source_id"])]["image_path"]})
             index = {"schema_version": 1, "image_selection": "current_coco_images_only",
                      "source_annotations": {"path": config["coco_json"],
-                     "sha256": annotation_hash, "categories": prepared["categories"]},
+                     "sha256": annotation_hash, "categories": prepared["categories"],
+                     "original_path": input_coco, "original_sha256": input_annotation_hash,
+                     "preprocessing": preprocessing},
                      "semantic_masks": {"rasterized": False}, "temporal_ground_truth": "not_created",
                      "split": read_json(out / "prepared/split.json"), "pairs": prepared["pairs"], "crops": crop_rows}
             index_name = record["started_utc"][:10] + "_dataset_index.json"
@@ -200,6 +231,10 @@ def run_dataset(config_path, out, prepare_only=False):
             summary.update(crop_count=len(crop_rows), crop_splits=dict(Counter(row["split"] for row in crop_rows)),
                            index_path=index_name, status="completed_with_issues" if issues else
                            "completed" if prepare_only else "completed_needs_review")
+        if sha256(input_coco) != input_annotation_hash or sha256(config["coco_json"]) != annotation_hash:
+            raise ValueError("Source or preprocessed COCO changed during dataset preparation")
+        if rules_hash and sha256(config["metadata_rules"]) != rules_hash:
+            raise ValueError("Metadata rules changed during dataset preparation")
         write_json(out / "summary.json", summary)
         (out / "summary.txt").write_text(
             f"Status: {summary['status']}\nInput issues: {summary['input_issues']}\n"
@@ -207,6 +242,8 @@ def run_dataset(config_path, out, prepare_only=False):
             f"Metadata review: {summary['metadata_review']}\nGroup review: {summary['group_review']}\n"
             f"Dataset index: {summary['index_path']}\n"
             f"Missing gold images: {prepared['summary']['missing_gold_sha256']}\n"
+            f"Annotations removed (stored area <= 0): {preprocessing['summary']['removed_annotation_count']}\n"
+            f"Annotation removal log: {preprocessing['report_path']}\n"
             "Only images listed in the current COCO are selected; other directory images are excluded.\n"
             "COCO semantic masks were not rasterized; temporal ground truth was not created.\n",
             encoding="utf-8")

@@ -79,6 +79,24 @@ class DatasetAuditTests(unittest.TestCase):
             self.audit.run_audit(self.config, self.root / "old/manifest.json", self.root / "failed", self.fixes)
         self.assertEqual(read_json(self.root / "failed/run.json")["status"], "failed")
 
+    def test_zero_area_filter_uses_cleaned_counts_without_decoding_or_removing_images(self):
+        coco = read_json(self.coco)
+        coco["annotations"] = [{"id": i, "image_id": 70, "category_id": 5, "area": area}
+                               for i, area in enumerate([10, 0, -1], 1)]
+        coco["categories"] = [{"id": 5, "name": "synthetic"}]
+        write_json(self.coco, coco)
+        before = self.coco.read_bytes()
+        with patch("facade_change.data.load_rgb", side_effect=AssertionError("Unchanged RGB decoded")):
+            audit, status = self.audit.run_audit(self.config, self.root / "old/manifest.json",
+                                                 self.root / "clean", self.fixes)
+        self.assertEqual(status, "completed")
+        self.assertEqual(self.coco.read_bytes(), before)
+        self.assertEqual(audit["inventory"]["image_count"], 6)
+        self.assertEqual(audit["inventory"]["annotation_count"], 1)
+        self.assertEqual(audit["inventory"]["decoded_image_count"], 0)
+        self.assertEqual(audit["annotation_preprocessing"]["summary"]["removed_annotation_count"], 2)
+        self.assertEqual(audit["annotation_issues"]["annotation_nonpositive_area_ids"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

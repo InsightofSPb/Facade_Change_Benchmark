@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from facade_change.data import REVIEW_FIELDS, build_manifest, normalized_name
+from facade_change.data import REVIEW_FIELDS, build_manifest, normalized_name, preprocess_coco, read_filename_rules
 from facade_change.io import finish_record, new_directory, read_json, run_record, sha256, write_json
 
 spec = importlib.util.spec_from_file_location(
@@ -71,18 +71,27 @@ def run_audit(config_path, previous_manifest, out, metadata_fixes=None):
         "metadata_fixes_sha256": sha256(metadata_fixes) if metadata_fixes else None,
         "image_selection": "current_coco_images_only", "config": config,
         "runner_sha256": sha256(Path(__file__)),
+        "coco_sha256": sha256(config["coco_json"]),
     })
     write_json(out / "run.json", record)
     try:
-        inventory = build_manifest(config_path, out / "inventory", overrides=config["metadata_csv"],
+        preprocessing = preprocess_coco(config["coco_json"], out / "preprocessed")
+        inventory_config = {**config}
+        if preprocessing["summary"]["removed_annotation_count"]:
+            inventory_config["coco_json"] = preprocessing["coco_path"]
+        write_json(out / "inventory_config.json", inventory_config)
+        inventory = build_manifest(out / "inventory_config.json", out / "inventory", overrides=config["metadata_csv"],
                                    previous_manifest=previous_manifest)
         rows, fixed_names = confirmed_rows(inventory["images"], metadata_fixes)
+        rules = read_filename_rules(config["metadata_rules"], inventory["images"])
+        fixed_names = sorted(set(fixed_names) | {normalized_name(Path(r["file_name"]).name)
+                             for r in inventory["images"] if str(r["image_id"]) in rules})
         metadata_path = out / "metadata_confirmed.csv"
         with metadata_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=REVIEW_FIELDS)
             writer.writeheader()
             writer.writerows(rows)
-        effective = {**config, "manifest_path": str(out / "inventory/manifest.json"),
+        effective = {**inventory_config, "manifest_path": str(out / "inventory/manifest.json"),
                      "metadata_csv": str(metadata_path)}
         # Audit is exploratory: leave freezing or extending gold to the dataset command.
         effective["split"] = {**config["split"], "mode": "dev"}
@@ -90,8 +99,9 @@ def run_audit(config_path, previous_manifest, out, metadata_fixes=None):
         write_json(out / "dataset_config.json", effective)
         result = runner.run_dataset(out / "dataset_config.json", out / "dataset", prepare_only=True)
         prepared = read_json(out / "dataset/prepared/manifest.json")
-        coco = read_json(config["coco_json"])
-        if sha256(config["coco_json"]) != inventory["source"]["coco_sha256"]:
+        coco = read_json(inventory["source"]["coco_json"])
+        if (sha256(config["coco_json"]) != record["config"]["coco_sha256"] or
+                sha256(inventory["source"]["coco_json"]) != inventory["source"]["coco_sha256"]):
             raise ValueError("Source COCO changed during audit")
         annotation_counts = Counter(str(a["image_id"]) for a in coco.get("annotations", []))
         pair_counts = Counter(str(p[key]) for p in prepared["pairs"]
@@ -137,6 +147,7 @@ def run_audit(config_path, previous_manifest, out, metadata_fixes=None):
         audit = {"schema_version": 1, "inventory": inventory["summary"],
                  "preparation": prepared["summary"], "metadata_fixes": fixed_names,
                  "confirmed_pairs": confirmed_pairs, "annotation_issues": annotation_issues,
+                 "annotation_preprocessing": preprocessing,
                  "pairing_status": dict(Counter(r["pairing_status"] for r in review_rows)),
                  "unreviewed_ready_image_count": sum(r["image_status"] == "ready" and
                                                       r["reviewed"] != "true" for r in review_rows),
@@ -147,6 +158,8 @@ def run_audit(config_path, previous_manifest, out, metadata_fixes=None):
         (out / "summary.txt").write_text(
             f"COCO: {config['coco_json']}\nImages: {inventory['summary']['image_count']}; "
             f"annotations: {inventory['summary']['annotation_count']}\n"
+            f"Annotations removed (stored area <= 0): {preprocessing['summary']['removed_annotation_count']}\n"
+            f"Annotation removal log: {preprocessing['report_path']}\n"
             f"Image status: {inventory['summary']['image_status']}\n"
             f"Reused with SHA-256 check: {inventory['summary']['reused_image_count']}; "
             f"decoded: {inventory['summary']['decoded_image_count']}\n"

@@ -13,6 +13,54 @@ PREFIX = re.compile(r"^[0-9a-fA-F]{8}-")
 YEAR = re.compile(r"^(?P<view>.+)_(?P<year>(?:19|20)\d{2})$")
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 REVIEW_FIELDS = ["image_id", "view_id", "building_id", "year", "reviewed", "notes"]
+DEFAULT_METADATA_RULES = Path(__file__).resolve().parents[1] / "configs/2026-10-03_metadata_rules.json"
+
+
+def preprocess_coco(coco_path, out) -> dict:
+    """Copy COCO unchanged except annotations with explicitly stored area <= 0."""
+    coco_path = Path(coco_path).expanduser().resolve()
+    source_hash = sha256(coco_path)
+    rule = "remove_only_explicit_area_le_zero"
+    out = new_directory(out)
+    record = run_record("coco_preprocessing", {"coco_path": str(coco_path),
+                        "coco_sha256": source_hash, "rule": rule})
+    write_json(out / "run.json", record)
+    try:
+        coco = read_json(coco_path)
+        annotations = coco.get("annotations", [])
+        retained, removed = [], []
+        for annotation in annotations:
+            (removed if "area" in annotation and annotation["area"] <= 0 else retained).append(annotation)
+        images = coco.get("images", [])
+        categories = coco.get("categories", [])
+        image_lookup = {str(row["id"]): row for row in images}
+        category_lookup = {str(row["id"]): row for row in categories}
+        annotated_ids = {str(row["image_id"]) for row in retained}
+        summary = {"image_count": len(images), "category_count": len(categories),
+                   "original_annotation_count": len(annotations), "retained_annotation_count": len(retained),
+                   "removed_annotation_count": len(removed),
+                   "images_without_annotations_count": sum(str(row["id"]) not in annotated_ids for row in images)}
+        cleaned_path = out / "annotations.json"
+        write_json(cleaned_path, {**coco, "annotations": retained})
+        report_path = out / "removed_annotations.json"
+        report = {"rule": rule, "summary": summary,
+                  "source": {"coco_path": str(coco_path), "sha256": source_hash},
+                  "output": {"coco_path": str(cleaned_path), "sha256": sha256(cleaned_path)},
+                  "removed_annotations": [{
+                      "annotation_id": row["id"], "image_id": row["image_id"],
+                      "file_name": image_lookup.get(str(row["image_id"]), {}).get("file_name"),
+                      "category_id": row["category_id"],
+                      "category_name": category_lookup.get(str(row["category_id"]), {}).get("name"),
+                      "area": row["area"], "bbox": row.get("bbox"),
+                  } for row in removed]}
+        write_json(report_path, report)
+        if sha256(coco_path) != source_hash:
+            raise ValueError("Source COCO changed during preprocessing")
+        finish_record(out, record, "completed")
+        return {"coco_path": str(cleaned_path), "report_path": str(report_path), "summary": summary}
+    except Exception as exc:
+        finish_record(out, record, "failed", str(exc))
+        raise
 
 
 def normalized_name(name: str) -> str:
@@ -105,6 +153,36 @@ def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
     return result
 
 
+def read_filename_rules(path, images) -> dict:
+    """Apply confirmed filename mappings to current IDs; absent files stay absent."""
+    if path is None:
+        return {}
+    rules = read_json(path)
+    if not isinstance(rules, list):
+        raise ValueError("Metadata rules must be a JSON list")
+    by_name = defaultdict(list)
+    for row in images:
+        by_name[normalized_name(Path(row["file_name"]).name)].append(row)
+    result, seen = {}, set()
+    for rule in rules:
+        if not isinstance(rule, dict) or any(not isinstance(rule.get(k), str) or not rule[k].strip()
+                for k in ("file_name", "view_id", "building_id")):
+            raise ValueError("Each metadata rule needs file_name, view_id and building_id")
+        year = rule.get("year")
+        if isinstance(year, bool) or not isinstance(year, int) or not 1800 <= year <= 2100:
+            raise ValueError("Each metadata rule needs a valid integer year")
+        name = normalized_name(Path(rule["file_name"]).name)
+        if name in seen or len(by_name[name]) > 1:
+            raise ValueError(f"Duplicate or ambiguous metadata rule: {name}")
+        seen.add(name)
+        for image in by_name[name]:
+            key = str(image.get("image_id", image.get("id")))
+            result[key] = {"view_id": rule["view_id"].strip(), "building_id": rule["building_id"].strip(),
+                           "year": year, "metadata_status": "reviewed", "metadata_source": "filename_rules",
+                           "metadata_notes": rule.get("notes", "Human-confirmed filename mapping")}
+    return result
+
+
 def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
                    previous_manifest=None) -> dict:
     """Inventory the current COCO; reuse verified RGB metadata by image identity."""
@@ -132,12 +210,17 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
             if name:
                 previous_names[name].append(row)
     current_names = Counter(normalized_name(Path(image["file_name"]).name) for image in images)
-    metadata = read_overrides(overrides, ids)
+    rules_value = config.get("metadata_rules", str(DEFAULT_METADATA_RULES))
+    rules_path = Path(absolute(rules_value)) if rules_value else None
+    rules_hash = sha256(rules_path) if rules_path else None
+    metadata = {**read_filename_rules(rules_path, images), **read_overrides(overrides, ids)}
     resolver = ImageResolver(roots)
     config = {"coco_json": str(coco_path), "image_roots": roots,
               "coco_sha256": coco_hash,
               "previous_manifest_path": str(previous_path) if previous_path else None,
               "previous_manifest_sha256": previous_hash,
+              "metadata_rules_path": str(rules_path) if rules_path else None,
+              "metadata_rules_sha256": rules_hash,
               "overrides_sha256": sha256(overrides) if overrides else None}
     out = new_directory(out)
     record = run_record("manifest", config)
@@ -229,6 +312,8 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
             raise ValueError("Source COCO changed during inspection")
         if previous_path and sha256(previous_path) != previous_hash:
             raise ValueError("Previous manifest changed during inspection")
+        if rules_path and sha256(rules_path) != rules_hash:
+            raise ValueError("Metadata rules changed during inspection")
         status = "completed" if all(r["image_status"] == "ready" for r in rows) else "completed_with_issues"
         finish_record(out, record, status)
         return result
