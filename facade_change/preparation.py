@@ -59,7 +59,7 @@ def _write_csv(path, rows, fields):
         writer.writerows(rows)
 
 
-def split_reviewed_buildings(images, val_fraction=.15, test_fraction=.15, seed=42):
+def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=42):
     """Approximate requested image fractions while keeping each building intact."""
     weights = Counter(row["building_id"] for row in images)
     fractions = {"train": 1 - val_fraction - test_fraction, "val": val_fraction, "test": test_fraction}
@@ -135,7 +135,7 @@ def split_reviewed_buildings(images, val_fraction=.15, test_fraction=.15, seed=4
 
 
 def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
-                    pair_policy="adjacent", seed=42, val_fraction=.15, test_fraction=.15,
+                    pair_policy="adjacent", seed=42, val_fraction=.10, test_fraction=.20,
                     assets_config=None) -> dict:
     """Prepare metadata without opening source photographs or rasterizing COCO.
 

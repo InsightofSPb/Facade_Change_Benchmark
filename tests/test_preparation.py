@@ -89,7 +89,7 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(balance["test"]["building_count"], 0)
         validate_partitions(result["images"])
 
-    def test_default_train_val_test_uses_70_15_15_image_targets(self):
+    def test_default_train_val_test_uses_70_10_20_image_targets(self):
         rows = []
         for group, size in (("large", 14), ("two1", 2), ("one1", 1), ("two2", 2), ("one2", 1)):
             for _ in range(size):
@@ -97,10 +97,14 @@ class PreparationTests(unittest.TestCase):
         self.save(rows)
         result = prepare_dataset(self.manifest, self.root / "split", split_mode="reviewed")
         balance = result["summary"]["split_balance"]["partitions"]
-        self.assertEqual({name: stats["target_image_fraction"] for name, stats in balance.items()},
-                         {"train": .7, "val": .15, "test": .15})
+        for name, target in {"train": .7, "val": .10, "test": .20}.items():
+            self.assertAlmostEqual(balance[name]["target_image_fraction"], target)
         self.assertEqual({name: stats["image_count"] for name, stats in balance.items()},
-                         {"train": 14, "val": 3, "test": 3})
+                         {"train": 14, "val": 2, "test": 4})
+        buildings = {}
+        for row in result["images"]:
+            buildings.setdefault(row["building_id"], set()).add(row["split"])
+        self.assertTrue(all(len(splits) == 1 for splits in buildings.values()))
         validate_partitions(result["images"])
 
     def test_indivisible_buildings_report_achieved_image_fraction(self):

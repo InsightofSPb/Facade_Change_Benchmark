@@ -1,0 +1,19 @@
+{
+  "coco_json": "/absolute/path/to/annotations.json",
+  "image_roots": ["/absolute/path/to/original_images"],
+  "manifest_path": null,
+  "metadata_csv": null,
+  "split": {"train": 0.70, "val": 0.10, "test": 0.20, "seed": 42, "mode": "reviewed"},
+  "pair_policy": "adjacent",
+  "alignment": {
+    "methods": ["cascade"],
+    "device": "cuda",
+    "checkpoint": "auto",
+    "trust_checkpoint": true,
+    "download_weights": false,
+    "max_side": 1024,
+    "ransac_threshold": 3.0,
+    "limit": 0
+  },
+  "crops": {"tile_size": 256, "stride": 128, "min_valid_fraction": 0.8, "method": "cascade", "controls": 1}
+}
