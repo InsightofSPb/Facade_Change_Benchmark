@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from facade_change.alignment import SIFTMatcher
-from facade_change.batch import run_batch
+from facade_change.batch import comparison_counts, run_batch
 from facade_change.data import build_manifest
 from facade_change.demo import make_fixture
 from facade_change.geometry import transform_points
@@ -61,19 +61,64 @@ class BatchTests(unittest.TestCase):
 
     def test_failed_method_does_not_remove_successful_comparison_or_denominator(self):
         out = self.root / "partial"
-        with patch("facade_change.pipeline.LoFTRMatcher", side_effect=RuntimeError("Unavailable checkpoint")):
-            summary = run_batch(self.manifest, out, methods=["loftr", "sift"])
+        with patch("facade_change.pipeline.LoFTRMatcher", side_effect=RuntimeError("Unavailable checkpoint")) as loader:
+            summary = run_batch(self.manifest, out, methods=["sift", "loftr"])
+        loader.assert_called_once()
         self.assertEqual(summary["attempted_runs"], 2)
         self.assertEqual(summary["failed_runs"], 1)
         self.assertEqual(summary["passed_routing_gate"], 1)
+        rows = read_json(out / "results.json")
+        self.assertEqual([(row["method"], row["status"]) for row in rows], [("sift", "passed"), ("loftr", "failed")])
+        self.assertEqual([row["path"] for row in rows], ["sift/pair-0-1", "loftr/pair-0-1"])
+        self.assertTrue(all((out / row["path"] / "run.json").is_file() for row in rows))
+        self.assertEqual(summary["sift_loftr_comparison"], {"passed_both": 0, "sift_only": 1,
+                         "loftr_only": 0, "passed_neither": 0, "not_fully_attempted": 0})
         self.assertEqual(read_json(out / "run.json")["status"], "completed_with_issues")
         self.assertIn("Unavailable checkpoint", (out / "comparison.html").read_text())
+
+    def test_interruption_preserves_summary_without_counting_pending_method_as_neither(self):
+        out = self.root / "interrupted"
+        with patch("facade_change.pipeline.LoFTRMatcher", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                run_batch(self.manifest, out, methods=["sift", "loftr"])
+        summary = read_json(out / "summary.json")
+        self.assertEqual(summary["eligible_pairs"], 1)
+        self.assertEqual(summary["attempted_runs"], 1)
+        self.assertEqual(summary["sift_loftr_comparison"], {"passed_both": 0, "sift_only": 0,
+                         "loftr_only": 0, "passed_neither": 0, "not_fully_attempted": 1})
+        self.assertEqual(summary["method_counts"]["sift"]["passed_fraction_of_eligible"], 1.)
+        self.assertEqual(summary["method_counts"]["loftr"]["not_attempted"], 1)
+        self.assertEqual(read_json(out / "run.json")["status"], "interrupted")
+        self.assertEqual(read_json(out / "loftr/pair-0-1/run.json")["status"], "interrupted")
+        self.assertEqual(len(read_json(out / "results.json")), 1)
+        self.assertTrue((out / "sift/pair-0-1/geometry.json").is_file())
+        self.assertIn("not fully attempted 1", (out / "summary.txt").read_text(encoding="utf-8"))
+        self.assertIn("Not run", (out / "comparison.html").read_text(encoding="utf-8"))
 
     def test_empty_requested_crops_are_reported_as_issue(self):
         with patch("facade_change.derived.build_crops", return_value={"crop_count": 0}):
             summary = run_batch(self.manifest, self.root / "empty", methods=["sift"], crops=True)
         self.assertEqual(summary["derivative_failures"], 1)
         self.assertEqual(read_json(self.root / "empty/run.json")["status"], "completed_with_issues")
+
+
+class ComparisonCountsTests(unittest.TestCase):
+    def test_all_pair_outcomes_keep_common_denominator_including_not_attempted(self):
+        pairs = [{"pair_id": str(index)} for index in range(5)]
+        outcomes = [("passed", "passed"), ("passed", "rejected"), ("rejected", "passed"),
+                    ("failed", "failed"), ("passed", None)]
+        rows = [{"pair_id": str(index), "method": method, "status": status}
+                for index, statuses in enumerate(outcomes)
+                for method, status in zip(("sift", "loftr"), statuses) if status is not None]
+        result = comparison_counts(pairs, ["sift", "loftr"], rows)
+        self.assertEqual(result["sift_loftr_comparison"], {"passed_both": 1, "sift_only": 1,
+                         "loftr_only": 1, "passed_neither": 1, "not_fully_attempted": 1})
+        self.assertEqual(sum(result["sift_loftr_comparison"].values()), 5)
+        self.assertEqual(result["method_counts"]["sift"]["attempted"], 5)
+        self.assertEqual(result["method_counts"]["loftr"]["attempted"], 4)
+        self.assertEqual(result["method_counts"]["loftr"]["not_attempted"], 1)
+        self.assertEqual(result["method_counts"]["sift"]["passed_fraction_of_eligible"], 3 / 5)
+        self.assertEqual(result["method_counts"]["loftr"]["passed_fraction_of_eligible"], 2 / 5)
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required for integration")

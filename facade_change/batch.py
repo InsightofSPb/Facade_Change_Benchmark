@@ -52,6 +52,59 @@ def batch_pairs(manifest, pairs=None, limit=3, split="all", allow_inferred_metad
     return selected
 
 
+def comparison_counts(pairs, methods, rows):
+    """Keep the same eligible-pair denominator, including failures and interruptions."""
+    lookup = {(row['pair_id'], row['method']): row['status'] for row in rows}
+    counts = {}
+    for method in methods:
+        statuses = [lookup.get((pair['pair_id'], method)) for pair in pairs]
+        counts[method] = {status: statuses.count(status) for status in ('passed', 'rejected', 'failed')}
+        counts[method].update(attempted=sum(status is not None for status in statuses),
+                              not_attempted=statuses.count(None),
+                              passed_fraction_of_eligible=statuses.count('passed') / len(pairs) if pairs else 0.)
+    result = {'method_counts': counts}
+    if 'sift' in methods and 'loftr' in methods:
+        comparison = dict.fromkeys(('passed_both', 'sift_only', 'loftr_only', 'passed_neither',
+                                    'not_fully_attempted'), 0)
+        for pair in pairs:
+            sift, loftr = (lookup.get((pair['pair_id'], method)) for method in ('sift', 'loftr'))
+            if sift is None or loftr is None:
+                comparison['not_fully_attempted'] += 1
+            else:
+                key = ('passed_both' if sift == loftr == 'passed' else 'sift_only' if sift == 'passed'
+                       else 'loftr_only' if loftr == 'passed' else 'passed_neither')
+                comparison[key] += 1
+        result['sift_loftr_comparison'] = comparison
+    return result
+
+
+def write_batch_summary(out, pairs, methods, rows, derivatives):
+    summary = {'eligible_pairs': len(pairs), 'requested_methods': methods,
+               'attempted_runs': len(rows), 'failed_runs': sum(r['status'] == 'failed' for r in rows),
+               'rejected_runs': sum(r['status'] == 'rejected' for r in rows),
+               'passed_routing_gate': sum(r['status'] == 'passed' for r in rows),
+               'derivative_failures': sum('error' in d for d in derivatives.values()),
+               'pair_count_by_split': {name: sum(p['split'] == name for p in pairs)
+                                       for name in sorted({p['split'] for p in pairs})},
+               **comparison_counts(pairs, methods, rows),
+               'interpretation': 'Gate success is not dense alignment or damage accuracy'}
+    write_json(out / 'summary.json', summary)
+    lines = [f"Pairs: {len(pairs)}; methods: {', '.join(methods)}; runs: {len(rows)}",
+             f"Passed routing gate: {summary['passed_routing_gate']}; rejected: {summary['rejected_runs']}; "
+             f"failed: {summary['failed_runs']}; derivative failures: {summary['derivative_failures']}"]
+    for method, counts in summary['method_counts'].items():
+        lines.append(f"{method}: passed {counts['passed']}/{len(pairs)}; rejected {counts['rejected']}; "
+                     f"failed {counts['failed']}; not attempted {counts['not_attempted']}")
+    if 'sift_loftr_comparison' in summary:
+        counts = summary['sift_loftr_comparison']
+        lines.append(f"SIFT/LoFTR: both passed {counts['passed_both']}; SIFT only {counts['sift_only']}; "
+                     f"LoFTR only {counts['loftr_only']}; neither {counts['passed_neither']}; "
+                     f"not fully attempted {counts['not_fully_attempted']}")
+    lines.append('Inspect comparison.html; gate success requires visual review.')
+    (out / 'summary.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return summary
+
+
 def comparison_page(out, pairs, methods, rows, derivatives):
     lookup = {(row["pair_id"], row["method"]): row for row in rows}
     parts = ['<!doctype html><html lang="en"><meta charset="utf-8"><title>Facade comparison</title>',
@@ -61,6 +114,11 @@ def comparison_page(out, pairs, methods, rows, derivatives):
              '<h1>Facade alignment comparison</h1><p>Raw photographs, native reference scale. '
              'Overlay above; absolute RGB residual below. Gate results are routing heuristics; '
              'physical visibility and dense registration need visual review.</p>',
+             '<p>' + '; '.join(f"{html.escape(method)}: {counts['passed']}/{len(pairs)} passed, "
+                              f"{counts['rejected']} rejected, {counts['failed']} failed, "
+                              f"{counts['not_attempted']} not attempted"
+                              for method, counts in comparison_counts(pairs, methods, rows)['method_counts'].items())
+             + '</p>',
              '<table><tr><th>Pair</th>' + ''.join(f'<th>{html.escape(method)}</th>' for method in methods) + '</tr>']
     for pair in pairs:
         label = f"{pair['view_id']}: {pair['reference_year']} → {pair['source_year']} ({pair['pair_id']})"
@@ -141,7 +199,7 @@ def run_batch(manifest_path, out, methods=None, pairs=None, limit=3, split="all"
             print(f"Pair {index}/{len(selected)}: {pair['view_id']} {pair['pair_id']}", flush=True)
             pair_results = {}
             for method in methods:
-                relative = f"pair-{pair['pair_id']}/{method}"
+                relative = f"{method}/pair-{pair['pair_id']}"
                 row = {"pair_id": pair["pair_id"], "method": method, "path": relative}
                 try:
                     metrics = run_pair(manifest_path, pair["reference_id"], pair["source_id"], out / relative,
@@ -154,6 +212,7 @@ def run_batch(manifest_path, out, methods=None, pairs=None, limit=3, split="all"
                     print(f"  {method}: {row['error']}", flush=True)
                 rows.append(row)
                 write_json(out / "results.json", rows)
+                write_batch_summary(out, selected, methods, rows, derivatives)
                 comparison_page(out, selected, methods, rows, derivatives)
             if crops:
                 result = pair_results.get(crop_method)
@@ -181,32 +240,20 @@ def run_batch(manifest_path, out, methods=None, pairs=None, limit=3, split="all"
                         print(f"  derivatives: {derivative['error']}", flush=True)
                 write_json(out / "derivatives.json", derivatives)
                 comparison_page(out, selected, methods, rows, derivatives)
-        summary = {"eligible_pairs": len(selected), "requested_methods": methods,
-                   "attempted_runs": len(rows), "failed_runs": sum(r['status'] == 'failed' for r in rows),
-                   "rejected_runs": sum(r['status'] == 'rejected' for r in rows),
-                   "passed_routing_gate": sum(r['status'] == 'passed' for r in rows),
-                   "derivative_failures": sum('error' in d for d in derivatives.values()),
-                   "pair_count_by_split": {name: sum(p['split'] == name for p in selected)
-                                           for name in sorted({p['split'] for p in selected})},
-                   "interpretation": "Exploratory comparison; gate success is not dense alignment or damage accuracy"}
-        write_json(out / "summary.json", summary)
+        summary = write_batch_summary(out, selected, methods, rows, derivatives)
         with (out / 'results.csv').open('w', newline='', encoding='utf-8') as handle:
-            fields = ['pair_id', 'method', 'status', 'selected_method', 'matches', 'inliers', 'overlap_pixels', 'error']
+            fields = ['pair_id', 'method', 'path', 'status', 'selected_method', 'matches', 'inliers', 'overlap_pixels', 'error']
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for row in rows:
                 values = row.get('diagnostics', {})
                 writer.writerow({key: row.get(key, values.get(key, '')) for key in fields})
-        (out / 'summary.txt').write_text(
-            f"Pairs: {len(selected)}; methods: {', '.join(methods)}; runs: {len(rows)}\n"
-            f"Passed routing gate: {summary['passed_routing_gate']}; rejected: {summary['rejected_runs']}; "
-            f"failed: {summary['failed_runs']}; derivative failures: {summary['derivative_failures']}\n"
-            "Inspect comparison.html; all requested attempts remain in results.csv/results.json.\n", encoding='utf-8')
         record['summary'] = summary
         issues = summary['failed_runs'] + summary['rejected_runs'] + summary['derivative_failures']
         finish_record(out, record, 'completed_with_issues' if issues else 'completed_needs_review')
         return summary
     except KeyboardInterrupt:
+        write_batch_summary(out, selected, methods, rows, derivatives)
         comparison_page(out, selected, methods, rows, derivatives)
         finish_record(out, record, 'interrupted', 'Interrupted by user; completed child runs preserved')
         raise

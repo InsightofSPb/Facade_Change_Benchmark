@@ -162,6 +162,8 @@ class LoFTRMatcher:
             raise ValueError("Device must be cpu or cuda[:index]")
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but unavailable; no silent CPU fallback")
+        if device == "cuda":
+            device = f"cuda:{torch.cuda.current_device()}"
         self.torch, self.device, self.confidence = torch, device, confidence
         checkpoint, origin = resolve_loftr_checkpoint(torch, checkpoint, download_weights)
         digest = sha256(checkpoint)
