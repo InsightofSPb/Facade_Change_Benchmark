@@ -306,6 +306,67 @@ class UnifiedPreparationTests(unittest.TestCase):
         self.assertFalse((out / "batch").exists())
         self.assertTrue(read_json(out / "prepared/split.json")["development_only"])
 
+    def test_unknown_temporal_metadata_is_excluded_without_blocking_confirmed_gold(self):
+        inputs = self.config.parent
+        Image.fromarray(np.full((384, 512, 3), 177, np.uint8)).save(inputs / "images/IMG_1000.png")
+        coco = read_json(inputs / "coco.json")
+        coco["images"].append({"id": 20, "file_name": "IMG_1000.png", "width": 512, "height": 384})
+        write_json(inputs / "coco.json", coco)
+        out = self.root / "unknown-excluded"
+        summary = self.runner.run_dataset(self.config, out, prepare_only=True)
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["preparation"]["image_splits"], {"train": 14, "val": 2, "test": 4, "excluded": 1})
+        manifest = read_json(out / "prepared/manifest.json")
+        unknown = manifest["images"][-1]
+        self.assertEqual(unknown["split"], "excluded")
+        self.assertFalse(unknown["gold_member"])
+        self.assertIn("unknown_view", unknown["preparation_exclusion_reasons"])
+        self.assertIn("unknown_or_invalid_year", unknown["preparation_exclusion_reasons"])
+        split = read_json(out / "prepared/split.json")
+        self.assertFalse(split["development_only"])
+        self.assertEqual(len(split["gold_cohort"]), 20)
+        self.assertTrue(all(row["image_id"] < 20 for row in split["gold_cohort"]))
+        self.assertEqual(len(read_json(out / summary["index_path"])["pairs"]), 10)
+
+    def test_unreviewed_named_observation_blocks_premature_partial_gold(self):
+        inputs = self.config.parent
+        Image.fromarray(np.full((384, 512, 3), 177, np.uint8)).save(inputs / "images/pending_2025.png")
+        coco = read_json(inputs / "coco.json")
+        coco["images"].append({"id": 20, "file_name": "pending_2025.png", "width": 512, "height": 384})
+        write_json(inputs / "coco.json", coco)
+        out = self.root / "pending-named"
+        with patch.object(self.runner, "run_batch", side_effect=AssertionError("Premature alignment")):
+            summary = self.runner.run_dataset(self.config, out)
+        self.assertEqual(summary["status"], "needs_metadata_review")
+        self.assertEqual(summary["unreviewed_ready_image_ids"], [20])
+        self.assertIsNone(summary["index_path"])
+        split = read_json(out / "prepared/split.json")
+        self.assertTrue(split["development_only"])
+        self.assertEqual(split["gold_cohort"], [])
+
+    def test_reviewed_named_observation_without_building_still_blocks_gold(self):
+        inputs = self.config.parent
+        Image.fromarray(np.full((384, 512, 3), 177, np.uint8)).save(inputs / "images/pending_2025.png")
+        coco = read_json(inputs / "coco.json")
+        coco["images"].append({"id": 20, "file_name": "pending_2025.png", "width": 512, "height": 384})
+        write_json(inputs / "coco.json", coco)
+        build_manifest(self.config, self.root / "inventory")
+        manifest_path = self.root / "inventory/manifest.json"
+        manifest = read_json(manifest_path)
+        manifest["images"][-1]["metadata_status"] = "reviewed"
+        self.assertIsNone(manifest["images"][-1]["building_id"])
+        write_json(manifest_path, manifest)
+        config = read_json(self.config)
+        config["manifest_path"] = str(manifest_path)
+        write_json(self.config, config)
+        out = self.root / "pending-building"
+        with patch.object(self.runner, "run_batch", side_effect=AssertionError("Premature alignment")):
+            summary = self.runner.run_dataset(self.config, out)
+        self.assertEqual(summary["status"], "needs_metadata_review")
+        self.assertEqual(summary["unreviewed_ready_image_ids"], [20])
+        self.assertEqual(read_json(out / "prepared/split.json")["gold_cohort"], [])
+        self.assertFalse((out / "batch").exists())
+
     def test_invalid_fraction_plan_is_rejected(self):
         config = read_json(self.config)
         config["split"] = {"train": .7, "val": .1, "test": .3}

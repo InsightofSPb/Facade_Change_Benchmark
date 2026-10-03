@@ -171,9 +171,9 @@ def run_dataset(config_path, out, prepare_only=False):
         for original in manifest["images"]:
             row = {**original, **overrides.get(str(original["image_id"]), {})}
             year = row.get("year")
-            if row.get("image_status") == "ready" and (row.get("metadata_status") != "reviewed"
-                    or not row.get("building_id") or not row.get("view_id") or isinstance(year, bool)
-                    or not isinstance(year, int) or not 1800 <= year <= 2100):
+            temporal_metadata = bool(row.get("view_id")) and type(year) is int and 1800 <= year <= 2100
+            if row.get("image_status") == "ready" and temporal_metadata and (
+                    row.get("metadata_status") != "reviewed" or not row.get("building_id")):
                 incomplete.append(row["image_id"])
         split = config["split"]
         needs_review = split["mode"] == "reviewed" and bool(incomplete)
