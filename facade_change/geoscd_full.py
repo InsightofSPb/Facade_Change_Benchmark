@@ -162,6 +162,7 @@ class OfficialFull:
                          "mask_fusion": "reference directional mask OR source mask gathered with reference→source projection",
                          "device_schedule": "VGGT CUDA then CPU; shared SAM CUDA then CPU, same weights, no SAM3 substitution",
                          "sam_memory_adaptation": "omit discarded first Block attention when return_qkv=False; active output and QKV paths unchanged",
+                         "diagnostic_capture": "plain pass-through callbacks save CPU maps only; no history of dense tensor arguments",
                          "safe_sam_loading": "bundled vit_h(checkpoint=None), weights_only=True, strict state_dict",
                          "score": "1 - official multi-head SAM key cosine, not calibrated probability",
                          "ground_truth": "not used; no metrics computed"}
@@ -175,7 +176,9 @@ class OfficialFull:
             result = original(*args, **kwargs)
             captured["projected_z"] = result[3].detach().float().cpu().numpy()
             return result
-        with patch.object(pixel, "matching_and_project", side_effect=capture):
+        # A mock with side_effect records tensor arguments in reference cycles.
+        # Use the callable itself so dense inputs release after each direction.
+        with patch.object(pixel, "matching_and_project", new=capture):
             output = pixel.run_dense_match([str(reference_path), str(source_path)], self.geometry.model,
                                            self.geometry.device, self.geometry.dtype, resolution=512, light=False, transfer=False)
         coordinates, occlusion, scatter, _, _, _, extrinsic = output
@@ -202,7 +205,8 @@ class OfficialFull:
             return similarity, valid
         coordinates = torch.as_tensor(geometry["coordinates"], dtype=torch.int64, device=self.geometry.device)
         depth = torch.as_tensor(geometry["scattered_depth"], device=self.geometry.device)
-        with patch.object(self.framework, "match_multihead_key_avg", side_effect=capture):
+        # Do not retain the two 1.25-GiB keys in a mock's call history.
+        with patch.object(self.framework, "match_multihead_key_avg", new=capture):
             mask = self.segmenter(str(reference_path), str(source_path), self.args, coordinates, depth,
                                   ignore_left=geometry["occlusion"], debug=False)
         if "score" not in captured:

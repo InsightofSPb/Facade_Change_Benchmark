@@ -1,8 +1,10 @@
 """CPU full-adapter contracts; no pretrained VGGT/SAM inference is claimed."""
 import csv
+import gc
 import importlib.util
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,7 +15,7 @@ from PIL import Image
 from facade_change.data import build_manifest
 from facade_change.demo import make_fixture
 from facade_change.geoscd import GEOSCD_COMMIT
-from facade_change.geoscd_full import merge_directional_masks, native_camera_warp, run_geoscd_full, skip_unused_sam_attention, validate_sam_vit_h_state
+from facade_change.geoscd_full import OfficialFull, merge_directional_masks, native_camera_warp, run_geoscd_full, skip_unused_sam_attention, validate_sam_vit_h_state
 from facade_change.io import read_json, sha256
 from facade_change.preparation import prepare_dataset
 
@@ -98,6 +100,142 @@ class FullContractTests(unittest.TestCase):
             self.assertEqual(len(original_block.calls), 2)
             self.assertEqual(len(optimized_block.calls), 1)
             np.testing.assert_array_equal(optimized(optimized_block, x, True), original_block.forward(x, True))
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch required")
+class FullCaptureLifetimeTests(unittest.TestCase):
+    """Diagnostic capture must not retain author tensors between directions.
+
+    Actual small CPU tensors reproduce the reference-lifetime contract of the
+    1.25-GiB SAM keys. Disabling automatic GC makes cyclic argument retention
+    observable without allocating large tensors or running pretrained models.
+    """
+
+    def setUp(self):
+        import torch
+        self.torch = torch
+        self.full = OfficialFull.__new__(OfficialFull)
+        self.full.torch = torch
+        self.full.args = SimpleNamespace()
+        self.full.geometry = SimpleNamespace(device="cpu", dtype=torch.float32, model=object())
+        self.was_gc_enabled = gc.isenabled()
+        gc.disable()
+        self.addCleanup(self.restore_gc)
+
+    def restore_gc(self):
+        gc.collect()
+        if self.was_gc_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+    def test_detection_capture_preserves_outputs_and_releases_keys_each_direction(self):
+        torch, references, expected = self.torch, [], []
+        function_calls = []
+
+        def author_match(key0, key1, coordinates):
+            function_calls.append(tuple(coordinates.shape))
+            similarity = (key0 * key1).mean(dim=-1).mean(dim=0)
+            valid = torch.ones(similarity.shape, dtype=torch.bool)
+            valid[0, 0] = False
+            return similarity, valid
+
+        framework = SimpleNamespace(match_multihead_key_avg=author_match)
+        self.full.framework = framework
+
+        def segmenter(left, right, args, coordinates, depth, ignore_left, debug):
+            step = len(expected)
+            key0 = torch.arange(2 * 3 * 4 * 5, dtype=torch.float32).reshape(2, 3, 4, 5) / 120
+            key1 = torch.ones_like(key0) * (.25 + step / 20)
+            references.extend((weakref.ref(key0), weakref.ref(key1)))
+            similarity, valid = framework.match_multihead_key_avg(key0, key1, coordinates)
+            expected.append((similarity.detach().numpy().copy(), valid.numpy().copy()))
+            return (similarity > .1).numpy().copy()
+
+        self.full.segmenter = segmenter
+        geometry = {"coordinates": np.zeros((3, 4, 2), np.int64),
+                    "scattered_depth": np.ones((3, 4), np.float32),
+                    "occlusion": np.zeros((3, 4), bool)}
+        for direction in range(6):
+            paths = ("reference.png", "source.png") if direction % 2 == 0 else ("source.png", "reference.png")
+            result = self.full._detect(*paths, geometry)
+            similarity, valid = expected[-1]
+            np.testing.assert_array_equal(result["mask"], similarity > .1)
+            np.testing.assert_array_equal(result["score"], (1 - similarity).astype(np.float32))
+            np.testing.assert_array_equal(result["feature_valid"], valid)
+            self.assertEqual(result["statistics"]["valid_feature_pixels"], int(valid.sum()))
+            self.assertAlmostEqual(result["statistics"]["similarity_std"], float(similarity[valid].std()))
+            self.assertIs(framework.match_multihead_key_avg, author_match)
+            self.assertTrue(all(reference() is None for reference in references),
+                            "SAM key tensors survive a completed direction until cyclic GC")
+        self.assertEqual(function_calls, [(3, 4, 2)] * 6)
+
+    def test_geometry_capture_preserves_outputs_and_releases_inputs_each_direction(self):
+        torch, references, expected = self.torch, [], []
+        calls = []
+
+        def author_project(extrinsic, intrinsic, depth, target_intrinsic):
+            coordinates = depth.unsqueeze(-1).repeat(1, 1, 2)
+            scattered = depth + 2
+            valid = depth > 0
+            z = depth + 3
+            return coordinates, scattered, valid, z
+
+        pixel = SimpleNamespace(matching_and_project=author_project)
+
+        def run_dense_match(paths, model, device, dtype, resolution, light, transfer):
+            calls.append((paths, resolution, light, transfer))
+            depth = torch.ones((3, 4), dtype=torch.float32) * len(calls)
+            extrinsic = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            intrinsic = torch.eye(3)
+            references.extend((weakref.ref(depth), weakref.ref(extrinsic), weakref.ref(intrinsic)))
+            coordinates, scattered, valid, z = pixel.matching_and_project(
+                extrinsic, intrinsic, depth, intrinsic)
+            camera = extrinsic.clone()
+            expected.append({"coordinates": coordinates.numpy().copy(),
+                             "scattered_depth": scattered.numpy().copy(),
+                             "camera_extrinsic": camera.numpy().copy(),
+                             "projected_z": z.numpy().copy(),
+                             "occlusion": (~valid).numpy().copy()})
+            return coordinates, (~valid).numpy().copy(), scattered, None, None, None, camera
+
+        pixel.run_dense_match = run_dense_match
+        self.full.geometry.pixel = pixel
+        for direction in range(6):
+            paths = ("reference.png", "source.png") if direction % 2 == 0 else ("source.png", "reference.png")
+            result = self.full._geometry(*paths)
+            for name, values in expected[-1].items():
+                np.testing.assert_array_equal(result[name], values)
+            self.assertIs(pixel.matching_and_project, author_project)
+            self.assertTrue(all(reference() is None for reference in references),
+                            "VGGT projection inputs survive a completed direction until cyclic GC")
+        self.assertEqual(len(calls), 6)
+        self.assertTrue(all(call[1:] == (512, False, False) for call in calls))
+
+    def test_failed_detection_restores_author_callable_and_releases_keys(self):
+        torch, references = self.torch, []
+
+        def author_match(*args):
+            raise RuntimeError("author comparison unavailable")
+
+        framework = SimpleNamespace(match_multihead_key_avg=author_match)
+        self.full.framework = framework
+
+        def segmenter(left, right, args, coordinates, depth, **options):
+            key0 = torch.ones((2, 3, 4, 5))
+            key1 = key0.clone()
+            references.extend((weakref.ref(key0), weakref.ref(key1)))
+            framework.match_multihead_key_avg(key0, key1, coordinates)
+
+        self.full.segmenter = segmenter
+        geometry = {"coordinates": np.zeros((3, 4, 2), np.int64),
+                    "scattered_depth": np.ones((3, 4), np.float32),
+                    "occlusion": np.zeros((3, 4), bool)}
+        with self.assertRaisesRegex(RuntimeError, "author comparison unavailable"):
+            self.full._detect("reference.png", "source.png", geometry)
+        self.assertIs(framework.match_multihead_key_avg, author_match)
+        self.assertTrue(all(reference() is None for reference in references),
+                        "Failed author calls retain dense keys after exception handling")
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required")
