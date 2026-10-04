@@ -95,6 +95,12 @@ def parser():
     hypotheses.add_argument("--crop-run", required=True)
     hypotheses.add_argument("--config", required=True, dest="config_path")
     hypotheses.add_argument("--out", required=True)
+    trial = sub.add_parser("h0h1-benchmark", help="CPU RGB-diff/SSIM trial on frozen procedural H0/H1 cases")
+    trial.add_argument("--dataset-run", required=True)
+    trial.add_argument("--out", required=True)
+    trial.add_argument("--methods", nargs="+", choices=["rgb_diff", "ssim"], default=["rgb_diff", "ssim"])
+    trial.add_argument("--max-bases-per-split", type=int, default=1,
+                       help="Frozen SHA-ranked base crops per partition; 0 uses the full existing dataset")
     geo = sub.add_parser("geoscd", help="GeoSCD geometry-only dense alignment trial; no SAM/change detector")
     geo.add_argument("--manifest", required=True, dest="manifest_path")
     geo.add_argument("--out", required=True)
@@ -167,6 +173,9 @@ def main(argv=None):
         elif command == "h0h1":
             from .hypothesis_dataset import prepare_hypothesis_dataset
             result = prepare_hypothesis_dataset(**args)
+        elif command == "h0h1-benchmark":
+            from .hypothesis_benchmark import run_hypothesis_benchmark
+            result = run_hypothesis_benchmark(**args)
         elif command == "geoscd":
             from .geoscd import run_geoscd
             result = run_geoscd(**args)
