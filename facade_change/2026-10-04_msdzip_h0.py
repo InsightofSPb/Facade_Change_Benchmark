@@ -12,7 +12,7 @@ import math
 import shutil
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -319,29 +319,43 @@ def _samples(root, parent, bases, cases, manifest, representation, timesteps, ch
     return np.concatenate(windows), np.concatenate(labels), np.concatenate(indices)
 
 
-def _epoch(model, samples, device, window_groups, optimizer=None, rng=None):
+def _epoch(model, samples, device, window_groups, optimizer=None, rng=None, progress_description=None):
     torch = _torch()
     total, count = 0., 0
     model.train(optimizer is not None)
     contexts, labels, positions = samples
     started = time.perf_counter()
-    for step, (batch, targets, indices) in enumerate(_batch_groups(contexts, labels, positions, model.batchsize, window_groups, rng), 1):
-        active = torch.as_tensor(indices >= 0, device=device)
-        x = torch.as_tensor(batch, device=device)
-        y = torch.as_tensor(targets, device=device)
-        with _numerics(device), torch.set_grad_enabled(optimizer is not None):
-            logits = _predict_groups(model, x)
-            losses = torch.nn.functional.cross_entropy(logits[active], y[active], reduction="none")
-            loss = losses.mean()
-            if optimizer is not None:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-        total += float(losses.detach().sum().cpu()) / math.log(2)
-        count += int(active.sum())
-        if step % 100 == 0:
-            elapsed = time.perf_counter() - started
-            print(f"  {'train' if optimizer else 'val'} grouped batches={step}; bytes={count}; bpb={total / count:.5f}; bytes/s={count / elapsed:.1f}", flush=True)
+    phase = "train" if optimizer is not None else "val"
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        progress = nullcontext(None)
+        print("tqdm unavailable; using text progress. Install with: python -m pip install 'tqdm>=4.66,<5'", flush=True)
+    else:
+        progress = tqdm(total=len(labels), desc=progress_description or phase,
+                        unit="B", unit_scale=True, dynamic_ncols=True, mininterval=1)
+    with progress as bar:
+        for step, (batch, targets, indices) in enumerate(_batch_groups(contexts, labels, positions, model.batchsize, window_groups, rng), 1):
+            active = torch.as_tensor(indices >= 0, device=device)
+            x = torch.as_tensor(batch, device=device)
+            y = torch.as_tensor(targets, device=device)
+            with _numerics(device), torch.set_grad_enabled(optimizer is not None):
+                logits = _predict_groups(model, x)
+                losses = torch.nn.functional.cross_entropy(logits[active], y[active], reduction="none")
+                loss = losses.mean()
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+            total += float(losses.detach().sum().cpu()) / math.log(2)
+            processed = int(active.sum())
+            count += processed
+            if bar is not None:
+                bar.set_postfix(bpb=f"{total / count:.5f}", refresh=False)
+                bar.update(processed)
+            elif step % 100 == 0:
+                elapsed = time.perf_counter() - started
+                print(f"  {phase} grouped batches={step}; bytes={count}; bpb={total / count:.5f}; bytes/s={count / elapsed:.1f}", flush=True)
     return total / count
 
 
@@ -411,10 +425,12 @@ def train_msdzip_h0(dataset_run, out, representations=("abs", "mod256"), device=
             for epoch in range(1, epochs + 1):
                 print(f"MSDZip {representation}: epoch {epoch}/{epochs}; H0 bytes train={len(samples['train'][1])}, val={len(samples['val'][1])}", flush=True)
                 started = time.perf_counter()
-                train_bpb = _epoch(model, samples["train"], target_device, window_groups, optimizer, np.random.default_rng(seed + epoch))
+                train_bpb = _epoch(model, samples["train"], target_device, window_groups, optimizer, np.random.default_rng(seed + epoch),
+                                   progress_description=f"MSDZip {representation} train {epoch}/{epochs}")
                 train_seconds = time.perf_counter() - started
                 val_started = time.perf_counter()
-                val_bpb = _epoch(model, samples["val"], target_device, window_groups)
+                val_bpb = _epoch(model, samples["val"], target_device, window_groups,
+                                 progress_description=f"MSDZip {representation} val {epoch}/{epochs}")
                 val_seconds = time.perf_counter() - val_started
                 history.append({"epoch": epoch, "train_bpb": train_bpb, "val_bpb": val_bpb,
                                 "train_seconds": train_seconds, "val_seconds": val_seconds,
