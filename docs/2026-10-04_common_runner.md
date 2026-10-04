@@ -79,6 +79,9 @@ einops 0.8.1 и safetensors 0.5.3. `lpips` отсутствует. Transformers,
 huggingface-hub не нужны для используемой локальной DINOv2 ViT-S/14 и этих
 адаптеров. Setup не меняет Torch/torchvision/NumPy/Pillow, не создаёт среду и
 не устанавливает пакеты обучения, xformers или весь старый benchmark.
+Перед импортом torchvision проверяется `mpmath` — зависимость SymPy в цепочке
+Torch Dynamo. Если она отсутствует, setup устанавливает только `mpmath==1.3.0`
+с `--no-deps`; установленные версии основных пакетов сохраняются.
 
 ```bash
 cd /home/sasha/Facade_Change_Benchmark

@@ -34,23 +34,33 @@ import sys
 if sys.version_info < (3, 10):
     raise SystemExit('Competitor workers require Python >= 3.10; use the existing scd_bench environment.')
 
-# Reject an incompatible core before pip changes anything. Existing CUDA builds stay intact.
-import torch
-import torchvision
-import numpy
-import PIL
-from torchvision.ops import batched_nms
-batched_nms(torch.tensor([[0., 0., 1., 1.]]), torch.tensor([1.]), torch.tensor([0]), 0.5)
-
-if tuple(int(part) for part in torch.__version__.split('+')[0].split('.')[:2]) < (2, 6):
-    raise SystemExit('RSCD safe checkpoint loading requires Torch >= 2.6; use scd_bench, not lposs.')
+# Read versions without importing torchvision: Torch Dynamo reaches SymPy,
+# which cannot initialize when its mpmath dependency is absent.
 preserved = {name: metadata.version(name) for name in ('torch', 'torchvision', 'numpy', 'Pillow')}
+if tuple(int(part) for part in preserved['torch'].split('+')[0].split('.')[:2]) < (2, 6):
+    raise SystemExit('RSCD safe checkpoint loading requires Torch >= 2.6; use scd_bench, not lposs.')
 
 def install(requirement, no_deps=True):
     command = [sys.executable, '-s', '-m', 'pip', 'install']
     if no_deps:
         command.append('--no-deps')
     subprocess.run(command + [requirement], check=True)
+
+try:
+    importlib.import_module('mpmath')
+except ModuleNotFoundError as exc:
+    if exc.name != 'mpmath':
+        raise
+    install('mpmath==1.3.0')
+    importlib.invalidate_caches()
+    importlib.import_module('mpmath')
+
+import torch
+import torchvision
+import numpy
+import PIL
+from torchvision.ops import batched_nms
+batched_nms(torch.tensor([[0., 0., 1., 1.]]), torch.tensor([1.]), torch.tensor([0]), 0.5)
 
 try:
     lpips_version = metadata.version('lpips')
