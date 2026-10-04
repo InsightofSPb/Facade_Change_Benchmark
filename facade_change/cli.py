@@ -91,6 +91,10 @@ def parser():
     dataset_crops.add_argument("--controls", type=int, default=0,
                                help="Total source crops for procedural controls across the dataset")
     dataset_crops.add_argument("--seed", type=int, default=42)
+    hypotheses = sub.add_parser("h0h1", help="Deterministic state edits and observation nuisances from reviewed crops")
+    hypotheses.add_argument("--crop-run", required=True)
+    hypotheses.add_argument("--config", required=True, dest="config_path")
+    hypotheses.add_argument("--out", required=True)
     geo = sub.add_parser("geoscd", help="GeoSCD geometry-only dense alignment trial; no SAM/change detector")
     geo.add_argument("--manifest", required=True, dest="manifest_path")
     geo.add_argument("--out", required=True)
@@ -160,6 +164,9 @@ def main(argv=None):
         elif command == "crop-dataset":
             from .crop_dataset import prepare_crop_dataset
             result = prepare_crop_dataset(**args)
+        elif command == "h0h1":
+            from .hypothesis_dataset import prepare_hypothesis_dataset
+            result = prepare_hypothesis_dataset(**args)
         elif command == "geoscd":
             from .geoscd import run_geoscd
             result = run_geoscd(**args)

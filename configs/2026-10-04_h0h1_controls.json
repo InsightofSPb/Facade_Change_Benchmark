@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "selection": {
+    "splits": ["train", "val", "test"],
+    "crops_per_building": 2,
+    "max_buildings_per_split": 0,
+    "min_valid_fraction": 0.95
+  },
+  "states": ["unchanged", "crack", "paint_patch", "self_paste"],
+  "scenarios": [
+    {"id": "clean", "kind": "identity"},
+    {"id": "shadow_diagonal_15", "kind": "shadow", "template": "diagonal", "strength": 0.15, "edge_width": 0.035},
+    {"id": "shadow_diagonal_35", "kind": "shadow", "template": "diagonal", "strength": 0.35, "edge_width": 0.035},
+    {"id": "shadow_diagonal_55", "kind": "shadow", "template": "diagonal", "strength": 0.55, "edge_width": 0.035},
+    {"id": "shadow_band_15", "kind": "shadow", "template": "band", "strength": 0.15, "edge_width": 0.035},
+    {"id": "shadow_band_35", "kind": "shadow", "template": "band", "strength": 0.35, "edge_width": 0.035},
+    {"id": "shadow_band_55", "kind": "shadow", "template": "band", "strength": 0.55, "edge_width": 0.035},
+    {"id": "exposure_dark", "kind": "exposure", "gain": 0.75},
+    {"id": "exposure_light", "kind": "exposure", "gain": 1.25},
+    {"id": "contrast_low", "kind": "contrast", "factor": 0.8, "center": 0.18},
+    {"id": "contrast_high", "kind": "contrast", "factor": 1.2, "center": 0.18},
+    {"id": "white_balance_warm", "kind": "white_balance", "gains": [1.12, 1.0, 0.88]},
+    {"id": "white_balance_cool", "kind": "white_balance", "gains": [0.88, 1.0, 1.12]},
+    {"id": "blur_08", "kind": "blur", "sigma": 0.8},
+    {"id": "blur_16", "kind": "blur", "sigma": 1.6},
+    {"id": "jpeg_70", "kind": "jpeg", "quality": 70},
+    {"id": "jpeg_40", "kind": "jpeg", "quality": 40},
+    {"id": "occlusion", "kind": "occlusion", "rectangle": [0.48, 0.25, 0.68, 0.8], "color": [62, 68, 58]}
+  ]
+}
