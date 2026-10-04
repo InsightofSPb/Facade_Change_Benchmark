@@ -104,6 +104,21 @@ def parser():
                      help="Use the VGGT grid directly, avoiding extra intrinsic/depth resize")
     geo.add_argument("--seed", type=int, default=42)
     geo.add_argument("--comparison-run", help="Existing SIFT/LoFTR batch on the same manifest")
+    full_geo = sub.add_parser("geoscd-full", help="Full official GeoSCD: VGGT plus SAM ViT-H change masks")
+    full_geo.add_argument("--manifest", required=True, dest="manifest_path")
+    full_geo.add_argument("--out", required=True)
+    full_geo.add_argument("--geoscd-root", required=True, help="Clean pinned official GeoSCD checkout")
+    full_geo.add_argument("--checkpoint", required=True, help="Existing local VGGT-1B checkpoint")
+    full_geo.add_argument("--sam-checkpoint", required=True, help="Existing SAM1 ViT-H checkpoint; SAM3 is incompatible")
+    full_geo.add_argument("--pair", action="append", dest="pairs", help="REFERENCE_ID:SOURCE_ID; repeat for explicit pairs")
+    full_geo.add_argument("--limit", type=int, default=3, help="Pair limit; 0 means all selected pairs")
+    full_geo.add_argument("--split", choices=["all", "dev", "train", "val", "test"], default="all")
+    full_geo.add_argument("--device", default="cuda:0")
+    full_geo.add_argument("--seed", type=int, default=42)
+    full_geo.add_argument("--mode", choices=["initial", "occupy"], default="occupy")
+    full_geo.add_argument("--points-per-side", type=int, default=32)
+    full_geo.add_argument("--iou-thresh", type=float, default=.65)
+    full_geo.add_argument("--sem-filter", type=float, default=None)
     controlled = sub.add_parser("controlled", help="Procedural state/nuisance factorial and sham controls")
     controlled.add_argument("--crops-path", required=True)
     controlled.add_argument("--out", required=True)
@@ -148,6 +163,9 @@ def main(argv=None):
         elif command == "geoscd":
             from .geoscd import run_geoscd
             result = run_geoscd(**args)
+        elif command == "geoscd-full":
+            from .geoscd_full import run_geoscd_full
+            result = run_geoscd_full(**args)
         elif command == "controlled":
             from .derived import controlled_examples
             result = controlled_examples(**args)
@@ -164,7 +182,7 @@ def main(argv=None):
             return 2
         if command == "batch" and any(result[name] for name in ("failed_runs", "rejected_runs", "derivative_failures")):
             return 2
-        if command == "geoscd" and result["failed_runs"]:
+        if command in ("geoscd", "geoscd-full") and result["failed_runs"]:
             return 2
         if command == "crop-dataset" and result.get("derivative_failures", 0):
             return 2

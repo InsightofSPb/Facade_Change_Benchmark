@@ -11,6 +11,7 @@ RSCD, AnyChange, SSIM и компрессионные модели этими к
 commit `dd31369654e96d6843cc4bbcebce854a8bc2159b`. SAM и детектор изменений
 GeoSCD не загружаются. Название для статьи: **GeoSCD geometry-only (VGGT dense
 reprojection)**; это сравнение геометрии, а не воспроизведение полного детектора.
+Для полного метода с SAM используй [отдельную команду geoscd-full](2026-10-04_geoscd_full.md).
 
 Установка на компьютере владельца:
 
@@ -26,6 +27,9 @@ conda activate facade-geoscd
 скачивает официальные веса VGGT-1B. Среда `lposs` используется для уже работающих
 SIFT/LoFTR и кропов. Без `--download-weights` веса не скачиваются; сам inference
 тоже их не скачивает. Если веса уже есть, передай их путь через `--checkpoint`.
+Веса хранятся в `models/vggt_1b.pt`; прежний `src/pretrained/model.pt`, если он уже
+существует, переиспользуется по пути, напечатанному setup. Пользовательские пакеты
+из `~/.local` исключаются из новой среды через `PYTHONNOUSERSITE=1` и `python -s`.
 Не требуются SAM-веса или обучение. Версии зависимостей заданы в
 `configs/2026-10-04_geoscd_geometry.requirements.txt`; фактическое окружение и
 хеш весов фиксируются в каждом запуске.
@@ -33,10 +37,10 @@ SIFT/LoFTR и кропов. Без `--download-weights` веса не скачи
 Первый запуск: одна обычная пара и две пары, отклонённые прежними порогами.
 
 ```bash
-python -B -m facade_change geoscd \
+python -s -B -m facade_change geoscd \
   --manifest runs/2026-10-03-first-anchor/manifest.json \
   --geoscd-root ../GeoSCD-facade \
-  --checkpoint ../GeoSCD-facade/src/pretrained/model.pt \
+  --checkpoint models/vggt_1b.pt \
   --device cuda:0 --pair 73:74 --pair 151:150 --pair 235:236 \
   --limit 0 \
   --comparison-run runs/2026-10-03-alignment-first-anchor \
@@ -48,10 +52,10 @@ GeoSCD. После проверки smoke-прогона те же компон�
 фиксированному списку пар:
 
 ```bash
-python -B -m facade_change geoscd \
+python -s -B -m facade_change geoscd \
   --manifest runs/2026-10-03-first-anchor/manifest.json \
   --geoscd-root ../GeoSCD-facade \
-  --checkpoint ../GeoSCD-facade/src/pretrained/model.pt \
+  --checkpoint models/vggt_1b.pt \
   --device cuda:0 --limit 0 \
   --comparison-run runs/2026-10-03-alignment-first-anchor \
   --out runs/2026-10-04-geoscd

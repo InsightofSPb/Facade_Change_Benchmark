@@ -1,4 +1,5 @@
-# Geometry branch only; no SAM or change detector. Torch is installed separately.
+# Shared GeoSCD dependencies. Torch is installed separately by setup_geoscd.sh.
+# --full additionally installs pinned official SAM for the bundled predictor import.
 # GeoSCD dd31369654e96d6843cc4bbcebce854a8bc2159b plus frozen LightGlue source.
 numpy==1.26.4
 Pillow==11.1.0

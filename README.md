@@ -9,10 +9,12 @@
 Источники перенесённой логики описаны в [provenance](docs/2026-09-27_provenance.md).
 Состав поставки и фактические проверки — в [отчёте подготовки](docs/2026-09-27_preparation_delivery.md).
 
-Добавлены `facade_change geoscd` — пробная геометрическая ветка GeoSCD/VGGT без
-SAM — и `facade_change crop-dataset` — кропы из готового SIFT/LoFTR batch без
+Добавлены `facade_change geoscd-full` — полный GeoSCD с VGGT и SAM1 ViT-H,
+`facade_change geoscd` — отдельная геометрическая ветка — и
+`facade_change crop-dataset` — кропы из готового SIFT/LoFTR batch без
 повторного matching или изменения split. Установка отдельной среды, smoke-прогон
-и экспорт RGB/масок/индекса/контрольных примеров:
+полного метода: [GeoSCD full](docs/2026-10-04_geoscd_full.md).
+Геометрия и экспорт RGB/масок/индекса/контрольных примеров:
 [инструкция от 2026-10-04](docs/2026-10-04_geoscd_and_crop_preparation.md).
 
 ## Единая подготовка нового набора
