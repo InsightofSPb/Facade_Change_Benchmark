@@ -95,12 +95,41 @@ def parser():
     hypotheses.add_argument("--crop-run", required=True)
     hypotheses.add_argument("--config", required=True, dest="config_path")
     hypotheses.add_argument("--out", required=True)
-    trial = sub.add_parser("h0h1-benchmark", help="CPU RGB-diff/SSIM trial on frozen procedural H0/H1 cases")
+    trial = sub.add_parser("h0h1-benchmark", help="Change scorers on frozen procedural H0/H1 cases")
     trial.add_argument("--dataset-run", required=True)
     trial.add_argument("--out", required=True)
-    trial.add_argument("--methods", nargs="+", choices=["rgb_diff", "ssim"], default=["rgb_diff", "ssim"])
+    trial.add_argument("--methods", nargs="+", choices=["rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs",
+                       "lzma_mod256", "msdzip_abs", "msdzip_mod256"], default=["rgb_diff", "ssim"])
     trial.add_argument("--max-bases-per-split", type=int, default=1,
                        help="Frozen SHA-ranked base crops per partition; 0 uses the full existing dataset")
+    trial.add_argument("--compression-tile-size", type=int, default=32)
+    trial.add_argument("--compression-stride", type=int, default=16)
+    trial.add_argument("--zstd-level", type=int, default=3)
+    trial.add_argument("--lzma-preset", type=int, default=3)
+    trial.add_argument("--msdzip-abs-checkpoint")
+    trial.add_argument("--msdzip-mod256-checkpoint")
+    trial.add_argument("--device", default="cpu")
+    trial.add_argument("--trust-checkpoint", action="store_true",
+                       help="Explicit trust for legacy Torch without weights_only support")
+    train = sub.add_parser("msdzip-train", help="Train original MSDZip on reviewed train H0 residuals only")
+    train.add_argument("--dataset-run", required=True)
+    train.add_argument("--out", required=True)
+    train.add_argument("--representations", nargs="+", choices=["abs", "mod256"], default=["abs", "mod256"])
+    train.add_argument("--device", default="cpu")
+    train.add_argument("--epochs", type=int, default=5)
+    train.add_argument("--max-train-bytes", type=int, default=2_000_000)
+    train.add_argument("--max-val-bytes", type=int, default=200_000)
+    train.add_argument("--model-batch-size", type=int, default=32)
+    train.add_argument("--window-groups", type=int, default=16,
+                       help="Independent fixed-lane batches per update; recorded and reused during scoring")
+    train.add_argument("--timesteps", type=int, default=16)
+    train.add_argument("--hidden-dim", type=int, default=256)
+    train.add_argument("--ffn-dim", type=int, default=4096)
+    train.add_argument("--vocab-dim", type=int, default=16)
+    train.add_argument("--lr", type=float, default=.001)
+    train.add_argument("--seed", type=int, default=42)
+    train.add_argument("--max-bases-per-split", type=int, default=0)
+    train.add_argument("--trust-checkpoint", action="store_true")
     geo = sub.add_parser("geoscd", help="GeoSCD geometry-only dense alignment trial; no SAM/change detector")
     geo.add_argument("--manifest", required=True, dest="manifest_path")
     geo.add_argument("--out", required=True)
@@ -176,6 +205,9 @@ def main(argv=None):
         elif command == "h0h1-benchmark":
             from .hypothesis_benchmark import run_hypothesis_benchmark
             result = run_hypothesis_benchmark(**args)
+        elif command == "msdzip-train":
+            from importlib import import_module
+            result = import_module(".2026-10-04_msdzip_h0", __package__).train_msdzip_h0(**args)
         elif command == "geoscd":
             from .geoscd import run_geoscd
             result = run_geoscd(**args)

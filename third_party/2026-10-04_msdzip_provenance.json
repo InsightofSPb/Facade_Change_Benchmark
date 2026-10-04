@@ -1,0 +1,9 @@
+{
+  "source_repository": "https://github.com/huidong-ma/MSDZip",
+  "source_commit": "cbbc03797aebe3e820bd11b4f995ae3f0b6824d0",
+  "source_path": "compress_model.py",
+  "local_path": "third_party/2026-10-04_msdzip_compress_model.py",
+  "source_sha256": "159a46f2d0736b784c0b078b88039f2e1477c09817c5889b7cf48788d3b32f72",
+  "modifications": "none; exact original file bytes",
+  "adapter_scope": "offline H0 residual training and frozen independent-window NLL scoring; not the author's online arithmetic-coding loop"
+}

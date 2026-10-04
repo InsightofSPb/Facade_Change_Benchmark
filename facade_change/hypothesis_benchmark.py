@@ -4,8 +4,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import html
+import json
 import re
 import shutil
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -212,13 +214,17 @@ def _aggregates(rows):
     return result
 
 
-def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split=1):
+def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split=1,
+                             compression_tile_size=32, compression_stride=16,
+                             zstd_level=3, lzma_preset=3, msdzip_abs_checkpoint=None,
+                             msdzip_mod256_checkpoint=None, device="cpu", trust_checkpoint=False):
     """Score frozen procedural cases; calibrate on validation and evaluate unchanged test."""
-    from .scorers import score_change, scorer_metadata
+    from .scorers import make_scorer
 
     methods = list(methods) if methods is not None else ["rgb_diff", "ssim"]
-    if not methods or len(set(methods)) != len(methods) or any(method not in {"rgb_diff", "ssim"} for method in methods):
-        raise ValueError("methods must contain unique rgb_diff/ssim names")
+    allowed = {"rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs", "lzma_mod256", "msdzip_abs", "msdzip_mod256"}
+    if not methods or len(set(methods)) != len(methods) or any(method not in allowed for method in methods):
+        raise ValueError("methods must contain unique supported change scorer names")
     if type(max_bases_per_split) is not int or max_bases_per_split < 0:
         raise ValueError("max_bases_per_split must be nonnegative; zero selects all bases")
     root = Path(dataset_run).expanduser().resolve()
@@ -240,19 +246,44 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
     bases, cases = _select(index, split, max_bases_per_split, expected)
     inputs = {"parent_run": parent_hash, "parent_summary": summary_hash, "parent_index": index_hash,
               "split": split_hash, "config": config_hash}
+    checkpoints = {"msdzip_abs": msdzip_abs_checkpoint, "msdzip_mod256": msdzip_mod256_checkpoint}
+    checkpoint_hashes = {}
+    for method in methods:
+        if method.startswith("msdzip_"):
+            if not checkpoints[method]:
+                raise ValueError(f"{method} requires its H0 checkpoint path")
+            checkpoints[method] = str(Path(checkpoints[method]).expanduser().resolve())
+            checkpoint_hashes[method] = sha256(checkpoints[method])
+    compression_options = {"compression_tile_size": compression_tile_size, "compression_stride": compression_stride,
+                           "zstd_level": zstd_level, "lzma_preset": lzma_preset}
     out = new_directory(out)
     record = run_record("hypothesis_benchmark", {"dataset_run": str(root), "input_sha256": inputs, "methods": methods,
                         "max_bases_per_split": max_bases_per_split, "threshold_grid": THRESHOLDS.tolist(),
-                        "scorers": {method: scorer_metadata(method) for method in methods}, "scope": SCOPE,
+                        "compression_options": compression_options, "checkpoints": checkpoints,
+                        "checkpoint_sha256": checkpoint_hashes, "device": device, "trust_checkpoint": trust_checkpoint,
+                        "scope": SCOPE,
                         "scorer_inputs": "reference RGB, synthetic source RGB, base reference support only; no oracle masks"})
     write_json(out / "run.json", record)
     try:
+        scorers = {}
+        for method in methods:
+            options = compression_options if method.startswith(("zstd_", "lzma_")) else {}
+            if method.startswith("msdzip_"):
+                options = {"checkpoint_path": checkpoints[method], "device": device,
+                           "dataset_fingerprint": inputs, "trust_checkpoint": trust_checkpoint}
+            scorers[method] = make_scorer(method, **options)
+        record["config"]["scorers"] = {method: scorer.metadata for method, scorer in scorers.items()}
+        serialized = json.dumps(record["config"], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+        record["config_sha256"] = hashlib.sha256(serialized).hexdigest()
+        write_json(out / "run.json", record)
         shutil.copyfile(split_path, out / "split.json")
         shutil.copyfile(summary_path, out / "parent_summary.json")
         write_json(out / "selection.json", {"algorithm": "SHA256(base_id) ranking within inherited split, before scores or GT",
                                            "max_bases_per_split": max_bases_per_split, "bases": bases,
                                            "case_ids": [case["case_id"] for case in cases], "input_sha256": inputs})
         selected_hashes, calibration, score_paths = {}, {method: [] for method in methods}, {}
+        native_paths, native_means = {}, {}
+        scoring_times, scored_bytes = {}, {}
         base_cases = defaultdict(list)
         for case in cases:
             base_cases[case["base_id"]].append(case)
@@ -260,12 +291,22 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
             (out / "scores" / method).mkdir(parents=True)
             (out / "predictions" / method).mkdir(parents=True)
             (out / "heatmaps" / method).mkdir(parents=True)
+            if method not in {"rgb_diff", "ssim"}:
+                (out / "native_bpb" / method).mkdir(parents=True)
         for i, base in enumerate(bases, 1):
             for method in methods:
                 print(f"Base {i}/{len(bases)}: {base['split']} {base['building_id']} / {base['base_id']}; {method}", flush=True)
                 for case in base_cases[base["base_id"]]:
                     reference, source, support, labels = _case_inputs(root, parent, base, case, selected_hashes)
-                    scores = score_change(reference, source, support.copy(), method=method)
+                    scorer = scorers[method]
+                    started = time.perf_counter()
+                    scores = scorer(reference, source, support.copy())
+                    seconds = time.perf_counter() - started
+                    scoring_times[method, case["case_id"]] = seconds
+                    scored_bytes[method, case["case_id"]] = int(support.sum()) * 3
+                    if method.startswith("msdzip_"):
+                        print(f"  {case['case_id']}: {seconds:.3f}s; supported RGB bytes/s="
+                              f"{scored_bytes[method, case['case_id']] / max(seconds, 1e-12):.1f}", flush=True)
                     if (scores.shape != support.shape or scores.dtype != np.float32
                             or not np.isfinite(scores[support]).all() or not np.isnan(scores[~support]).all()
                             or np.any(scores[support] < 0) or np.any(scores[support] > 1)):
@@ -273,6 +314,16 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                     relative = Path("scores") / method / (case["case_id"] + ".npy")
                     np.save(out / relative, scores, allow_pickle=False)
                     score_paths[method, case["case_id"]] = relative.as_posix()
+                    if scorer.raw_scores is not None:
+                        raw = scorer.raw_scores
+                        if (raw.shape != support.shape or raw.dtype != np.float32
+                                or not np.isfinite(raw[support]).all() or np.any(raw[support] < 0)
+                                or not np.isnan(raw[~support]).all()):
+                            raise ValueError("Compression scorer must retain finite native bpb and unsupported NaNs")
+                        native = Path("native_bpb") / method / (case["case_id"] + ".npy")
+                        np.save(out / native, raw, allow_pickle=False)
+                        native_paths[method, case["case_id"]] = native.as_posix()
+                        native_means[method, case["case_id"]] = float(raw[support].mean(dtype=np.float64))
                     if case["split"] == "val":
                         calibration[method].append((case, _counts(scores, labels, THRESHOLDS)))
         thresholds = {method: _calibrate(calibration[method]) for method in methods}
@@ -296,6 +347,9 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                                                          "reference_year", "source_year", "source_image_sha256")},
                        "method": method, "threshold": threshold, **_case_metrics(case, scores, labels, threshold),
                        "score_path": score_paths[method, case["case_id"]], "prediction_path": prediction_path,
+                       "native_bpb_path": native_paths.get((method, case["case_id"])),
+                       "native_bpb_supported_mean": native_means.get((method, case["case_id"])),
+                       "scoring_seconds": scoring_times[method, case["case_id"]],
                        "score_sha256": sha256(out / score_paths[method, case["case_id"]]),
                        "prediction_sha256": sha256(out / prediction_path)}
                 rows.append(row)
@@ -314,6 +368,9 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                              (split_path, split_hash), (config_path, config_hash)):
             if sha256(path) != digest:
                 raise ValueError(f"Parent provenance changed during benchmark: {path.name}")
+        for method, digest in checkpoint_hashes.items():
+            if sha256(checkpoints[method]) != digest:
+                raise ValueError(f"MSDZip checkpoint changed during benchmark: {method}")
         primary, sham = {}, {}
         for method in methods:
             primary[method] = _aggregates([row for row in rows if row["method"] == method and not row["sham_self_paste"]])
@@ -323,7 +380,8 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
         fields = ["method", "case_id", "base_id", "building_id", "view_id", "split", "hypothesis", "state", "scenario_id",
                   "nuisance_kind", "sham_self_paste", "threshold", "tp", "fp", "fn", "tn", "evaluated_pixel_count", "ignored_pixel_count",
                   "f1", "iou", "precision", "recall", "h0_pixel_fpr", "full_edit_pixel_count", "visible_edit_pixel_count",
-                  "retained_visible_edit_fraction", "comparable_fraction", "exclude_from_visible_recall", "score_path", "prediction_path"]
+                  "retained_visible_edit_fraction", "comparable_fraction", "exclude_from_visible_recall", "score_path", "prediction_path",
+                  "native_bpb_path", "native_bpb_supported_mean", "scoring_seconds"]
         with (out / "metrics.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
@@ -334,6 +392,10 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                    "cases_by_split": dict(Counter(case["split"] for case in cases)),
                    "buildings_by_split": {part: len({base["building_id"] for base in bases if base["split"] == part}) for part in ("train", "val", "test")},
                    "thresholds": {method: thresholds[method]["threshold"] for method in methods},
+                   "scoring": {method: {"seconds": sum(value for (name, _), value in scoring_times.items() if name == method),
+                                        "supported_rgb_bytes": sum(value for (name, _), value in scored_bytes.items() if name == method),
+                                        "scope": "scorer calls only; model loading, dataset reads and output writes excluded"}
+                               for method in methods},
                    "primary": {method: {part: {key: value for key, value in aggregate.items() if key != "buildings"}
                                         for part, aggregate in primary[method]["by_split"].items()} for method in methods},
                    "sham_controls": {method: {part: {key: value for key, value in aggregate.items() if key != "buildings"}

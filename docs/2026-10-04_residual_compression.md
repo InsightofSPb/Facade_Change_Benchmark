@@ -1,0 +1,159 @@
+# RGB-остатки и оригинальный MSDZip
+
+Добавлены четыре классических скорера и два обучаемых скорера к существующему
+`h0h1-benchmark`. Набор изображений, reviewed split, маски оценки, правила
+усреднения по зданиям и выбор порога на validation переиспользуются.
+Это обнаружение процедурных изменений на реальных кропах, не проверка
+реальных изменений между годами и не полное сравнение кодовых объяснений H0/H1.
+
+## Представления и оценки
+
+`abs = abs(source.int16 - reference.int16)`;
+`mod256 = (source.int16 - reference.int16) % 256`.
+Оба результата — uint8 в исходной RGB-решётке. Байты идут по строкам,
+каналы RGB чередуются. `abs` теряет знак и без дополнительных данных не
+восстанавливает source по reference. `mod256` обратим при известном reference.
+
+`zstd_abs`, `zstd_mod256`, `lzma_abs`, `lzma_mod256` кодируют тайлы 32×32 со
+stride 16. Сохраняется фактическая длина потока с заголовками, делённая на
+полное число RGB-байтов тайла. Геометрически неподдержанные и выходящие за
+границу изображения позиции заполняются нулями; они остаются в знаменателе.
+Перекрывающиеся оценки усредняются. Поэтому border/support padding влияет на
+значение, а пространственная детализация отличается от пиксельного RGB-diff.
+Параметры и единицы записаны в `run.json`.
+
+Нативные карты сохраняются в `native_bpb/<method>/<case_id>.npy`.
+Для общей сетки порогов evaluator применяется фиксированная шкала
+`score = 1 - exp(-bpb / 8)`. Отдельные карты не нормализуются по min/max.
+Это техническая шкала, не вероятность повреждения.
+
+## Оригинальный predictor
+
+`third_party/2026-10-04_msdzip_compress_model.py` — точная копия
+`compress_model.py` из https://github.com/huidong-ma/MSDZip,
+commit `cbbc03797aebe3e820bd11b4f995ae3f0b6824d0`.
+SHA-256 проверяется перед загрузкой. Прежняя MSDZip-style реализация и её
+веса не используются. Справочные данные об источнике находятся в
+`third_party/2026-10-04_msdzip_provenance.json`.
+
+Наш адаптер обучает этот оригинальный `MixedModel` заранее и фиксирует веса
+для обнаружения; это отличается от авторского online-обучения при сжатии.
+Он получает предыдущие байты остатка и предсказывает следующий байт.
+Текущий целевой байт в контекст не входит. История обнуляется на начале
+изображения и после геометрически неподдержанных пикселей. Истинные маски
+правок, видимости и окклюзий не передаются модели.
+
+В оригинале часть параметров привязана к позиции в batch. Поэтому позиция
+целевого байта всегда `native_flat_RGB_offset % model_batch_size`, одинаково
+при обучении и оценке. Кеш очищается перед независимыми окнами. Несколько
+таких batch обрабатываются через `torch.vmap`, если он доступен; для старого
+Torch есть последовательный fallback. Исходный predictor не изменён.
+При `model_batch_size=32`, `window_groups=16` один optimizer update получает
+до 512 целей. Эти параметры записываются в checkpoint и сохраняются при оценке.
+
+## Обучение
+
+Используются только `unchanged/H0` из train и validation. `self_paste`
+исключён как дубликат. Бюджет распределяется между ячейками здание×сценарий,
+затем между их кропами. Обе формы остатка используют одинаковые цели и
+начальную инициализацию. Checkpoint выбирается по минимальной H0 validation
+NLL; порог обнаружения затем выбирается обычным evaluator по validation.
+H1/test RGB при обучении и выборе checkpoint не открываются.
+
+Зависимости: существующий PyTorch; для zstd нужен `zstandard`.
+Код не устанавливает и не обновляет пакеты автоматически. Если zstandard
+отсутствует, достаточно `python -m pip install 'zstandard>=0.22,<1'`.
+
+Начальный прогон классических методов:
+
+```bash
+cd /home/sasha/Facade_Change_Benchmark
+git pull --ff-only
+conda activate lposs
+
+python -B -m facade_change h0h1-benchmark \
+  --dataset-run runs/2026-10-04-h0h1 \
+  --methods zstd_abs zstd_mod256 lzma_abs lzma_mod256 \
+  --max-bases-per-split 1 \
+  --out runs/2026-10-04-compression-smoke-001
+```
+
+Небольшое обучение с исходными hidden/context параметрами predictor, для проверки CUDA и
+скорости. Это технический smoke; его веса не являются результатом полного обучения.
+Сначала посмотри текущие процессы GPU; код их не останавливает.
+
+```bash
+nvidia-smi
+
+python -B -m facade_change msdzip-train \
+  --dataset-run runs/2026-10-04-h0h1 \
+  --representations abs mod256 \
+  --device cuda:0 --epochs 1 \
+  --max-train-bytes 65536 --max-val-bytes 16384 \
+  --model-batch-size 32 --window-groups 16 \
+  --max-bases-per-split 1 \
+  --out runs/2026-10-04-msdzip-smoke-001
+```
+
+Консоль и `2026-10-04_training_history_<representation>.json` показывают
+NLL, время и байты/с. На CPU оригинальный predictor дорог; скорость CUDA
+нужно измерить этим прогоном перед масштабированием.
+
+Полное обучение, когда smoke подтвердил работу и приемлемую скорость:
+
+```bash
+python -B -m facade_change msdzip-train \
+  --dataset-run runs/2026-10-04-h0h1 \
+  --representations abs mod256 \
+  --device cuda:0 --epochs 5 \
+  --max-train-bytes 2000000 --max-val-bytes 200000 \
+  --model-batch-size 32 --window-groups 16 \
+  --max-bases-per-split 0 \
+  --out runs/2026-10-04-msdzip-h0-001
+```
+
+Выходы обучения: `2026-10-04_msdzip_h0_abs.pt`,
+`2026-10-04_msdzip_h0_mod256.pt`, истории эпох, общий sampling manifest,
+reviewed split, `2026-10-04_msdzip_h0_summary.json` и `run.json`.
+Лучшие веса и история сохраняются по эпохам; автоматического resume пока нет.
+Каждый новый запуск требует новой выходной директории.
+
+Итоговое сравнение с теми же RGB-diff/SSIM на полном фиксированном наборе:
+
+```bash
+python -B -m facade_change h0h1-benchmark \
+  --dataset-run runs/2026-10-04-h0h1 \
+  --methods rgb_diff ssim zstd_abs zstd_mod256 lzma_abs lzma_mod256 msdzip_abs msdzip_mod256 \
+  --msdzip-abs-checkpoint runs/2026-10-04-msdzip-h0-001/2026-10-04_msdzip_h0_abs.pt \
+  --msdzip-mod256-checkpoint runs/2026-10-04-msdzip-h0-001/2026-10-04_msdzip_h0_mod256.pt \
+  --device cuda:0 --max-bases-per-split 0 \
+  --out runs/2026-10-04-compression-comparison-001
+```
+
+Оценка проверяет hash checkpoint, исходник predictor и совпадение fingerprint
+набора/split. Карты и прогнозы используют только RGB и базовую геометрическую
+поддержку. Known occlusions исключает evaluator, а не scorer.
+Общий порог выбирается отдельно для каждого метода только на validation;
+`self_paste` остаётся отдельным sham-контролем. Основные выходы:
+`metrics.json`, `metrics.csv`, `threshold_selection.json`, `summary.txt`,
+`scores/`, `native_bpb/`, `predictions/`, `gallery.html` и `run.json`.
+Для MSDZip консоль показывает время и скорость каждого примера; `summary.json`
+содержит суммарное время scorer calls без загрузки модели и файлового I/O.
+
+MSDZip bpb — модельная NLL, не фактический размер arithmetic-coded файла.
+Высокий score означает необычность остатка относительно изученных H0,
+а не подтверждённое повреждение. Гладкая правка может быть предсказуемой;
+неизвестная помеха может дать высокую оценку. Устойчивость к новым условиям
+и настоящим изменениям между годами требует отдельной проверки.
+
+## Проверки реализации
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+`test_scorers.load_tests` включает датированные тесты, которые стандартный
+discovery иначе пропускает. Проверяются round-trip классических кодеков,
+abs/mod256, исходник MSDZip, отсутствие целевого байта в контексте, фиксированные
+batch lanes, групповая/последовательная эквивалентность, H0-only чтение данных,
+замороженные веса и отсутствие зависимости от предыдущих примеров.

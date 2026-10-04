@@ -69,9 +69,9 @@ class HypothesisBenchmarkTests(unittest.TestCase):
     def tearDown(self):
         self.fixture.tearDown()
 
-    def _run(self, name="smoke", methods=None, limit=1):
+    def _run(self, name="smoke", methods=None, limit=1, **options):
         out = self.root / name
-        summary = run_hypothesis_benchmark(self.dataset, out, methods=methods, max_bases_per_split=limit)
+        summary = run_hypothesis_benchmark(self.dataset, out, methods=methods, max_bases_per_split=limit, **options)
         return out, summary, read_json(out / "metrics.json")
 
     def _rewrite_parent(self):
@@ -130,6 +130,53 @@ class HypothesisBenchmarkTests(unittest.TestCase):
             self.assertTrue(np.isfinite(scores[1:]).all())
             self.assertTrue(np.isnan(scores[0]).all())
         self.assertTrue(any(np.asarray(Image.open(out / row["prediction_path"]))[1:].any() for row in occluded))
+
+    @unittest.skipUnless(importlib.util.find_spec("zstandard"), "Optional zstandard codec required")
+    def test_compression_uses_existing_protocol_and_preserves_native_bpb(self):
+        methods = ["rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs", "lzma_mod256"]
+        out, summary, metrics = self._run("compression", methods=methods, compression_tile_size=16, compression_stride=8)
+        self.assertEqual(summary["scored_case_method_count"], 36 * len(methods))
+        selection = read_json(out / "threshold_selection.json")
+        self.assertEqual(set(selection["methods"]), set(methods))
+        record = read_json(out / "run.json")
+        for row in metrics["cases"]:
+            if row["method"] in {"rgb_diff", "ssim"}:
+                self.assertIsNone(row["native_bpb_path"])
+                continue
+            raw = np.load(out / row["native_bpb_path"], allow_pickle=False)
+            scores = np.load(out / row["score_path"], allow_pickle=False)
+            self.assertEqual(raw.dtype, np.float32)
+            self.assertTrue(np.isnan(raw[0]).all())
+            np.testing.assert_allclose(scores[1:], -np.expm1(-raw[1:] / 8), rtol=1e-6, atol=1e-7)
+            self.assertGreater(row["native_bpb_supported_mean"], 0)
+            self.assertEqual(record["config"]["scorers"][row["method"]]["tile_size"], 16)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "Optional PyTorch predictor required")
+    def test_original_msdzip_checkpoint_runs_through_shared_evaluator(self):
+        import importlib
+        import torch
+        msdzip = importlib.import_module("facade_change.2026-10-04_msdzip_h0")
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            fit = self.root / "original-fit"
+            result = msdzip.train_msdzip_h0(
+                self.dataset, fit, representations=["abs"], epochs=1,
+                max_train_bytes=32, max_val_bytes=16, model_batch_size=32,
+                timesteps=2, vocab_dim=2, hidden_dim=4, ffn_dim=8, window_groups=16,
+                max_bases_per_split=1,
+            )
+            checkpoint = fit / result["results"]["abs"]["checkpoint_path"]
+            out, summary, metrics = self._run("original-evaluation", methods=["msdzip_abs"],
+                                             msdzip_abs_checkpoint=checkpoint)
+            self.assertEqual(summary["scored_case_method_count"], 36)
+            metadata = read_json(out / "run.json")["config"]["scorers"]["msdzip_abs"]
+            self.assertTrue(metadata["checkpoint_dataset_verified"])
+            self.assertEqual(metadata["source_sha256"], msdzip.SOURCE_SHA256)
+            self.assertEqual(len({row["threshold"] for row in metrics["cases"]}), 1)
+            self.assertTrue(all((out / row["native_bpb_path"]).is_file() for row in metrics["cases"]))
+        finally:
+            torch.set_num_threads(previous_threads)
 
     def test_test_oracle_mask_changes_leave_scores_and_validation_thresholds_unchanged(self):
         first_out, first_summary, first = self._run("before-oracle", methods=["rgb_diff"])
