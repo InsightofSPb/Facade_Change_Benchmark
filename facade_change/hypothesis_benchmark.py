@@ -173,16 +173,53 @@ def _calibrate(validation):
                        "h0_building_macro_pixel_fpr": float(fpr[i])} for i, value in enumerate(THRESHOLDS)]}
 
 
-def _case_metrics(case, scores, labels, threshold):
-    tp, fp, fn, tn = (int(value) for value in _counts(scores, labels, threshold))
+def _metrics_from_counts(case, counts, ignored_pixel_count=0):
+    tp, fp, fn, tn = (int(value) for value in counts)
     visible_h1 = case["hypothesis"] == "H1" and tp + fn > 0
     return {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "evaluated_pixel_count": tp + fp + fn + tn,
-            "ignored_pixel_count": int((labels == 255).sum()),
+            "ignored_pixel_count": ignored_pixel_count,
             "f1": 2 * tp / (2 * tp + fp + fn) if visible_h1 else None,
             "iou": tp / (tp + fp + fn) if visible_h1 else None,
             "precision": tp / (tp + fp) if visible_h1 and tp + fp else (0. if visible_h1 else None),
             "recall": tp / (tp + fn) if visible_h1 else None,
             "h0_pixel_fpr": fp / (fp + tn) if case["hypothesis"] == "H0" and fp + tn else None}
+
+
+def _case_metrics(case, scores, labels, threshold):
+    return _metrics_from_counts(case, _counts(scores, labels, threshold), int((labels == 255).sum()))
+
+
+def _progress_rows(cases, methods, thresholds, counts, timings):
+    """Reuse evaluated count curves; provisional thresholds never see test labels."""
+    rows = []
+    for method in methods:
+        choice = thresholds.get(method)
+        for case in cases:
+            key = method, case["case_id"]
+            if key not in counts:
+                continue
+            row = {**{name: case.get(name) for name in ("case_id", "base_id", "building_id", "split", "state",
+                    "scenario_id", "nuisance_kind", "hypothesis", "sham_self_paste", "comparable_fraction",
+                    "retained_visible_edit_fraction", "exclude_from_visible_recall")},
+                   "method": method, "threshold": choice["threshold"] if choice else None,
+                   "scoring_seconds": timings[key]}
+            if choice:
+                curve, ignored = counts[key]
+                row.update(_metrics_from_counts(case, [values[choice["grid_index"]] for values in curve], ignored))
+            else:
+                row.update({metric: None for metric in ("f1", "iou", "precision", "recall", "h0_pixel_fpr")})
+            rows.append(row)
+    return rows
+
+
+def _progress_summaries(rows, methods):
+    summaries = {}
+    for method in methods:
+        selected = [row for row in rows if row["method"] == method and not row["sham_self_paste"]]
+        summaries[method] = {**_building_macro(selected)["means"], "case_count": len(selected),
+                             "threshold": selected[0]["threshold"] if selected else None,
+                             "scoring_seconds": sum(row["scoring_seconds"] for row in selected)}
+    return summaries
 
 
 def _building_macro(rows):
@@ -217,9 +254,12 @@ def _aggregates(rows):
 def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split=1,
                              compression_tile_size=32, compression_stride=16,
                              zstd_level=3, lzma_preset=3, msdzip_abs_checkpoint=None,
-                             msdzip_mod256_checkpoint=None, device="cpu", trust_checkpoint=False):
+                             msdzip_mod256_checkpoint=None, device="cpu", trust_checkpoint=False,
+                             quick_bases=0, selection_seed=42):
     """Score frozen procedural cases; calibrate on validation and evaluate unchanged test."""
     from .scorers import make_scorer
+    from .benchmark_progress import (format_case_table, format_crop_table, format_cumulative_test_table, progress_bars)
+    from .benchmark_subset import select_quick_subset
 
     methods = list(methods) if methods is not None else ["rgb_diff", "ssim"]
     allowed = {"rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs", "lzma_mod256", "msdzip_abs", "msdzip_mod256"}
@@ -227,6 +267,10 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
         raise ValueError("methods must contain unique supported change scorer names")
     if type(max_bases_per_split) is not int or max_bases_per_split < 0:
         raise ValueError("max_bases_per_split must be nonnegative; zero selects all bases")
+    if type(quick_bases) is not int or quick_bases < 0 or quick_bases == 1:
+        raise ValueError("quick_bases must be zero or at least two (validation and test)")
+    if type(selection_seed) is not int:
+        raise ValueError("selection_seed must be an integer")
     root = Path(dataset_run).expanduser().resolve()
     parent_hash = sha256(root / "run.json")
     parent = read_json(root / "run.json")
@@ -243,7 +287,12 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
     if parent["config"]["input_sha256"]["config"] != config_hash or parent_summary["case_count"] != len(index["cases"]):
         raise ValueError("Parent configuration/case-count provenance disagrees")
     expected = {(state, scenario["id"]) for state in parent["config"]["states"] for scenario in parent["config"]["scenarios"]}
-    bases, cases = _select(index, split, max_bases_per_split, expected)
+    bases, cases = _select(index, split, 0 if quick_bases else max_bases_per_split, expected)
+    subset = {"algorithm": "SHA256(base_id) ranking within inherited split, before scores or GT"}
+    if quick_bases:
+        bases, cases, subset = select_quick_subset(bases, cases, max_bases=quick_bases, seed=selection_seed)
+    # Validation must finish before any test table is evaluated at a threshold.
+    bases = sorted(bases, key=lambda base: {"val": 0, "test": 1, "train": 2}[base["split"]])
     inputs = {"parent_run": parent_hash, "parent_summary": summary_hash, "parent_index": index_hash,
               "split": split_hash, "config": config_hash}
     checkpoints = {"msdzip_abs": msdzip_abs_checkpoint, "msdzip_mod256": msdzip_mod256_checkpoint}
@@ -259,6 +308,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
     out = new_directory(out)
     record = run_record("hypothesis_benchmark", {"dataset_run": str(root), "input_sha256": inputs, "methods": methods,
                         "max_bases_per_split": max_bases_per_split, "threshold_grid": THRESHOLDS.tolist(),
+                        "quick_bases": quick_bases, "selection_seed": selection_seed, "subset": subset,
                         "compression_options": compression_options, "checkpoints": checkpoints,
                         "checkpoint_sha256": checkpoint_hashes, "device": device, "trust_checkpoint": trust_checkpoint,
                         "scope": SCOPE,
@@ -278,7 +328,8 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
         write_json(out / "run.json", record)
         shutil.copyfile(split_path, out / "split.json")
         shutil.copyfile(summary_path, out / "parent_summary.json")
-        write_json(out / "selection.json", {"algorithm": "SHA256(base_id) ranking within inherited split, before scores or GT",
+        write_json(out / "selection.json", {**subset,
+                                           "quick_selection": subset if quick_bases else None,
                                            "max_bases_per_split": max_bases_per_split, "bases": bases,
                                            "case_ids": [case["case_id"] for case in cases], "input_sha256": inputs})
         selected_hashes, calibration, score_paths = {}, {method: [] for method in methods}, {}
@@ -293,42 +344,82 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
             (out / "heatmaps" / method).mkdir(parents=True)
             if method not in {"rgb_diff", "ssim"}:
                 (out / "native_bpb" / method).mkdir(parents=True)
-        for i, base in enumerate(bases, 1):
-            for method in methods:
-                print(f"Base {i}/{len(bases)}: {base['split']} {base['building_id']} / {base['base_id']}; {method}", flush=True)
-                for case in base_cases[base["base_id"]]:
-                    reference, source, support, labels = _case_inputs(root, parent, base, case, selected_hashes)
-                    scorer = scorers[method]
-                    started = time.perf_counter()
-                    scores = scorer(reference, source, support.copy())
-                    seconds = time.perf_counter() - started
-                    scoring_times[method, case["case_id"]] = seconds
-                    scored_bytes[method, case["case_id"]] = int(support.sum()) * 3
-                    if method.startswith("msdzip_"):
-                        print(f"  {case['case_id']}: {seconds:.3f}s; supported RGB bytes/s="
-                              f"{scored_bytes[method, case['case_id']] / max(seconds, 1e-12):.1f}", flush=True)
-                    if (scores.shape != support.shape or scores.dtype != np.float32
-                            or not np.isfinite(scores[support]).all() or not np.isnan(scores[~support]).all()
-                            or np.any(scores[support] < 0) or np.any(scores[support] > 1)):
-                        raise ValueError("Scorer must return native float32 [0,1] scores and NaN outside base support")
-                    relative = Path("scores") / method / (case["case_id"] + ".npy")
-                    np.save(out / relative, scores, allow_pickle=False)
-                    score_paths[method, case["case_id"]] = relative.as_posix()
-                    if scorer.raw_scores is not None:
-                        raw = scorer.raw_scores
-                        if (raw.shape != support.shape or raw.dtype != np.float32
-                                or not np.isfinite(raw[support]).all() or np.any(raw[support] < 0)
-                                or not np.isnan(raw[~support]).all()):
-                            raise ValueError("Compression scorer must retain finite native bpb and unsupported NaNs")
-                        native = Path("native_bpb") / method / (case["case_id"] + ".npy")
-                        np.save(out / native, raw, allow_pickle=False)
-                        native_paths[method, case["case_id"]] = native.as_posix()
-                        native_means[method, case["case_id"]] = float(raw[support].mean(dtype=np.float64))
-                    if case["split"] == "val":
-                        calibration[method].append((case, _counts(scores, labels, THRESHOLDS)))
-        thresholds = {method: _calibrate(calibration[method]) for method in methods}
-        write_json(out / "threshold_selection.json", {"scope": "validation only; test labels never enter calibration",
-                                                       "exclude_self_paste": True, "methods": thresholds})
+        count_curves, completed_cases, thresholds = {}, [], {}
+        last_validation = [base["base_id"] for base in bases if base["split"] == "val"][-1]
+        thresholds_frozen = False
+        with progress_bars(len(cases) * len(methods), len(bases)) as progress:
+            for i, base in enumerate(bases, 1):
+                crop_cases = base_cases[base["base_id"]]
+                progress.start_base(i, len(crop_cases) * len(methods),
+                                    f"{base['split']} {base['building_id']}")
+                for method in methods:
+                    for case in crop_cases:
+                        case_label = f"{case['state']}/{case['scenario_id']}"
+                        progress.job_started(method, case_label)
+                        reference, source, support, labels = _case_inputs(root, parent, base, case, selected_hashes)
+                        scorer = scorers[method]
+                        started = time.perf_counter()
+                        scores = scorer(reference, source, support.copy())
+                        seconds = time.perf_counter() - started
+                        scoring_times[method, case["case_id"]] = seconds
+                        scored_bytes[method, case["case_id"]] = int(support.sum()) * 3
+                        if (scores.shape != support.shape or scores.dtype != np.float32
+                                or not np.isfinite(scores[support]).all() or not np.isnan(scores[~support]).all()
+                                or np.any(scores[support] < 0) or np.any(scores[support] > 1)):
+                            raise ValueError("Scorer must return native float32 [0,1] scores and NaN outside base support")
+                        relative = Path("scores") / method / (case["case_id"] + ".npy")
+                        np.save(out / relative, scores, allow_pickle=False)
+                        score_paths[method, case["case_id"]] = relative.as_posix()
+                        if scorer.raw_scores is not None:
+                            raw = scorer.raw_scores
+                            if (raw.shape != support.shape or raw.dtype != np.float32
+                                    or not np.isfinite(raw[support]).all() or not np.isnan(raw[~support]).all()
+                                    or np.any(raw[support] < 0)):
+                                raise ValueError("Compression scorer must retain finite native bpb and unsupported NaNs")
+                            native = Path("native_bpb") / method / (case["case_id"] + ".npy")
+                            np.save(out / native, raw, allow_pickle=False)
+                            native_paths[method, case["case_id"]] = native.as_posix()
+                            native_means[method, case["case_id"]] = float(raw[support].mean(dtype=np.float64))
+                        counts = _counts(scores, labels, THRESHOLDS)
+                        count_curves[method, case["case_id"]] = counts, int((labels == 255).sum())
+                        if case["split"] == "val":
+                            calibration[method].append((case, counts))
+                        progress.job_finished(method, case_label)
+                progress.close_base()
+                completed_cases.extend(crop_cases)
+                if base["split"] == "val":
+                    for method in methods:
+                        try:
+                            thresholds[method] = _calibrate(calibration[method])
+                        except ValueError:
+                            if base["base_id"] == last_validation:
+                                raise
+                            thresholds[method] = None
+                    if base["base_id"] == last_validation:
+                        thresholds_frozen = True
+                        write_json(out / "threshold_selection.json", {
+                            "scope": "validation only; test labels never enter calibration",
+                            "exclude_self_paste": True, "methods": thresholds})
+                crop_rows = _progress_rows(crop_cases, methods, thresholds, count_curves, scoring_times)
+                live_rows = _progress_rows(completed_cases, methods, thresholds, count_curves, scoring_times)
+                test_rows = [row for row in live_rows if row["split"] == "test"]
+                test_bases = len({row["base_id"] for row in test_rows})
+                table = format_crop_table(base, _progress_summaries(crop_rows, methods), thresholds_frozen)
+                case_metrics = {method: {row["case_id"]: row for row in crop_rows if row["method"] == method}
+                                for method in methods}
+                table += "\n" + format_case_table(crop_cases, case_metrics)
+                if base["split"] == "test":
+                    table += "\n" + format_cumulative_test_table(_progress_summaries(test_rows, methods), test_bases)
+                progress.write(table)
+                with (out / "progress.txt").open("a", encoding="utf-8") as stream:
+                    stream.write(table + "\n\n")
+                write_json(out / "live_metrics.json", {
+                    "scope": SCOPE, "completed_base_count": i, "selected_base_count": len(bases),
+                    "completed_case_method_count": len(live_rows), "thresholds_frozen": thresholds_frozen,
+                    "thresholds": {method: choice["threshold"] if choice else None for method, choice in thresholds.items()},
+                    "aggregation": "case means within building, then equal building means",
+                    "primary": {method: _aggregates([row for row in live_rows if row["method"] == method and not row["sham_self_paste"]])
+                                for method in methods}, "cases": live_rows})
         rows, galleries = [], {method: [] for method in methods}
         bases_by_id = {base["base_id"]: base for base in bases}
         gallery_ids = _gallery_selection(cases)
@@ -405,6 +496,8 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                                              "building_count": parent_summary["selected_building_count"]},
                    "parent_summary_path": "parent_summary.json", "metrics_path": "metrics.json", "csv_metrics_path": "metrics.csv",
                    "threshold_selection_path": "threshold_selection.json", "selection_path": "selection.json", "gallery_path": "gallery.html"}
+        summary.update(quick_bases=quick_bases, selection_seed=selection_seed,
+                       live_metrics_path="live_metrics.json", progress_path="progress.txt")
         write_json(out / "summary.json", summary)
         test_lines = []
         for method in methods:

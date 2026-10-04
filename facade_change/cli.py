@@ -102,6 +102,10 @@ def parser():
                        "lzma_mod256", "msdzip_abs", "msdzip_mod256"], default=["rgb_diff", "ssim"])
     trial.add_argument("--max-bases-per-split", type=int, default=1,
                        help="Frozen SHA-ranked base crops per partition; 0 uses the full existing dataset")
+    trial.add_argument("--quick-bases", type=int, default=0,
+                       help="Up to this many distinct val/test buildings; 3 states x 2 shared nuisance scenarios per crop; overrides max-bases-per-split")
+    trial.add_argument("--selection-seed", type=int, default=42,
+                       help="Fixed seed for quick crop and nuisance selection before scoring")
     trial.add_argument("--compression-tile-size", type=int, default=32)
     trial.add_argument("--compression-stride", type=int, default=16)
     trial.add_argument("--zstd-level", type=int, default=3)

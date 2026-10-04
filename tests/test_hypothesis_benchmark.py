@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,6 +85,98 @@ class HypothesisBenchmarkTests(unittest.TestCase):
         path = self.dataset / case[key]
         Image.fromarray(array).save(path)
         case["artifact_sha256"][key] = sha256(path)
+
+    def test_quick_ten_distinct_buildings_calibrate_before_test_and_save_live_metrics(self):
+        for part, count, anchor in (("val", 2, 90), ("test", 6, 150)):
+            for i in range(count):
+                building = f"extra_{part}_{i}"
+                self.fixture.split["building_assignments"][building] = part
+                self.fixture._add_crop(building, part, "view", anchor + i, "only")
+        write_json(self.fixture.parent / "split.json", self.fixture.split)
+        self.fixture._finish_parent()
+        dataset, _, _ = self.fixture._export("larger-hypotheses")
+        from facade_change.hypothesis_benchmark import _case_inputs
+        out = self.root / "quick-ten"
+        phase_order = []
+
+        def checked_inputs(root, parent, base, case, checked):
+            phase_order.append(case["split"])
+            if case["split"] == "test":
+                self.assertTrue((out / "threshold_selection.json").is_file())
+                choice = read_json(out / "threshold_selection.json")
+                self.assertEqual(choice["methods"]["rgb_diff"]["h1_building_count"], 3)
+            return _case_inputs(root, parent, base, case, checked)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch("facade_change.benchmark_progress._load_tqdm", return_value=None), \
+                patch("facade_change.hypothesis_benchmark._case_inputs", side_effect=checked_inputs):
+            summary = run_hypothesis_benchmark(dataset, out, methods=["rgb_diff"], quick_bases=10, selection_seed=42)
+        self.assertEqual((summary["selected_base_count"], summary["selected_case_count"], summary["scored_case_method_count"]), (10, 60, 60))
+        self.assertEqual(summary["buildings_by_split"], {"train": 0, "val": 3, "test": 7})
+        selection = read_json(out / "selection.json")
+        self.assertEqual(len({base["building_id"] for base in selection["bases"]}), 10)
+        self.assertEqual(selection["quick_selection"]["selected_case_count"], 60)
+        self.assertEqual(set(selection["quick_selection"]["states"]), {"unchanged", "crack", "paint_patch"})
+        live = read_json(out / "live_metrics.json")
+        self.assertTrue(live["thresholds_frozen"])
+        self.assertEqual(live["thresholds"], summary["thresholds"])
+        self.assertEqual(live["completed_base_count"], 10)
+        self.assertEqual(live["primary"]["rgb_diff"]["by_split"]["test"]["means"], summary["primary"]["rgb_diff"]["test"]["means"])
+        self.assertIn("предварительные пороги", output.getvalue())
+        self.assertIn("Накопленный TEST", output.getvalue())
+        self.assertEqual((out / "progress.txt").read_text().count("Каждая выбранная пара:"), 10)
+
+    def test_quick_interruption_preserves_completed_validation_and_frozen_threshold(self):
+        from facade_change.hypothesis_benchmark import _case_inputs
+        out = self.root / "quick-interrupted"
+
+        def interrupted_inputs(root, parent, base, case, checked):
+            if case["split"] == "test":
+                self.assertTrue((out / "threshold_selection.json").is_file())
+                raise KeyboardInterrupt("stop before test")
+            return _case_inputs(root, parent, base, case, checked)
+
+        with contextlib.redirect_stdout(io.StringIO()), patch("facade_change.benchmark_progress._load_tqdm", return_value=None), \
+                patch("facade_change.hypothesis_benchmark._case_inputs", side_effect=interrupted_inputs):
+            with self.assertRaises(KeyboardInterrupt):
+                run_hypothesis_benchmark(self.dataset, out, methods=["rgb_diff"], quick_bases=10)
+        self.assertEqual(read_json(out / "run.json")["status"], "interrupted")
+        live = read_json(out / "live_metrics.json")
+        self.assertEqual(live["completed_base_count"], 1)
+        self.assertTrue(live["thresholds_frozen"])
+        self.assertEqual(len(live["cases"]), 6)
+        self.assertTrue((out / "progress.txt").is_file())
+
+    @unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("zstandard"), "PyTorch/zstandard required")
+    def test_quick_all_eight_methods_use_existing_checkpoints_and_identical_cases(self):
+        import importlib
+        import torch
+        msdzip = importlib.import_module("facade_change.2026-10-04_msdzip_h0")
+        old_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                fit = msdzip.train_msdzip_h0(self.dataset, self.root / "quick-fit", epochs=1,
+                    max_train_bytes=32, max_val_bytes=16, model_batch_size=4, timesteps=2,
+                    hidden_dim=4, ffn_dim=8, vocab_dim=2, window_groups=2)
+                checkpoints = {rep: self.root / "quick-fit" / fit["results"][rep]["checkpoint_path"] for rep in ("abs", "mod256")}
+                before = {rep: sha256(path) for rep, path in checkpoints.items()}
+                methods = ["rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs", "lzma_mod256", "msdzip_abs", "msdzip_mod256"]
+                with patch("facade_change.benchmark_progress._load_tqdm", return_value=None):
+                    out, summary, metrics = self._run("quick-eight", methods=methods, quick_bases=10,
+                        msdzip_abs_checkpoint=checkpoints["abs"], msdzip_mod256_checkpoint=checkpoints["mod256"],
+                        compression_tile_size=16, compression_stride=8)
+            self.assertEqual(summary["selected_case_count"], 12)
+            self.assertEqual(summary["scored_case_method_count"], 96)
+            expected = set(read_json(out / "selection.json")["case_ids"])
+            for method in methods:
+                rows = [row for row in metrics["cases"] if row["method"] == method]
+                self.assertEqual({row["case_id"] for row in rows}, expected)
+                self.assertEqual({row["threshold"] for row in rows}, {summary["thresholds"][method]})
+            self.assertEqual({rep: sha256(path) for rep, path in checkpoints.items()}, before)
+            self.assertEqual(read_json(out / "live_metrics.json")["completed_case_method_count"], 96)
+        finally:
+            torch.set_num_threads(old_threads)
 
     def test_end_to_end_frozen_selection_primary_vs_sham_and_standalone_gallery(self):
         before = {path: sha256(path) for path in self.dataset.rglob("*") if path.is_file()}
