@@ -94,6 +94,9 @@ bash scripts/setup_competitors.sh --env scd_bench --download-lpips-weights
 0.1.4. Существующий проверенный backbone переиспользуется. Без флага веса не
 скачиваются. Inference никогда автоматически не скачивает модели.
 Все DINO/RSCD/SAM checkpoint из прежнего проекта используются на месте.
+RSCD загружает NumPy-метаданные checkpoint через ограниченный список scalar/dtype.
+Импорт совместим с NumPy 1.26 и 2.x; в Torch 2.6 учитываются оба исторических
+имени NumPy scalar. Версии библиотек для этого менять не требуется.
 
 LPIPS проверяет локальный файл по умолчанию в `torch.hub.get_dir()/checkpoints`.
 Для другого расположения можно задать `backbone_checkpoint` в конфигурации

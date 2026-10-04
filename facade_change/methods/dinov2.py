@@ -7,6 +7,7 @@ not an architecture change or a claim to reproduce an author's image protocol.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import pickle
 import sys
 from pathlib import Path
@@ -63,10 +64,16 @@ def _checkpoint(path, trust_checkpoint=False, numpy_metadata=False):
         return torch.load(path, map_location="cpu", weights_only=True), "weights_only"
     except (TypeError, pickle.UnpicklingError) as safe_error:
         if numpy_metadata and hasattr(torch.serialization, "safe_globals"):
-            numpy_core = getattr(np, "_core", None)
-            if numpy_core is None:
-                numpy_core = np.core
-            allowed = [np.dtype, numpy_core.multiarray.scalar]
+            # NumPy 1.26 exposes a compatibility numpy._core package without
+            # its multiarray attribute. Import the actual version's submodule.
+            namespace = "numpy._core" if int(np.__version__.split(".")[0]) >= 2 else "numpy.core"
+            scalar = importlib.import_module(namespace + ".multiarray").scalar
+            allowed = [np.dtype, scalar]
+            if tuple(int(part) for part in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 6):
+                # Torch 2.6 supports exact-name aliases. Both pickle spellings
+                # refer to this same fixed NumPy scalar constructor.
+                allowed += [(scalar, name + ".multiarray.scalar")
+                            for name in ("numpy.core", "numpy._core")]
             allowed += [type(np.dtype(name)) for name in
                         ("float32", "float64", "int32", "int64")]
             try:

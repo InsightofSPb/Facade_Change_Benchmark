@@ -138,6 +138,19 @@ class DinoRSCDTests(unittest.TestCase):
         self.assertEqual(record["metric"], .5)
         self.assertEqual(mode, "weights_only_numpy_metadata")
 
+    def test_numpy_compatibility_namespace_without_multiarray_does_not_block_loading(self):
+        path = self.root / "numpy-compatibility.pth"
+        torch.save({"metric": np.float64(.5), "model": {"head": torch.ones(1)}}, path)
+        before = list(torch.serialization.get_safe_globals())
+        # NumPy 1.26 has a _core compatibility package whose presence does not
+        # guarantee a multiarray attribute. Exercise that exact failure shape.
+        with mock.patch.object(np, "_core", types.SimpleNamespace(), create=True):
+            record, mode = _checkpoint(path, numpy_metadata=True)
+        self.assertEqual(record["metric"], .5)
+        torch.testing.assert_close(record["model"]["head"], torch.ones(1))
+        self.assertEqual(mode, "weights_only_numpy_metadata")
+        self.assertEqual(torch.serialization.get_safe_globals(), before)
+
     def test_old_torch_never_implicitly_uses_unrestricted_loading(self):
         def old_load(path, **kwargs):
             if "weights_only" in kwargs:
