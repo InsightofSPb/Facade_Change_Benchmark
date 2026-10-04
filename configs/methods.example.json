@@ -1,0 +1,54 @@
+{
+  "methods": {
+    "lpips": {
+      "worker_python": "/home/sasha/miniconda3/envs/scd_bench/bin/python",
+      "network": "alex"
+    },
+    "dinov2": {
+      "worker_python": "/home/sasha/miniconda3/envs/scd_bench/bin/python",
+      "source_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/dinov2",
+      "checkpoint_path": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2_vits14_pretrain.pth"
+    },
+    "rscd_cmu": {
+      "worker_python": "/home/sasha/miniconda3/envs/scd_bench/bin/python",
+      "source_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/rscd",
+      "checkpoint_path": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2.2CrossAttn.CMU.pth",
+      "dino_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/dinov2",
+      "dino_checkpoint": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2_vits14_pretrain.pth",
+      "py_utils_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/py_utils"
+    },
+    "rscd_diff_cmu": {
+      "worker_python": "/home/sasha/miniconda3/envs/scd_bench/bin/python",
+      "source_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/rscd",
+      "checkpoint_path": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2.2CrossAttn.Diff-CMU.pth",
+      "dino_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/dinov2",
+      "dino_checkpoint": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2_vits14_pretrain.pth",
+      "py_utils_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/py_utils"
+    },
+    "rscd_pscd": {
+      "worker_python": "/home/sasha/miniconda3/envs/scd_bench/bin/python",
+      "source_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/rscd",
+      "checkpoint_path": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2.2CrossAttn.PSCD.pth",
+      "dino_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/dinov2",
+      "dino_checkpoint": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/dinov2_vits14_pretrain.pth",
+      "py_utils_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/py_utils"
+    },
+    "anychange": {
+      "worker_python": "/home/sasha/miniconda3/envs/scd_bench/bin/python",
+      "source_root": "/home/sasha/Semantic_Change_Detection_Comparison/benchmark/sources/anychange",
+      "checkpoint_path": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/sam_vit_h_4b8939.pth",
+      "points_per_batch": 32
+    },
+    "geoscd": {
+      "worker_python": "/home/sasha/miniconda3/envs/facade-geoscd/bin/python",
+      "source_root": "/home/sasha/GeoSCD-facade",
+      "checkpoint_path": "/home/sasha/Facade_Change_Benchmark/models/vggt_1b.pt",
+      "sam_checkpoint": "/home/sasha/Semantic_Change_Detection_Comparison/competitors_model_weights/sam_vit_h_4b8939.pth",
+      "seed": 42,
+      "mode": "occupy",
+      "points_per_side": 32,
+      "iou_thresh": 0.65,
+      "worker_timeout": 3600
+    }
+  }
+}

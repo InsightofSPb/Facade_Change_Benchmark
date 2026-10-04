@@ -6,6 +6,7 @@ __pycache__/
 .env.*
 !.env.example
 configs/local*.json
+configs/*.local.json
 runs/
 data/
 datasets/

@@ -60,13 +60,14 @@ def load_rgb(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
 
 def environment() -> dict:
     versions = {}
-    for name in ("numpy", "Pillow", "opencv-python-headless", "opencv-python", "torch", "kornia"):
+    for name in ("numpy", "Pillow", "opencv-python-headless", "opencv-python", "torch", "torchvision",
+                 "kornia", "lpips", "safetensors", "einops", "scikit-image"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     package = Path(__file__).resolve().parent
-    source = {p.name: sha256(p) for p in sorted(package.glob("*.py"))}
+    source = {p.relative_to(package).as_posix(): sha256(p) for p in sorted(package.rglob("*.py"))}
     result = {"python": platform.python_version(), "platform": platform.platform(),
               "packages": versions, "source_sha256": source}
     try:

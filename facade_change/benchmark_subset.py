@@ -3,11 +3,122 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
+import re
 from collections import defaultdict
+from pathlib import Path
 
 
 QUICK_STATES = ("unchanged", "crack", "paint_patch")
 QUICK_FAMILIES = ("shadow", "exposure", "contrast", "white_balance", "blur", "occlusion")
+
+INPUT_HASH_KEYS = frozenset(("parent_run", "parent_summary", "parent_index", "split", "config"))
+
+
+def validate_input_hashes(actual, expected):
+    """Require the entire inherited dataset fingerprint, not just RGB identity."""
+    for hashes in (actual, expected):
+        if not isinstance(hashes, dict) or set(hashes) != INPUT_HASH_KEYS:
+            raise ValueError("Selection requires all five parent dataset input hashes")
+        if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+               for value in hashes.values()):
+            raise ValueError("Selection input hashes must be SHA256 values")
+    if actual != expected:
+        raise ValueError("Selection belongs to a different parent dataset fingerprint")
+
+
+def replay_selection(bases, cases, input_sha256, selection_path):
+    """Replay a recorded selection exactly, with no new sampling or score access.
+
+    Returned rows always come from the currently verified parent index. The
+    selection's base records are identity assertions, never replacement rows.
+    The five hashes bind scenario, support and GT artifacts to the same parent.
+    """
+    selection_path = Path(selection_path).expanduser().resolve()
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    if not isinstance(selection, dict) or selection.get("schema_version") != 1:
+        raise ValueError("Unsupported saved selection schema")
+    validate_input_hashes(input_sha256, selection.get("input_sha256"))
+    bases, cases = list(bases), list(cases)
+    # Also validate unselected bases: replay must not hide facade-level leakage.
+    _base_candidates(bases, selection.get("seed", 42))
+    by_base = {row["base_id"]: row for row in bases}
+    by_case = {}
+    for case in cases:
+        identifier = case["case_id"]
+        if identifier in by_case or case["base_id"] not in by_base:
+            raise ValueError("Saved selection requires unique cases with known bases")
+        by_case[identifier] = case
+    saved_bases, identifiers = selection.get("bases"), selection.get("case_ids")
+    if not isinstance(saved_bases, list) or not saved_bases or not isinstance(identifiers, list) or not identifiers:
+        raise ValueError("Saved selection must contain bases and case IDs")
+    if any(not isinstance(value, str) for value in identifiers) or len(set(identifiers)) != len(identifiers):
+        raise ValueError("Saved selection duplicates or invalidates case IDs")
+    selected_bases, seen = [], set()
+    for recorded in saved_bases:
+        identifier = recorded.get("base_id")
+        if identifier in seen or identifier not in by_base:
+            raise ValueError("Saved selection duplicates or refers to an unknown base")
+        base = by_base[identifier]
+        if recorded != base:
+            raise ValueError("Saved base identity disagrees with its verified parent index")
+        seen.add(identifier)
+        selected_bases.append(base)
+    splits = [row["split"] for row in selected_bases]
+    priority = {"val": 0, "test": 1, "train": 2}
+    if not {"val", "test"}.issubset(splits) or splits != sorted(splits, key=priority.get):
+        raise ValueError("Saved selection must finish validation before test")
+    selected_cases, grouped = [], defaultdict(list)
+    for identifier in identifiers:
+        case = by_case.get(identifier)
+        if case is None or case["base_id"] not in seen:
+            raise ValueError("Saved selection refers to an unknown or unselected case")
+        base = by_base[case["base_id"]]
+        if any(case.get(key) != base.get(key) for key in ("building_id", "split", "view_id")):
+            raise ValueError("Saved case identity disagrees with its verified base")
+        if "parent_dataset_crop_id" in case and case["parent_dataset_crop_id"] != base.get("dataset_crop_id"):
+            raise ValueError("Saved case belongs to a different parent crop")
+        expected_hypothesis = "H1" if case["state"] in {"crack", "paint_patch"} else "H0"
+        if case.get("hypothesis") != expected_hypothesis or bool(case.get("sham_self_paste")) != (case["state"] == "self_paste"):
+            raise ValueError("Saved case state/hypothesis/control metadata disagrees")
+        spec = case.get("scenario")
+        if not isinstance(spec, dict) or spec.get("id") != case["scenario_id"] or spec.get("kind") != case["nuisance_kind"]:
+            raise ValueError("Saved case scenario metadata disagrees")
+        if "reference_rgb" in case and case["reference_rgb"] != base["path"] + "/reference_rgb.png":
+            raise ValueError("Saved case reference does not belong to its base")
+        if "reference_support" in case and case["reference_support"] != base["path"] + "/reference_support.png":
+            raise ValueError("Saved case support does not belong to its base")
+        selected_cases.append(case)
+        grouped[case["base_id"]].append(case)
+    if [row["case_id"] for base in selected_bases for row in grouped[base["base_id"]]] != identifiers:
+        raise ValueError("Saved case ordering disagrees with saved base ordering")
+    if any(not grouped[base["base_id"]] for base in selected_bases):
+        raise ValueError("Saved selection contains a base without cases")
+    if selection.get("selected_base_count", len(selected_bases)) != len(selected_bases) or selection.get("selected_case_count", len(selected_cases)) != len(selected_cases):
+        raise ValueError("Saved selection counts disagree")
+    if selection.get("mode") == "quick":
+        quick = selection.get("quick_selection")
+        if not isinstance(quick, dict):
+            raise ValueError("Saved quick selection requires its frozen per-base scenario metadata")
+        frozen = quick.get("bases", [])
+        if [row.get("base_id") for row in frozen] != [row["base_id"] for row in selected_bases]:
+            raise ValueError("Saved quick-selection base order disagrees")
+        for base, spec in zip(selected_bases, frozen):
+            rows = grouped[base["base_id"]]
+            if spec.get("case_ids") != [row["case_id"] for row in rows]:
+                raise ValueError("Saved quick-selection case IDs disagree")
+            families, variants = _eligible_scenarios(base, rows)
+            scenarios = spec.get("selected_scenario_ids", [])
+            if len(rows) != 6 or len(scenarios) != 2 or set(variants) != set(scenarios) or len(families) != 2:
+                raise ValueError("Saved quick selection requires two shared conditions and six cases per base")
+            if set(spec.get("selected_families", [])) != set(families):
+                raise ValueError("Saved quick-selection families disagree")
+        if len({row["building_id"] for row in selected_bases}) != len(selected_bases) or "train" in splits:
+            raise ValueError("Saved quick selection requires distinct validation/test buildings")
+    subset = copy.deepcopy(selection)
+    subset.update(replayed_selection_path=str(selection_path),
+                  replayed_selection_sha256=hashlib.sha256(selection_path.read_bytes()).hexdigest())
+    return selected_bases, selected_cases, subset
 
 
 def _rank(seed, *parts):

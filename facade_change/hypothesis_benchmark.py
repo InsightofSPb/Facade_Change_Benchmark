@@ -255,16 +255,30 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                              compression_tile_size=32, compression_stride=16,
                              zstd_level=3, lzma_preset=3, msdzip_abs_checkpoint=None,
                              msdzip_mod256_checkpoint=None, device="cpu", trust_checkpoint=False,
-                             quick_bases=0, selection_seed=42):
+                             quick_bases=0, selection_seed=42, selection_path=None,
+                             reuse_run=None, method_options=None):
     """Score frozen procedural cases; calibrate on validation and evaluate unchanged test."""
     from .scorers import make_scorer
     from .benchmark_progress import (format_case_table, format_crop_table, format_cumulative_test_table, progress_bars)
-    from .benchmark_subset import select_quick_subset
+    from .benchmark_subset import select_quick_subset, replay_selection
+    from .benchmark_results import ReuseResults
+    from .methods.registry import ALL_METHODS, EXTERNAL_METHODS
+    from .methods.remote import RemotePool, RemoteScorer
 
     methods = list(methods) if methods is not None else ["rgb_diff", "ssim"]
-    allowed = {"rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs", "lzma_mod256", "msdzip_abs", "msdzip_mod256"}
+    allowed = set(ALL_METHODS)
     if not methods or len(set(methods)) != len(methods) or any(method not in allowed for method in methods):
         raise ValueError("methods must contain unique supported change scorer names")
+    method_options = dict(method_options or {})
+    if set(method_options) - allowed or any(not isinstance(value, dict) for value in method_options.values()):
+        raise ValueError("method_options must map supported method names to option objects")
+    reuse = ReuseResults(reuse_run) if reuse_run else None
+    if reuse:
+        methods = list(reuse.methods) + [method for method in methods if method not in reuse.methods]
+        if any(method not in allowed for method in methods):
+            raise ValueError("Reused run contains unsupported methods")
+        if not selection_path:
+            selection_path = reuse.path / "selection.json"
     if type(max_bases_per_split) is not int or max_bases_per_split < 0:
         raise ValueError("max_bases_per_split must be nonnegative; zero selects all bases")
     if type(quick_bases) is not int or quick_bases < 0 or quick_bases == 1:
@@ -287,18 +301,24 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
     if parent["config"]["input_sha256"]["config"] != config_hash or parent_summary["case_count"] != len(index["cases"]):
         raise ValueError("Parent configuration/case-count provenance disagrees")
     expected = {(state, scenario["id"]) for state in parent["config"]["states"] for scenario in parent["config"]["scenarios"]}
-    bases, cases = _select(index, split, 0 if quick_bases else max_bases_per_split, expected)
+    bases, cases = _select(index, split, 0 if quick_bases or selection_path else max_bases_per_split, expected)
     subset = {"algorithm": "SHA256(base_id) ranking within inherited split, before scores or GT"}
-    if quick_bases:
+    if quick_bases and not selection_path:
         bases, cases, subset = select_quick_subset(bases, cases, max_bases=quick_bases, seed=selection_seed)
     # Validation must finish before any test table is evaluated at a threshold.
     bases = sorted(bases, key=lambda base: {"val": 0, "test": 1, "train": 2}[base["split"]])
     inputs = {"parent_run": parent_hash, "parent_summary": summary_hash, "parent_index": index_hash,
               "split": split_hash, "config": config_hash}
+    if selection_path:
+        if quick_bases:
+            raise ValueError("Use saved --selection or --quick-bases, not both")
+        bases, cases, subset = replay_selection(bases, cases, inputs, selection_path)
+    if reuse:
+        reuse.validate_selection(inputs, bases, cases)
     checkpoints = {"msdzip_abs": msdzip_abs_checkpoint, "msdzip_mod256": msdzip_mod256_checkpoint}
     checkpoint_hashes = {}
     for method in methods:
-        if method.startswith("msdzip_"):
+        if method.startswith("msdzip_") and not (reuse and method in reuse.methods):
             if not checkpoints[method]:
                 raise ValueError(f"{method} requires its H0 checkpoint path")
             checkpoints[method] = str(Path(checkpoints[method]).expanduser().resolve())
@@ -311,29 +331,42 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                         "quick_bases": quick_bases, "selection_seed": selection_seed, "subset": subset,
                         "compression_options": compression_options, "checkpoints": checkpoints,
                         "checkpoint_sha256": checkpoint_hashes, "device": device, "trust_checkpoint": trust_checkpoint,
+                        "method_options": method_options, "reuse": reuse.provenance if reuse else None,
                         "scope": SCOPE,
                         "scorer_inputs": "reference RGB, synthetic source RGB, base reference support only; no oracle masks"})
     write_json(out / "run.json", record)
+    pool = RemotePool(log_dir=out / "worker_logs")
+    scorers = {}
     try:
-        scorers = {}
         for method in methods:
+            if reuse and method in reuse.methods:
+                continue
             options = compression_options if method.startswith(("zstd_", "lzma_")) else {}
             if method.startswith("msdzip_"):
                 options = {"checkpoint_path": checkpoints[method], "device": device,
                            "dataset_fingerprint": inputs, "trust_checkpoint": trust_checkpoint}
-            scorers[method] = make_scorer(method, **options)
-        record["config"]["scorers"] = {method: scorer.metadata for method, scorer in scorers.items()}
+            if method in EXTERNAL_METHODS:
+                defaults = {"device": device}
+                if method != "geoscd":
+                    defaults["trust_checkpoint"] = trust_checkpoint
+                options = {**defaults, **method_options.get(method, {})}
+                scorers[method] = RemoteScorer(method, options, pool)
+            else:
+                scorers[method] = make_scorer(method, **options)
+        record["config"]["scorers"] = {
+            method: reuse.metadata(method) if reuse and method in reuse.methods else scorers[method].metadata
+            for method in methods}
         serialized = json.dumps(record["config"], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
         record["config_sha256"] = hashlib.sha256(serialized).hexdigest()
         write_json(out / "run.json", record)
         shutil.copyfile(split_path, out / "split.json")
         shutil.copyfile(summary_path, out / "parent_summary.json")
         write_json(out / "selection.json", {**subset,
-                                           "quick_selection": subset if quick_bases else None,
+                                           "quick_selection": subset if quick_bases else subset.get("quick_selection"),
                                            "max_bases_per_split": max_bases_per_split, "bases": bases,
                                            "case_ids": [case["case_id"] for case in cases], "input_sha256": inputs})
         selected_hashes, calibration, score_paths = {}, {method: [] for method in methods}, {}
-        native_paths, native_means = {}, {}
+        native_paths, native_means, raw_paths, native_prediction_paths = {}, {}, {}, {}
         scoring_times, scored_bytes = {}, {}
         base_cases = defaultdict(list)
         for case in cases:
@@ -342,9 +375,12 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
             (out / "scores" / method).mkdir(parents=True)
             (out / "predictions" / method).mkdir(parents=True)
             (out / "heatmaps" / method).mkdir(parents=True)
-            if method not in {"rgb_diff", "ssim"}:
+            (out / "native_predictions" / method).mkdir(parents=True)
+            (out / "raw_scores" / method).mkdir(parents=True)
+            if method.startswith(("zstd_", "lzma_", "msdzip_")):
                 (out / "native_bpb" / method).mkdir(parents=True)
-        count_curves, completed_cases, thresholds = {}, [], {}
+        count_curves, completed_cases, thresholds, load_fingerprints = {}, [], {}, {}
+        reused_methods = set(reuse.methods) if reuse else set()
         last_validation = [base["base_id"] for base in bases if base["split"] == "val"][-1]
         thresholds_frozen = False
         with progress_bars(len(cases) * len(methods), len(bases)) as progress:
@@ -353,14 +389,40 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                 progress.start_base(i, len(crop_cases) * len(methods),
                                     f"{base['split']} {base['building_id']}")
                 for method in methods:
+                    if method not in reused_methods and isinstance(scorers[method], RemoteScorer):
+                        progress.job_started(method, "загрузка модели")
+                        scorers[method].activate()
+                        immutable = {key: scorers[method].metadata[key] for key in (
+                            "method", "output_kind", "checkpoint", "checkpoints", "weights", "source", "sources",
+                            "backbone", "package", "normalization", "settings", "author_settings", "checkpoint_model_args",
+                            "device", "worker_python", "worker_environment") if key in scorers[method].metadata}
+                        fingerprint = hashlib.sha256(json.dumps(immutable, sort_keys=True, ensure_ascii=False,
+                                                               allow_nan=False).encode()).hexdigest()
+                        if method in load_fingerprints and load_fingerprints[method] != fingerprint:
+                            raise ValueError(f"Method source, weights or worker environment changed during benchmark: {method}")
+                        load_fingerprints[method] = fingerprint
+                        record["config"]["scorer_load_fingerprints"] = dict(load_fingerprints)
+                        record["config"]["scorers"][method] = scorers[method].metadata
+                        serialized = json.dumps(record["config"], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+                        record["config_sha256"] = hashlib.sha256(serialized).hexdigest()
+                        write_json(out / "run.json", record)
                     for case in crop_cases:
                         case_label = f"{case['state']}/{case['scenario_id']}"
                         progress.job_started(method, case_label)
                         reference, source, support, labels = _case_inputs(root, parent, base, case, selected_hashes)
-                        scorer = scorers[method]
                         started = time.perf_counter()
-                        scores = scorer(reference, source, support.copy())
-                        seconds = time.perf_counter() - started
+                        if method in reused_methods:
+                            cached = reuse.load(method, case["case_id"])
+                            scores, raw = cached["scores"], cached["raw_scores"]
+                            native_prediction = cached.get("native_prediction")
+                            seconds = cached["scoring_seconds"]
+                        else:
+                            scorer = scorers[method]
+                            scores = scorer(reference, source, support.copy())
+                            seconds = time.perf_counter() - started
+                            raw = getattr(scorer, "raw_scores", None)
+                            native_prediction = getattr(scorer, "native_prediction", None)
+                            record["config"]["scorers"][method] = scorer.metadata
                         scoring_times[method, case["case_id"]] = seconds
                         scored_bytes[method, case["case_id"]] = int(support.sum()) * 3
                         if (scores.shape != support.shape or scores.dtype != np.float32
@@ -368,27 +430,57 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                                 or np.any(scores[support] < 0) or np.any(scores[support] > 1)):
                             raise ValueError("Scorer must return native float32 [0,1] scores and NaN outside base support")
                         relative = Path("scores") / method / (case["case_id"] + ".npy")
-                        np.save(out / relative, scores, allow_pickle=False)
+                        if method in reused_methods:
+                            shutil.copyfile(reuse._checked(cached["row"]["score_path"], cached["row"].get("score_sha256")), out / relative)
+                        else:
+                            np.save(out / relative, scores, allow_pickle=False)
                         score_paths[method, case["case_id"]] = relative.as_posix()
-                        if scorer.raw_scores is not None:
-                            raw = scorer.raw_scores
+                        if raw is not None:
                             if (raw.shape != support.shape or raw.dtype != np.float32
                                     or not np.isfinite(raw[support]).all() or not np.isnan(raw[~support]).all()
                                     or np.any(raw[support] < 0)):
-                                raise ValueError("Compression scorer must retain finite native bpb and unsupported NaNs")
-                            native = Path("native_bpb") / method / (case["case_id"] + ".npy")
-                            np.save(out / native, raw, allow_pickle=False)
-                            native_paths[method, case["case_id"]] = native.as_posix()
-                            native_means[method, case["case_id"]] = float(raw[support].mean(dtype=np.float64))
+                                raise ValueError("Raw score maps must be finite nonnegative float32 with unsupported NaNs")
+                            is_bpb = method.startswith(("zstd_", "lzma_", "msdzip_"))
+                            native = Path("native_bpb" if is_bpb else "raw_scores") / method / (case["case_id"] + ".npy")
+                            if method in reused_methods:
+                                previous_raw = cached["row"].get("raw_score_path") or cached["row"].get("native_bpb_path")
+                                shutil.copyfile(reuse._checked(previous_raw), out / native)
+                            else:
+                                np.save(out / native, raw, allow_pickle=False)
+                            raw_paths[method, case["case_id"]] = native.as_posix()
+                            if is_bpb:
+                                native_paths[method, case["case_id"]] = native.as_posix()
+                                native_means[method, case["case_id"]] = float(raw[support].mean(dtype=np.float64))
+                        if native_prediction is not None:
+                            if native_prediction.shape != support.shape or native_prediction.dtype != bool:
+                                raise ValueError("Author predictions must be native-grid boolean masks")
+                            native_prediction = native_prediction & support
+                            native = Path("native_predictions") / method / (case["case_id"] + ".png")
+                            Image.fromarray(native_prediction.astype(np.uint8) * 255).save(out / native)
+                            native_prediction_paths[method, case["case_id"]] = native.as_posix()
+                        if record["config"]["scorers"][method].get("output_kind") == "native_mask":
+                            if native_prediction is None or not np.array_equal(scores[support], native_prediction[support].astype(np.float32)):
+                                raise ValueError("Native-mask method must preserve the author's binary prediction")
                         counts = _counts(scores, labels, THRESHOLDS)
                         count_curves[method, case["case_id"]] = counts, int((labels == 255).sum())
                         if case["split"] == "val":
                             calibration[method].append((case, counts))
                         progress.job_finished(method, case_label)
+                    pool.release()
+                serialized = json.dumps(record["config"], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+                record["config_sha256"] = hashlib.sha256(serialized).hexdigest()
+                write_json(out / "run.json", record)
                 progress.close_base()
                 completed_cases.extend(crop_cases)
                 if base["split"] == "val":
                     for method in methods:
+                        if method in reused_methods:
+                            thresholds[method] = reuse.thresholds[method]
+                            continue
+                        if record["config"]["scorers"][method].get("output_kind") == "native_mask":
+                            thresholds[method] = {"threshold": .5, "grid_index": 50, "selection_split": None,
+                                "prediction_rule": "author native binary mask", "criterion": "author inference; no threshold calibration"}
+                            continue
                         try:
                             thresholds[method] = _calibrate(calibration[method])
                         except ValueError:
@@ -398,7 +490,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                     if base["base_id"] == last_validation:
                         thresholds_frozen = True
                         write_json(out / "threshold_selection.json", {
-                            "scope": "validation only; test labels never enter calibration",
+                            "scope": "continuous maps: validation only; author native masks keep their decisions; test labels never enter calibration",
                             "exclude_self_paste": True, "methods": thresholds})
                 crop_rows = _progress_rows(crop_cases, methods, thresholds, count_curves, scoring_times)
                 live_rows = _progress_rows(completed_cases, methods, thresholds, count_curves, scoring_times)
@@ -420,7 +512,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                     "aggregation": "case means within building, then equal building means",
                     "primary": {method: _aggregates([row for row in live_rows if row["method"] == method and not row["sham_self_paste"]])
                                 for method in methods}, "cases": live_rows})
-        rows, galleries = [], {method: [] for method in methods}
+        rows, native_rows, galleries = [], [], {method: [] for method in methods}
         bases_by_id = {base["base_id"]: base for base in bases}
         gallery_ids = _gallery_selection(cases)
         for method in methods:
@@ -430,7 +522,14 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                 scores = np.load(out / score_paths[method, case["case_id"]], allow_pickle=False)
                 prediction = scores > np.float32(threshold)  # Known occlusion is deliberately not applied to predictions.
                 prediction_path = (Path("predictions") / method / (case["case_id"] + ".png")).as_posix()
-                Image.fromarray(prediction.astype(np.uint8) * 255).save(out / prediction_path)
+                if method in reused_methods:
+                    previous = reuse.rows[method, case["case_id"]]
+                    saved_prediction = reuse._checked(previous["prediction_path"], previous["prediction_sha256"])
+                    if not np.array_equal(_mask(saved_prediction, support.shape), prediction):
+                        raise ValueError("Reused author or frozen-threshold decision differs from the original prediction")
+                    shutil.copyfile(saved_prediction, out / prediction_path)
+                else:
+                    Image.fromarray(prediction.astype(np.uint8) * 255).save(out / prediction_path)
                 row = {**{key: case.get(key) for key in ("case_id", "base_id", "building_id", "view_id", "split", "state", "scenario_id",
                                                          "nuisance_kind", "hypothesis", "sham_self_paste", "full_edit_pixel_count",
                                                          "visible_edit_pixel_count", "comparable_fraction", "retained_visible_edit_fraction",
@@ -440,9 +539,24 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                        "score_path": score_paths[method, case["case_id"]], "prediction_path": prediction_path,
                        "native_bpb_path": native_paths.get((method, case["case_id"])),
                        "native_bpb_supported_mean": native_means.get((method, case["case_id"])),
+                       "raw_score_path": raw_paths.get((method, case["case_id"])),
+                       "raw_score_units": ("bits per byte" if method.startswith(("zstd_", "lzma_", "msdzip_"))
+                                           else record["config"]["scorers"][method].get("raw_units")),
+                       "native_prediction_path": native_prediction_paths.get((method, case["case_id"])),
+                       "reused_from": str(reuse.path) if method in reused_methods else None,
                        "scoring_seconds": scoring_times[method, case["case_id"]],
                        "score_sha256": sha256(out / score_paths[method, case["case_id"]]),
                        "prediction_sha256": sha256(out / prediction_path)}
+                if method in reused_methods:
+                    previous = reuse.rows[method, case["case_id"]]
+                    if any(row[key] != previous[key] for key in ("tp", "fp", "fn", "tn", "ignored_pixel_count", "score_sha256", "prediction_sha256")):
+                        raise ValueError(f"Reused result changes original evaluation: {method}/{case['case_id']}")
+                if row["native_prediction_path"]:
+                    native = _mask(out / row["native_prediction_path"], support.shape)
+                    native_metrics = _case_metrics(case, native.astype(np.float32), labels, np.float32(.5))
+                    row["native_metrics"] = native_metrics
+                    row["native_prediction_sha256"] = sha256(out / row["native_prediction_path"])
+                    native_rows.append({**row, **native_metrics, "threshold": None})
                 rows.append(row)
                 if case["case_id"] in gallery_ids:
                     heatmap_path = (Path("heatmaps") / method / (case["case_id"] + ".png")).as_posix()
@@ -462,17 +576,22 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
         for method, digest in checkpoint_hashes.items():
             if sha256(checkpoints[method]) != digest:
                 raise ValueError(f"MSDZip checkpoint changed during benchmark: {method}")
-        primary, sham = {}, {}
+        primary, sham, native_primary = {}, {}, {}
         for method in methods:
             primary[method] = _aggregates([row for row in rows if row["method"] == method and not row["sham_self_paste"]])
             sham[method] = _aggregates([row for row in rows if row["method"] == method and row["sham_self_paste"]])
+            author_rows = [row for row in native_rows if row["method"] == method and not row["sham_self_paste"]]
+            if author_rows:
+                native_primary[method] = _aggregates(author_rows)
         write_json(out / "metrics.json", {"scope": SCOPE, "aggregation": "case means within building, then equal building means; no pooled-pixel metric",
-                                         "primary": primary, "sham_controls": sham, "cases": rows})
+                                         "primary": primary, "native_primary": native_primary,
+                                         "sham_controls": sham, "cases": rows})
         fields = ["method", "case_id", "base_id", "building_id", "view_id", "split", "hypothesis", "state", "scenario_id",
                   "nuisance_kind", "sham_self_paste", "threshold", "tp", "fp", "fn", "tn", "evaluated_pixel_count", "ignored_pixel_count",
                   "f1", "iou", "precision", "recall", "h0_pixel_fpr", "full_edit_pixel_count", "visible_edit_pixel_count",
                   "retained_visible_edit_fraction", "comparable_fraction", "exclude_from_visible_recall", "score_path", "prediction_path",
-                  "native_bpb_path", "native_bpb_supported_mean", "scoring_seconds"]
+                  "native_bpb_path", "native_bpb_supported_mean", "raw_score_path", "raw_score_units",
+                  "native_prediction_path", "reused_from", "scoring_seconds"]
         with (out / "metrics.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
@@ -485,12 +604,19 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                    "thresholds": {method: thresholds[method]["threshold"] for method in methods},
                    "scoring": {method: {"seconds": sum(value for (name, _), value in scoring_times.items() if name == method),
                                         "supported_rgb_bytes": sum(value for (name, _), value in scored_bytes.items() if name == method),
-                                        "scope": "scorer calls only; model loading, dataset reads and output writes excluded"}
+                                        "reused": method in reused_methods,
+                                        "scope": "original scorer duration (reused)" if method in reused_methods else
+                                                 "scorer calls only; worker transport included; model loading, dataset reads and output writes excluded"}
                                for method in methods},
                    "primary": {method: {part: {key: value for key, value in aggregate.items() if key != "buildings"}
                                         for part, aggregate in primary[method]["by_split"].items()} for method in methods},
                    "sham_controls": {method: {part: {key: value for key, value in aggregate.items() if key != "buildings"}
                                               for part, aggregate in sham[method]["by_split"].items()} for method in methods},
+                   "native_primary": {method: {part: {key: value for key, value in aggregate.items() if key != "buildings"}
+                                                for part, aggregate in aggregates["by_split"].items()}
+                                      for method, aggregates in native_primary.items()},
+                   "reused_methods": sorted(reused_methods),
+                   "new_inference_case_method_count": len(cases) * (len(methods) - len(reused_methods)),
                    "source_dataset_counts": {"base_count": parent_summary["selected_crop_count"],
                                              "case_count": parent_summary["case_count"],
                                              "building_count": parent_summary["selected_building_count"]},
@@ -507,7 +633,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
             test_lines.append(f"TEST {method}: {metric_text}; buildings={aggregate['building_count']}; metric building counts={aggregate['metric_building_counts']}.\n")
         (out / "summary.txt").write_text(
             f"{SCOPE}.\nBases: {len(bases)}; cases: {len(cases)}; buildings by split: {summary['buildings_by_split']}.\n"
-            f"Validation-only frozen thresholds: {summary['thresholds']}.\n"
+            f"Frozen decisions (validation thresholds or author binary masks): {summary['thresholds']}.\n"
             + ''.join(test_lines) +
             "Scores use RGB and base reference support only. Labels/visibility are evaluation-only; 255 is ignored.\n"
             "Primary excludes self_paste; matched sham controls are reported separately.\n"
@@ -518,8 +644,17 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
         finish_record(out, record, summary["status"])
         return summary
     except (Exception, KeyboardInterrupt) as exc:
+        pool.close()
+        serialized = json.dumps(record["config"], sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+        record["config_sha256"] = hashlib.sha256(serialized).hexdigest()
         finish_record(out, record, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", str(exc))
         raise
+    finally:
+        pool.close()
+        for scorer in scorers.values():
+            close = getattr(scorer, "close", None)
+            if close:
+                close()
 
 
 def _gallery_selection(cases):
@@ -548,7 +683,7 @@ def _gallery(out, root, methods):
     rows = ['<!doctype html><meta charset="utf-8"><title>Exploratory synthetic change scores</title>',
             '<style>body{font:16px system-ui;margin:24px}td{padding:8px;vertical-align:top}img{max-width:150px}</style>',
             '<h1>Exploratory synthetic change scores</h1><p>' + html.escape(SCOPE) + '</p>',
-            '<p>Reference / synthetic source / planted edit / score (blue 0 → red 1) / frozen-threshold prediction. '
+            '<p>Reference / synthetic source / planted edit / score (blue 0 → red 1) / validation-calibrated or author-native prediction. '
             'Prediction keeps known occlusions; evaluation alone ignores label 255. At most 36 cases per method.</p>']
     for method, cases in methods.items():
         rows.append('<h2>' + method + '</h2><table>')

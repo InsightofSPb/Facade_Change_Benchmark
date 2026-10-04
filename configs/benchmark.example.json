@@ -1,0 +1,17 @@
+{
+  "dataset_run": "../runs/2026-10-04-h0h1",
+  "out": "../runs/2026-10-04-all-methods-001",
+  "methods": [
+    "lpips",
+    "dinov2",
+    "rscd_cmu",
+    "rscd_diff_cmu",
+    "rscd_pscd",
+    "anychange",
+    "geoscd"
+  ],
+  "selection_path": "../runs/2026-10-04-compression-quick-001/selection.json",
+  "reuse_run": "../runs/2026-10-04-compression-quick-001",
+  "methods_config": "methods.local.json",
+  "device": "cuda:0"
+}

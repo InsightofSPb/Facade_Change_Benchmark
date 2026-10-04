@@ -96,10 +96,14 @@ def parser():
     hypotheses.add_argument("--config", required=True, dest="config_path")
     hypotheses.add_argument("--out", required=True)
     trial = sub.add_parser("h0h1-benchmark", help="Change scorers on frozen procedural H0/H1 cases")
-    trial.add_argument("--dataset-run", required=True)
-    trial.add_argument("--out", required=True)
-    trial.add_argument("--methods", nargs="+", choices=["rgb_diff", "ssim", "zstd_abs", "zstd_mod256", "lzma_abs",
-                       "lzma_mod256", "msdzip_abs", "msdzip_mod256"], default=["rgb_diff", "ssim"])
+    from .methods.registry import ALL_METHODS
+    trial.add_argument("--config", dest="benchmark_config", help="Common benchmark JSON; explicit flags override it")
+    trial.add_argument("--methods-config", help="Local source/weight/worker-Python options by method")
+    trial.add_argument("--selection", dest="selection_path", help="Replay exact saved crop/case IDs and input hashes")
+    trial.add_argument("--reuse-run", help="Complete previous result directory; retain its methods, maps and thresholds")
+    trial.add_argument("--dataset-run")
+    trial.add_argument("--out")
+    trial.add_argument("--methods", nargs="+", choices=ALL_METHODS, default=["rgb_diff", "ssim"])
     trial.add_argument("--max-bases-per-split", type=int, default=1,
                        help="Frozen SHA-ranked base crops per partition; 0 uses the full existing dataset")
     trial.add_argument("--quick-bases", type=int, default=0,
@@ -115,6 +119,11 @@ def parser():
     trial.add_argument("--device", default="cpu")
     trial.add_argument("--trust-checkpoint", action="store_true",
                        help="Explicit trust for legacy Torch without weights_only support")
+    # Omitted CLI flags must not silently override JSON configuration. Defaults
+    # remain in the runner signature, keeping existing direct calls unchanged.
+    for action in trial._actions:
+        if action.dest != "help":
+            action.default = argparse.SUPPRESS
     train = sub.add_parser("msdzip-train", help="Train original MSDZip on reviewed train H0 residuals only")
     train.add_argument("--dataset-run", required=True)
     train.add_argument("--out", required=True)
@@ -208,6 +217,8 @@ def main(argv=None):
             result = prepare_hypothesis_dataset(**args)
         elif command == "h0h1-benchmark":
             from .hypothesis_benchmark import run_hypothesis_benchmark
+            from .benchmark_config import benchmark_arguments
+            args = benchmark_arguments(args)
             result = run_hypothesis_benchmark(**args)
         elif command == "msdzip-train":
             from importlib import import_module
@@ -227,7 +238,13 @@ def main(argv=None):
         elif command == "align":
             from .pipeline import run_pair
             result = run_pair(**args)
-        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        if command == "h0h1-benchmark":
+            from pathlib import Path
+            output = Path(args["out"]).expanduser().resolve()
+            print((output / "summary.txt").read_text(encoding="utf-8"))
+            print(f"Полный отчёт: {output / 'summary.json'}\nГалерея: {output / 'gallery.html'}")
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
         if command == "manifest" and any(k != "ready" for k in result["image_status"]):
             return 2  # Completed inventory with unresolved images; inspect the saved manifest.
         if command == "align" and not result["quality_gate"]["passed"]:
