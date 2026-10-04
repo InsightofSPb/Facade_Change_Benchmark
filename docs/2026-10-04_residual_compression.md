@@ -104,17 +104,25 @@ python -B -m facade_change msdzip-train \
 NLL, время и байты/с. На CPU оригинальный predictor дорог; скорость CUDA
 нужно измерить этим прогоном перед масштабированием.
 
-Полное обучение, когда smoke подтвердил работу и приемлемую скорость:
+Согласованный запуск на всех кропах после измерения CUDA-скорости:
+3 эпохи, до 500 000 train и 50 000 validation целевых байтов на эпоху.
+`model_batch_size=32` сохраняется: в исходной модели этот параметр задаёт
+число постоянных параметрических lanes. Увеличиваем только `window_groups`
+с 16 до 128: до 4096 целей за optimizer update вместо 512.
+Это не гарантирует восьмикратное ускорение; скорость и пик памяти измеряются
+на локальной GPU. При нехватке памяти можно использовать 64 группы с новым `out`.
+Увеличение batch сокращает число обновлений оптимизатора, поэтому качество
+обучения оценивается по train/validation NLL. Выборка целей остаётся фиксированной.
 
 ```bash
 python -B -m facade_change msdzip-train \
   --dataset-run runs/2026-10-04-h0h1 \
   --representations abs mod256 \
-  --device cuda:0 --epochs 5 \
-  --max-train-bytes 2000000 --max-val-bytes 200000 \
-  --model-batch-size 32 --window-groups 16 \
+  --device cuda:0 --epochs 3 \
+  --max-train-bytes 500000 --max-val-bytes 50000 \
+  --model-batch-size 32 --window-groups 128 \
   --max-bases-per-split 0 \
-  --out runs/2026-10-04-msdzip-h0-001
+  --out runs/2026-10-04-msdzip-h0-002
 ```
 
 Выходы обучения: `2026-10-04_msdzip_h0_abs.pt`,
@@ -129,15 +137,16 @@ reviewed split, `2026-10-04_msdzip_h0_summary.json` и `run.json`.
 python -B -m facade_change h0h1-benchmark \
   --dataset-run runs/2026-10-04-h0h1 \
   --methods rgb_diff ssim zstd_abs zstd_mod256 lzma_abs lzma_mod256 msdzip_abs msdzip_mod256 \
-  --msdzip-abs-checkpoint runs/2026-10-04-msdzip-h0-001/2026-10-04_msdzip_h0_abs.pt \
-  --msdzip-mod256-checkpoint runs/2026-10-04-msdzip-h0-001/2026-10-04_msdzip_h0_mod256.pt \
+  --msdzip-abs-checkpoint runs/2026-10-04-msdzip-h0-002/2026-10-04_msdzip_h0_abs.pt \
+  --msdzip-mod256-checkpoint runs/2026-10-04-msdzip-h0-002/2026-10-04_msdzip_h0_mod256.pt \
   --device cuda:0 --max-bases-per-split 0 \
-  --out runs/2026-10-04-compression-comparison-001
+  --out runs/2026-10-04-compression-comparison-002
 ```
 
 Оценка проверяет hash checkpoint, исходник predictor и совпадение fingerprint
 набора/split. Карты и прогнозы используют только RGB и базовую геометрическую
 поддержку. Known occlusions исключает evaluator, а не scorer.
+Число групп при оценке автоматически загружается из checkpoint.
 Общий порог выбирается отдельно для каждого метода только на validation;
 `self_paste` остаётся отдельным sham-контролем. Основные выходы:
 `metrics.json`, `metrics.csv`, `threshold_selection.json`, `summary.txt`,
