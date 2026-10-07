@@ -33,7 +33,7 @@ class ReuseResults:
     when loaded so a mutation after preflight cannot pass silently.
     """
 
-    def __init__(self, reuse_run_path):
+    def __init__(self, reuse_run_path, exclude_methods=()):
         self.path = Path(reuse_run_path).expanduser().resolve()
         self.record = read_json(self.path / "run.json")
         if self.record.get("kind") != "hypothesis_benchmark" or self.record.get("status") != "completed_exploratory":
@@ -47,6 +47,7 @@ class ReuseResults:
         if hashlib.sha256(serialized).hexdigest() != self.record.get("config_sha256"):
             raise ValueError("Reuse run configuration SHA256 disagrees")
         self.summary = read_json(self._checked("summary.json"))
+        self.codec_stats = read_json(self._checked("codec_stats.json")) if "codec_stats.json" in self._hashes else {}
         self.selection = read_json(self._checked("selection.json"))
         metrics = read_json(self._checked("metrics.json"))
         threshold_selection = read_json(self._checked("threshold_selection.json"))
@@ -114,6 +115,7 @@ class ReuseResults:
         for name, key in (("parent_summary.json", "parent_summary"), ("split.json", "split")):
             if (self.path / name).exists():
                 self._checked(name, self.input_sha256[key])
+        self.exclude(exclude_methods)
 
     def _checked(self, relative, expected=None):
         if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
@@ -133,8 +135,17 @@ class ReuseResults:
         return {"run_path": str(self.path), "run_sha256": self._run_sha256,
                 "config_sha256": self.record["config_sha256"],
                 "selection_sha256": self._hashes["selection.json"],
+                "recomputed_methods": list(self.excluded_methods),
                 "source_environment": copy.deepcopy(self.record.get("environment", {})),
                 "scoring_time_scope": "original inference duration; no inference is performed for reused maps"}
+
+    def exclude(self, methods):
+        """Filter only after full source-run validation; preserve its files."""
+        methods = tuple(methods)
+        if len(set(methods)) != len(methods) or set(methods) - set(self.methods):
+            raise ValueError("Recomputed methods must be distinct methods in the reuse run")
+        self.excluded_methods = methods
+        self.methods = tuple(name for name in self.methods if name not in methods)
 
     def metadata(self, method):
         return copy.deepcopy(self._metadata[method])

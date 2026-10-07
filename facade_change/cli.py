@@ -101,6 +101,8 @@ def parser():
     trial.add_argument("--methods-config", help="Local source/weight/worker-Python options by method")
     trial.add_argument("--selection", dest="selection_path", help="Replay exact saved crop/case IDs and input hashes")
     trial.add_argument("--reuse-run", help="Complete previous result directory; retain its methods, maps and thresholds")
+    trial.add_argument("--recompute-methods", nargs="+", choices=ALL_METHODS,
+                       help="Explicitly replace these cached methods; all other cached maps stay frozen")
     trial.add_argument("--dataset-run")
     trial.add_argument("--out")
     trial.add_argument("--methods", nargs="+", choices=ALL_METHODS, default=["rgb_diff", "ssim"])
@@ -124,6 +126,11 @@ def parser():
     for action in trial._actions:
         if action.dest != "help":
             action.default = argparse.SUPPRESS
+    method_check = sub.add_parser("methods-check", help="Small codec roundtrips or RSCD validation/identity controls")
+    method_check.add_argument("--config", required=True, dest="benchmark_config")
+    method_check.add_argument("--out", required=True)
+    method_check.add_argument("--methods", required=True, nargs="+", choices=ALL_METHODS)
+    method_check.add_argument("--max-val-bases", type=int, default=1)
     train = sub.add_parser("msdzip-train", help="Train original MSDZip on reviewed train H0 residuals only")
     train.add_argument("--dataset-run", required=True)
     train.add_argument("--out", required=True)
@@ -220,6 +227,9 @@ def main(argv=None):
             from .benchmark_config import benchmark_arguments
             args = benchmark_arguments(args)
             result = run_hypothesis_benchmark(**args)
+        elif command == "methods-check":
+            from .method_checks import check_methods
+            result = check_methods(**args)
         elif command == "msdzip-train":
             from importlib import import_module
             result = import_module(".2026-10-04_msdzip_h0", __package__).train_msdzip_h0(**args)

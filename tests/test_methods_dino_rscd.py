@@ -149,7 +149,7 @@ class DinoRSCDTests(unittest.TestCase):
         self.assertEqual(record["metric"], .5)
         torch.testing.assert_close(record["model"]["head"], torch.ones(1))
         self.assertEqual(mode, "weights_only_numpy_metadata")
-        self.assertEqual(torch.serialization.get_safe_globals(), before)
+        self.assertCountEqual(torch.serialization.get_safe_globals(), before)
 
     def test_old_torch_never_implicitly_uses_unrestricted_loading(self):
         def old_load(path, **kwargs):

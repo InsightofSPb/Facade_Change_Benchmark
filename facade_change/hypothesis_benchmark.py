@@ -147,7 +147,16 @@ def _counts(scores, labels, thresholds):
     return tp, fp, len(positive) - tp, len(negative) - fp
 
 
-def _calibrate(validation):
+def _threshold_grid(method):
+    # A fixed, label-independent extension for probabilities near zero. Keep
+    # every old threshold; never normalize a probability map by its min/max.
+    if method.startswith("rscd_"):
+        return np.unique(np.concatenate((THRESHOLDS, np.geomspace(
+            np.finfo(np.float32).tiny, .5, 769, dtype=np.float32))))
+    return THRESHOLDS
+
+
+def _calibrate(validation, grid=THRESHOLDS):
     h1, h0 = defaultdict(list), defaultdict(list)
     for case, counts in validation:
         if case["sham_self_paste"]:
@@ -164,13 +173,13 @@ def _calibrate(validation):
     tied = np.flatnonzero(np.isclose(f1, f1.max(), rtol=0, atol=1e-12))
     tied = tied[np.isclose(fpr[tied], fpr[tied].min(), rtol=0, atol=1e-12)]
     chosen = int(tied[-1])
-    return {"threshold": float(THRESHOLDS[chosen]), "grid_index": chosen,
+    return {"threshold": float(grid[chosen]), "grid_index": chosen,
             "selection_split": "val", "prediction_rule": "score > threshold",
             "comparison_dtype": "float32; JSON records the exact float32 grid values",
             "criterion": "max building-macro visible-H1 case F1; then min non-sham H0 pixel FPR; then highest threshold",
             "h1_building_count": len(h1), "h0_building_count": len(h0),
             "curve": [{"threshold": float(value), "h1_building_macro_f1": float(f1[i]),
-                       "h0_building_macro_pixel_fpr": float(fpr[i])} for i, value in enumerate(THRESHOLDS)]}
+                       "h0_building_macro_pixel_fpr": float(fpr[i])} for i, value in enumerate(grid)]}
 
 
 def _metrics_from_counts(case, counts, ignored_pixel_count=0):
@@ -256,7 +265,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                              zstd_level=3, lzma_preset=3, msdzip_abs_checkpoint=None,
                              msdzip_mod256_checkpoint=None, device="cpu", trust_checkpoint=False,
                              quick_bases=0, selection_seed=42, selection_path=None,
-                             reuse_run=None, method_options=None):
+                             reuse_run=None, method_options=None, recompute_methods=()):
     """Score frozen procedural cases; calibrate on validation and evaluate unchanged test."""
     from .scorers import make_scorer
     from .benchmark_progress import (format_case_table, format_crop_table, format_cumulative_test_table, progress_bars)
@@ -272,7 +281,11 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
     method_options = dict(method_options or {})
     if set(method_options) - allowed or any(not isinstance(value, dict) for value in method_options.values()):
         raise ValueError("method_options must map supported method names to option objects")
-    reuse = ReuseResults(reuse_run) if reuse_run else None
+    recompute_methods = tuple(recompute_methods)
+    if (len(set(recompute_methods)) != len(recompute_methods)
+            or set(recompute_methods) - set(methods) or (recompute_methods and not reuse_run)):
+        raise ValueError("recompute_methods requires a reuse run and distinct explicitly requested methods")
+    reuse = ReuseResults(reuse_run, exclude_methods=recompute_methods) if reuse_run else None
     if reuse:
         methods = list(reuse.methods) + [method for method in methods if method not in reuse.methods]
         if any(method not in allowed for method in methods):
@@ -285,6 +298,12 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
         raise ValueError("quick_bases must be zero or at least two (validation and test)")
     if type(selection_seed) is not int:
         raise ValueError("selection_seed must be an integer")
+    grids = {method: _threshold_grid(method) for method in methods}
+    if reuse:
+        for method in reuse.methods:
+            curve = reuse.thresholds[method].get("curve")
+            if curve:
+                grids[method] = np.array([point["threshold"] for point in curve], dtype=np.float32)
     root = Path(dataset_run).expanduser().resolve()
     parent_hash = sha256(root / "run.json")
     parent = read_json(root / "run.json")
@@ -332,6 +351,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                         "compression_options": compression_options, "checkpoints": checkpoints,
                         "checkpoint_sha256": checkpoint_hashes, "device": device, "trust_checkpoint": trust_checkpoint,
                         "method_options": method_options, "reuse": reuse.provenance if reuse else None,
+                        "threshold_grids_by_method": {method: grid.tolist() for method, grid in grids.items()},
                         "scope": SCOPE,
                         "scorer_inputs": "reference RGB, synthetic source RGB, base reference support only; no oracle masks"})
     write_json(out / "run.json", record)
@@ -367,7 +387,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                                            "case_ids": [case["case_id"] for case in cases], "input_sha256": inputs})
         selected_hashes, calibration, score_paths = {}, {method: [] for method in methods}, {}
         native_paths, native_means, raw_paths, native_prediction_paths = {}, {}, {}, {}
-        scoring_times, scored_bytes = {}, {}
+        scoring_times, scored_bytes, codec_stats = {}, {}, {}
         base_cases = defaultdict(list)
         for case in cases:
             base_cases[case["base_id"]].append(case)
@@ -395,7 +415,9 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                         immutable = {key: scorers[method].metadata[key] for key in (
                             "method", "output_kind", "checkpoint", "checkpoints", "weights", "source", "sources",
                             "backbone", "package", "normalization", "settings", "author_settings", "checkpoint_model_args",
-                            "device", "worker_python", "worker_environment") if key in scorers[method].metadata}
+                            "device", "worker_python", "worker_environment", "codec",
+                            "implementation_version", "representation", "tile_size", "stride",
+                            "score_formula") if key in scorers[method].metadata}
                         fingerprint = hashlib.sha256(json.dumps(immutable, sort_keys=True, ensure_ascii=False,
                                                                allow_nan=False).encode()).hexdigest()
                         if method in load_fingerprints and load_fingerprints[method] != fingerprint:
@@ -416,6 +438,9 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                             scores, raw = cached["scores"], cached["raw_scores"]
                             native_prediction = cached.get("native_prediction")
                             seconds = cached["scoring_seconds"]
+                            if case["case_id"] in reuse.codec_stats.get(method, {}):
+                                codec_stats.setdefault(method, {})[case["case_id"]] = reuse.codec_stats[method][case["case_id"]]
+                                write_json(out / "codec_stats.json", codec_stats)
                         else:
                             scorer = scorers[method]
                             scores = scorer(reference, source, support.copy())
@@ -423,6 +448,9 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                             raw = getattr(scorer, "raw_scores", None)
                             native_prediction = getattr(scorer, "native_prediction", None)
                             record["config"]["scorers"][method] = scorer.metadata
+                            if scorer.metadata.get("last_codec_stats"):
+                                codec_stats.setdefault(method, {})[case["case_id"]] = scorer.metadata["last_codec_stats"]
+                                write_json(out / "codec_stats.json", codec_stats)
                         scoring_times[method, case["case_id"]] = seconds
                         scored_bytes[method, case["case_id"]] = int(support.sum()) * 3
                         if (scores.shape != support.shape or scores.dtype != np.float32
@@ -461,7 +489,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                         if record["config"]["scorers"][method].get("output_kind") == "native_mask":
                             if native_prediction is None or not np.array_equal(scores[support], native_prediction[support].astype(np.float32)):
                                 raise ValueError("Native-mask method must preserve the author's binary prediction")
-                        counts = _counts(scores, labels, THRESHOLDS)
+                        counts = _counts(scores, labels, grids[method])
                         count_curves[method, case["case_id"]] = counts, int((labels == 255).sum())
                         if case["split"] == "val":
                             calibration[method].append((case, counts))
@@ -482,7 +510,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                                 "prediction_rule": "author native binary mask", "criterion": "author inference; no threshold calibration"}
                             continue
                         try:
-                            thresholds[method] = _calibrate(calibration[method])
+                            thresholds[method] = _calibrate(calibration[method], grids[method])
                         except ValueError:
                             if base["base_id"] == last_validation:
                                 raise

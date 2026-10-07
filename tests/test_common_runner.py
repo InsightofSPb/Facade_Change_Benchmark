@@ -124,6 +124,27 @@ class CommonRunnerTests(unittest.TestCase):
         self.assertTrue(record["config"]["scorers"]["anychange"]["loaded"])
         self.assertTrue(FakeRemoteScorer.instances[0].closed)
 
+    def test_recompute_replaces_only_requested_cached_method_and_keeps_selection(self):
+        previous, replaced = self.root / "old-rscd", self.root / "new-rscd"
+        FakeRemoteScorer.instances = []
+        with contextlib.redirect_stdout(io.StringIO()), \
+                patch("facade_change.benchmark_progress._load_tqdm", return_value=None), \
+                patch("facade_change.methods.remote.RemoteScorer", FakeRemoteScorer):
+            old = run_hypothesis_benchmark(self.dataset, previous,
+                methods=["rgb_diff", "rscd_cmu"], quick_bases=10)
+            old_record = (previous / "run.json").read_bytes()
+            FakeRemoteScorer.instances = []
+            with patch("facade_change.scorers.make_scorer", side_effect=AssertionError("cached RGB loaded")):
+                new = run_hypothesis_benchmark(self.dataset, replaced,
+                    methods=["rscd_cmu"], recompute_methods=["rscd_cmu"], reuse_run=previous)
+        self.assertEqual(old["primary"]["rgb_diff"], new["primary"]["rgb_diff"])
+        self.assertEqual(old["scoring"]["rgb_diff"]["seconds"], new["scoring"]["rgb_diff"]["seconds"])
+        self.assertEqual((previous / "run.json").read_bytes(), old_record)
+        self.assertEqual(new["new_inference_case_method_count"], new["selected_case_count"])
+        self.assertEqual([item.method for item in FakeRemoteScorer.instances], ["rscd_cmu"])
+        self.assertEqual(read_json(previous / "selection.json")["case_ids"],
+                         read_json(replaced / "selection.json")["case_ids"])
+
     def test_reloaded_model_cannot_change_sources_between_validation_and_test(self):
         out = self.root / "changed-model"
         original = FakeRemoteScorer.activate
