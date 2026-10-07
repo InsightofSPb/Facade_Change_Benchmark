@@ -14,7 +14,7 @@ LEGACY_METHODS = (
 )
 EXTERNAL_METHODS = (
     "lpips", "dinov2", "rscd_cmu", "rscd_diff_cmu", "rscd_pscd", "anychange", "geoscd",
-    "jpegls_abs", "jpegls_mod256", "h264_rgb", "arib_bps_abs", "arib_bps_mod256",
+    "jpegls_abs", "jpegls_mod256", "h264_rgb", "arib_bps_abs", "arib_bps_mod256", "bcm_net_rgb",
 )
 ALL_METHODS = LEGACY_METHODS + EXTERNAL_METHODS
 
@@ -36,6 +36,7 @@ _EXTERNAL_ADAPTERS = {
     "h264_rgb": ("lossless", "ClassicalCodecScorer"),
     "arib_bps_abs": ("arib_bps", "ArIBScorer"),
     "arib_bps_mod256": ("arib_bps", "ArIBScorer"),
+    "bcm_net_rgb": ("bcm_net", "BCMScorer"),
 }
 
 
@@ -68,6 +69,6 @@ def make_method(method, **options):
     name, class_name = _EXTERNAL_ADAPTERS[method]
     module = importlib.import_module(f".{name}", __package__)
     adapter = getattr(module, class_name)
-    if method.startswith(("rscd_", "jpegls_", "arib_bps_")) or method == "h264_rgb":
+    if method.startswith(("rscd_", "jpegls_", "arib_bps_")) or method in {"h264_rgb", "bcm_net_rgb"}:
         return adapter(method=method, **options)
     return adapter(**options)

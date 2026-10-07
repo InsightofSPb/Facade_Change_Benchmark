@@ -132,7 +132,7 @@ def parser():
     method_check.add_argument("--methods", required=True, nargs="+", choices=ALL_METHODS)
     method_check.add_argument("--max-val-bases", type=int, default=1)
     method_check.add_argument("--bitstream-check", action="store_true",
-                              help="Require exact original ArIB stream roundtrips; mismatch fails")
+                              help="Require exact neural codec stream roundtrips; mismatch fails")
     codec_train = sub.add_parser("arib-train", help="Adapt original ArIB-BPS on H0 residual-image tiles")
     codec_train.add_argument("--dataset-run", required=True)
     codec_train.add_argument("--out", required=True)
@@ -147,6 +147,25 @@ def parser():
     codec_train.add_argument("--tile-size", type=int, default=32)
     codec_train.add_argument("--lr", type=float, default=2e-4)
     codec_train.add_argument("--seed", type=int, default=42)
+    bcm_train = sub.add_parser("bcm-train", help="Adapt original BCM-Net with its VTM base on H0 RGB tiles")
+    bcm_train.add_argument("--dataset-run", required=True)
+    bcm_train.add_argument("--out", required=True)
+    bcm_train.add_argument("--source-root", default="third_party/bcm_net")
+    bcm_train.add_argument("--vtm-encoder", required=True)
+    bcm_train.add_argument("--vtm-decoder", required=True)
+    bcm_train.add_argument("--vtm-config", required=True)
+    bcm_train.add_argument("--vtm-scc-config", help="Author class-SCC VTM config; otherwise derive sibling per-class/classSCC.cfg")
+    bcm_train.add_argument("--init-checkpoint", help="Explicit local original medical checkpoint for domain fine-tuning; omit for fresh weights")
+    bcm_train.add_argument("--trust-checkpoint", action="store_true",
+                           help="Explicit trust for a local legacy Torch checkpoint that cannot use weights_only loading")
+    bcm_train.add_argument("--device", default="cpu")
+    bcm_train.add_argument("--epochs", type=int, default=3)
+    bcm_train.add_argument("--max-train-patches", type=int, default=160)
+    bcm_train.add_argument("--max-val-patches", type=int, default=16)
+    bcm_train.add_argument("--batch-size", type=int, default=1)
+    bcm_train.add_argument("--tile-size", type=int, choices=[32], default=32)
+    bcm_train.add_argument("--lr", type=float, default=1e-4)
+    bcm_train.add_argument("--seed", type=int, default=42)
     train = sub.add_parser("msdzip-train", help="Train original MSDZip on reviewed train H0 residuals only")
     train.add_argument("--dataset-run", required=True)
     train.add_argument("--out", required=True)
@@ -252,6 +271,9 @@ def main(argv=None):
         elif command == "arib-train":
             from .codec_training import train_arib_h0
             result = train_arib_h0(**args)
+        elif command == "bcm-train":
+            from .bcm_training import train_bcm_h0
+            result = train_bcm_h0(**args)
         elif command == "geoscd":
             from .geoscd import run_geoscd
             result = run_geoscd(**args)

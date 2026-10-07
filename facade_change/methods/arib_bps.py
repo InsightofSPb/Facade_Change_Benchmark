@@ -52,7 +52,7 @@ def load_author_model(source_root, config_name="imagenet32_config", dropout=0.0)
     }
 
 
-def configure_torch(device, seed):
+def configure_torch(device, seed, name="ArIB-BPS"):
     import torch
     target = torch.device(device)
     if target.type not in {"cpu", "cuda"}:
@@ -61,7 +61,7 @@ def configure_torch(device, seed):
         if not torch.cuda.is_available():
             raise RuntimeError("Requested CUDA is unavailable")
         free, total = torch.cuda.mem_get_info(target)
-        print(f"ArIB-BPS: free {free/2**30:.2f}/{total/2**30:.2f} GiB; other processes unchanged", flush=True)
+        print(f"{name}: free {free/2**30:.2f}/{total/2**30:.2f} GiB; other processes unchanged", flush=True)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cudnn.benchmark = False

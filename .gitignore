@@ -14,6 +14,8 @@ weights/
 models/
 checkpoints/
 third_party/arib_bps/
+third_party/bcm_net/
+third_party/vtm/
 *.pt
 *.pth
 *.ckpt

@@ -1,0 +1,98 @@
+{
+  "repository": "https://github.com/LiuXiangrui/BCM-Net",
+  "commit": "6ba35a99228d03bd0831501d79c62715c06ded2e",
+  "paper": {
+    "title": "Bilateral Context Modeling for Residual Coding in Lossless 3D Medical Image Compression",
+    "venue": "IEEE Transactions on Image Processing",
+    "year": 2024,
+    "doi": "10.1109/TIP.2024.3378910"
+  },
+  "license": "No license file at pinned author commit; source is cloned separately and is not redistributed in this repository.",
+  "sha256": {
+    ".gitignore": "fed27869b64b74bfc7e12c97a531049f457e0b34773d184152407d459a8a0d50",
+    "Dockerfile": "edd3dccbc040b26ce4165bdee0f2982b857078ee9731e3bc8cb7d8ef35911f4c",
+    "Modules/BasicBlock.py": "213674da33cb04e7d68bf6ef1d0e99de7d689b887e4ebd5fce6ce464641dec66",
+    "Modules/EntropyModel.py": "97e23525088678d824b9c594383bbb8dcc35e35b5fcbcc698a9717e2ad46d5e0",
+    "Modules/FeatsExtraction.py": "a86f7dbb373da4fb6ae027abbb0b92b80257748b0e4afd785b559a5b8786aa29",
+    "Modules/I2CG.py": "9ec4662dd6fabe11fbf97e02d64c84ffa7e0872e2bff0abb9c9b8a7a24c9fc70",
+    "Modules/Utils.py": "d6a3befc9ebde8c7ec7df2d973055421623d816df8287d9cb0f252f5fb313de4",
+    "Modules/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "Network.py": "5528db049bb9fe038868f81c4f53ae0ede0a02971c25c38ab136d1f8063bd016",
+    "README.MD": "9bf9ddd606c83328bc83b1a381c14498e2092cd864ce2c538bf245c5e89f37b3",
+    "TestMRNet.py": "f030d3fe1175f79c355997f79e1c5e58862bcbf0291fd0e07c9fa8c98c3e8221",
+    "TestMosMedData.py": "09488013d8c6a2c903492aa7e6b3ca02cce9b9e9a77d0fa6402f704e6dd5fae5",
+    "TestTRABIT.py": "0acf1fc373c55f5d2af02ae037d85bf3a2f6033fad770b943be4f9d4897d4d12",
+    "assets/Oveview.png": "8e0528bca61f0691c258a420a785bbe3c00f87cfb08daf62f3c4b710151944c8"
+  },
+  "git_blob_sha1": {
+    ".gitignore": "3010ea691872a94e2fa23cabe8fbf6c41b5cb40f",
+    "Dockerfile": "d1f46c24779a751728e1f18081f229836084c23e",
+    "Modules/BasicBlock.py": "145ba6207ad48355a28d46e3f1cd180c6b2bf330",
+    "Modules/EntropyModel.py": "b3ec190664e7b3956271b1b061770b9baf1675cf",
+    "Modules/FeatsExtraction.py": "77eb387b1a83254024c741d5721527f2c9f3cd52",
+    "Modules/I2CG.py": "307ed8411efa305447229a25fc64eec949110095",
+    "Modules/Utils.py": "41f6c3cb2196a45c5df85ff978d1bd8f9d3ae627",
+    "Modules/__init__.py": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+    "Network.py": "de602af4c8e16f9e48fe71008f7505e4758c1f5c",
+    "README.MD": "91129bd1442e9265cb211b9a20d2871131055e05",
+    "TestMRNet.py": "52d97285f1791599adee59a3b30e7be6670eb5da",
+    "TestMosMedData.py": "e7694497cb9107f3bbe7fd5962fadf38c7ac5c37",
+    "TestTRABIT.py": "846c4c2ac4e18f84fee0ed283001cf0eda394700",
+    "assets/Oveview.png": "87cb52034785c788621a055dd892a516231ce217"
+  },
+  "verification": "Every author file matches its Git blob at the pinned commit, including CRLF/trailing newline bytes; SHA-256 is computed from the original bytes.",
+  "pretrained_models": {
+    "url": "https://drive.google.com/drive/folders/1Ogi8ZKouMTsHS59nr_xdu1wQIEGhFbuB?usp=sharing",
+    "download": "Explicit user action only; no automatic checkpoint download.",
+    "mrnet_axial": "MRNet/Axial.pth",
+    "sha256": "Record downloaded checkpoint SHA-256 in each run; no checksum was published or verified here."
+  },
+  "author_runtime": {
+    "python": "3.10",
+    "torch": "1.13.1+cu117",
+    "numpy_adapter_pin": "1.26.4",
+    "einops": "0.6.1",
+    "torchac": "0.9.3",
+    "tqdm": "4.65.0",
+    "torch_bugfix_pr": "https://github.com/pytorch/pytorch/pull/99980/commits/222b25601ba54ebbe17a8597d37bad56e7b0b5ec",
+    "runtime_note": "Author asks for a torch source patch. Setup never edits torch; adapter compatibility is separate and must be verified."
+  },
+  "architecture": {
+    "bit_depth": 8,
+    "channels_F": 64,
+    "channels_M": 120,
+    "channels_X": 1,
+    "K": 10,
+    "R": 8
+  },
+  "vtm": {
+    "repository": "https://vcgit.hhi.fraunhofer.de/jvet/VVCSoftware_VTM.git",
+    "mirror": "https://github.com/ffvvc/VVCSoftware_VTM.git",
+    "version": "VTM-15.0",
+    "tag_object": "a5df53d0b9ee69fed8c2e4dc9d04a3cb0b247d28",
+    "commit": "2e935808159fefa3c85a599c3b79615cd9555429",
+    "verification": "Original HHI and ffvvc mirror git ls-remote agree on annotated tag object and peeled commit. Source is cloned from HHI at VTM-15.0; source files below are SHA-256 checked.",
+    "sha256": {
+      "CMakeLists.txt": "c83aaf1134b0c330323c061e0b58e785032622d1bbfee22b7bb11f486847a1e4",
+      "COPYING": "d5003b200f848d18ea9d7f9a6c5e6a839c18163546eb804c84310c0f6fc7c76a",
+      "cfg/encoder_randomaccess_vtm_gop16.cfg": "a101e350a44aba78a60f4bdb7714c33bb0520d6017953a5e9409684c95a256b2",
+      "cfg/per-class/classSCC.cfg": "dad8eb819383981e7628d3477cc135609784b405f90dd81d1b478faab878d904",
+      "source/Lib/CommonLib/TypeDef.h": "46746678767dd5d94f44eba8e76ae41971c482fa59f7691470b3de5acc178134",
+      "source/App/EncoderApp/EncAppCfg.cpp": "e863c259731f18dd69cb63f27dcc7772970362af2e7afe7a0b3e3fa4e34d00c8"
+    },
+    "encoder_configs": [
+      "cfg/encoder_randomaccess_vtm_gop16.cfg",
+      "cfg/per-class/classSCC.cfg"
+    ],
+    "format": {
+      "input_chroma_format": 400,
+      "input_bit_depth": 8,
+      "output_bit_depth": 8
+    },
+    "build": "Unmodified default8/10-bit source; JVET_R0351_HIGH_BIT_DEPTH_ENABLED remains0. Source-preserving CMake compiler flags -include cstdint -Wno-error=deprecated-declarations -Wno-error=address supply the missing standard header and allow legacy std::unary_function and array-address warnings. On GCC12 or newer setup additionally uses -Wno-error=array-compare for the original IntraSearch array comparison. Binary success and runtime validation belong in run provenance."
+  },
+  "adapter_runtime": {
+    "Pillow": "11.3.0",
+    "purpose": "Facade PNG I/O and CLI; not an original author network dependency."
+  }
+}

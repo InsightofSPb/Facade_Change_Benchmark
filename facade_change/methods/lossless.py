@@ -128,7 +128,8 @@ class TileCodecScorer:
                 a[:end_row-row, :end_col-col] = left[region]
                 b[:end_row-row, :end_col-col] = right[region]
                 if self.theoretical:
-                    bpb = self.codec.theoretical_bpb(b)
+                    bpb = (self.codec.theoretical_bpb(a, b) if self.representation == "rgb_pair"
+                           else self.codec.theoretical_bpb(b))
                     if not np.isfinite(bpb) or bpb < 0:
                         raise RuntimeError("Author theoretical tile cost must be finite and nonnegative")
                 else:

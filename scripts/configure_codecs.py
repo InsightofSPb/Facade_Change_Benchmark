@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from facade_change.benchmark_config import benchmark_arguments
 from facade_change.benchmark_results import ReuseResults
 from facade_change.benchmark_subset import validate_input_hashes
+from facade_change.bcm_training import validate_bcm_training_run
 from facade_change.io import read_json, sha256
 
 
@@ -69,7 +70,9 @@ def _training_options(training_run, dataset_run, reuse):
 
 
 def configure(reuse_run=None, out=None, worker_python=None, destination=None, repo_root=ROOT,
-              training_run=None, source_root=None, cost_mode="bitstream", neural_device="cuda:0"):
+              training_run=None, source_root=None, cost_mode="bitstream", neural_device="cuda:0",
+              bcm_training_run=None, bcm_source_root=None, bcm_vtm_encoder=None,
+              bcm_vtm_decoder=None, bcm_vtm_config=None, bcm_vtm_scc_config=None):
     repo = Path(repo_root).resolve()
     original = benchmark_arguments({"benchmark_config": str(repo / "configs/benchmark.local.json")})
     if reuse_run:
@@ -115,6 +118,31 @@ def configure(reuse_run=None, out=None, worker_python=None, destination=None, re
             method_options[name] = {"worker_python": python, "source_root": str(source),
                 "training_run": str(run), "device": neural_device, "tile_size": 32, "stride": 16,
                 "seed": training.get("seed", 42), "worker_timeout": 3600, "cost_mode": cost_mode}
+    if bcm_training_run is not None:
+        if cost_mode not in {"bitstream", "theoretical"}:
+            raise ValueError("BCM cost_mode must be bitstream or theoretical")
+        run, record, _ = validate_bcm_training_run(bcm_training_run, reuse.input_sha256)
+        training = record["config"]
+        validate_input_hashes(training["input_sha256"], _dataset_fingerprint(original["dataset_run"]))
+        protected.append(run)
+        source = Path(bcm_source_root).expanduser().resolve() if bcm_source_root else repo / "third_party/bcm_net"
+        paths = {}
+        for key, explicit in (("vtm_encoder", bcm_vtm_encoder), ("vtm_decoder", bcm_vtm_decoder),
+                              ("vtm_config", bcm_vtm_config), ("vtm_scc_config", bcm_vtm_scc_config)):
+            value = explicit if explicit is not None else training.get(key)
+            if value is None:
+                if key == "vtm_scc_config":
+                    continue
+                raise ValueError(f"BCM requires a recorded or explicit {key}")
+            path = Path(value).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"BCM {key} missing: {path}")
+            paths[key] = str(path)
+        added.append("bcm_net_rgb")
+        method_options["bcm_net_rgb"] = {"worker_python": python, "source_root": str(source),
+            "training_run": str(run), "device": neural_device, "tile_size": 32, "stride": 16,
+            "seed": training.get("seed", 42), "worker_timeout": 3600, "cost_mode": cost_mode,
+            "qp": 37, **paths}
     destination = Path(destination).expanduser().resolve() if destination else repo / "configs/codecs.local.json"
     if destination.exists():
         raise FileExistsError(f"Configuration already exists: {destination}; use --config-out for a new file")
@@ -149,6 +177,12 @@ def main():
     p.add_argument("--worker-python")
     p.add_argument("--training-run", help="Completed ArIB H0 run; add only its fitted residual representations")
     p.add_argument("--source-root", help="Original ArIB sources (default: third_party/arib_bps)")
+    p.add_argument("--bcm-training-run", help="Completed BCM H0 run; add the full VTM plus neural lossless RGB codec")
+    p.add_argument("--bcm-source-root", help="Original BCM-Net sources (default: third_party/bcm_net)")
+    p.add_argument("--bcm-vtm-encoder", help="VTM encoder binary; otherwise use the training run path")
+    p.add_argument("--bcm-vtm-decoder", help="VTM decoder binary; otherwise use the training run path")
+    p.add_argument("--bcm-vtm-config", help="VTM random-access config; otherwise use the training run path")
+    p.add_argument("--bcm-vtm-scc-config", help="VTM class-SCC config; otherwise use training config or derive its sibling")
     p.add_argument("--cost-mode", choices=("bitstream", "theoretical"), default="bitstream")
     p.add_argument("--neural-device", default="cuda:0")
     p.add_argument("--config-out", dest="destination")

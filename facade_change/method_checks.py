@@ -31,12 +31,12 @@ def check_methods(benchmark_config, out, methods, max_val_bases=1, bitstream_che
     if not methods or len(set(methods)) != len(methods):
         raise ValueError("Select distinct methods")
     from .methods.registry import ALL_METHODS
-    allowed = {name for name in ALL_METHODS if name.startswith(("rscd_", "jpegls_", "arib_bps_")) or name == "h264_rgb"}
+    allowed = {name for name in ALL_METHODS if name.startswith(("rscd_", "jpegls_", "arib_bps_")) or name in {"h264_rgb", "bcm_net_rgb"}}
     if set(methods) - allowed:
         raise ValueError("methods-check accepts RSCD and lossless image/video codec adapters")
     controls, fingerprints = [], None
     rng = np.random.default_rng(42)
-    for name in ("unchanged", "paint_patch", "wraparound"):
+    for name in ("unchanged", "paint_patch", "wraparound", "wraparound_reverse"):
         a = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
         b = a.copy()
         if name == "paint_patch":
@@ -44,6 +44,9 @@ def check_methods(benchmark_config, out, methods, max_val_bases=1, bitstream_che
         if name == "wraparound":
             a.fill(255)
             b.fill(0)
+        if name == "wraparound_reverse":
+            a.fill(0)
+            b.fill(255)
         controls.append((name, a, b, np.ones((32, 32), dtype=bool)))
     validation = []
     if any(method.startswith("rscd_") for method in methods):
@@ -66,7 +69,7 @@ def check_methods(benchmark_config, out, methods, max_val_bases=1, bitstream_che
                 validation.append((case["case_id"], a, b, support))
             a, _, support = h0._rgb_inputs(root, parent, base, selected_cases[0], checked)
             validation.append((base["base_id"]+"-identity-AA", a, a.copy(), support))
-    if any(method.startswith("arib_bps_") for method in methods) and fingerprints is None:
+    if any(method.startswith("arib_bps_") or method == "bcm_net_rgb" for method in methods) and fingerprints is None:
         h0 = importlib.import_module(".2026-10-04_msdzip_h0", __package__)
         _, _, _, _, fingerprints = h0._parent(args["dataset_run"])
     out = new_directory(out)
@@ -86,7 +89,7 @@ def check_methods(benchmark_config, out, methods, max_val_bases=1, bitstream_che
                                   **options.get(method, {})}
                 if not method.startswith("rscd_"):
                     scorer_options["tile_size"], scorer_options["stride"] = 32, 32
-                if method.startswith("arib_bps_"):
+                if method.startswith("arib_bps_") or method == "bcm_net_rgb":
                     scorer_options["dataset_fingerprint"] = fingerprints
                     if bitstream_check:
                         scorer_options["cost_mode"] = "bitstream"

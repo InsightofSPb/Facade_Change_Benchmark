@@ -370,7 +370,7 @@ def run_hypothesis_benchmark(dataset_run, out, methods=None, max_bases_per_split
                 if method != "geoscd":
                     defaults["trust_checkpoint"] = trust_checkpoint
                 options = {**defaults, **method_options.get(method, {})}
-                if method.startswith("arib_bps_"):
+                if method.startswith("arib_bps_") or method == "bcm_net_rgb":
                     options["dataset_fingerprint"] = inputs
                 scorers[method] = RemoteScorer(method, options, pool)
             else:
