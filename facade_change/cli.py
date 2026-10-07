@@ -131,6 +131,22 @@ def parser():
     method_check.add_argument("--out", required=True)
     method_check.add_argument("--methods", required=True, nargs="+", choices=ALL_METHODS)
     method_check.add_argument("--max-val-bases", type=int, default=1)
+    method_check.add_argument("--bitstream-check", action="store_true",
+                              help="Require exact original ArIB stream roundtrips; mismatch fails")
+    codec_train = sub.add_parser("arib-train", help="Adapt original ArIB-BPS on H0 residual-image tiles")
+    codec_train.add_argument("--dataset-run", required=True)
+    codec_train.add_argument("--out", required=True)
+    codec_train.add_argument("--source-root", default="third_party/arib_bps")
+    codec_train.add_argument("--representations", nargs="+", choices=["abs", "mod256"], default=["abs", "mod256"])
+    codec_train.add_argument("--author-config", choices=["imagenet32_config", "imagenet64_config", "imagenet64_small_config", "cifar_config"], default="imagenet32_config")
+    codec_train.add_argument("--device", default="cpu")
+    codec_train.add_argument("--epochs", type=int, default=3)
+    codec_train.add_argument("--max-train-patches", type=int, default=160)
+    codec_train.add_argument("--max-val-patches", type=int, default=16)
+    codec_train.add_argument("--batch-size", type=int, default=1)
+    codec_train.add_argument("--tile-size", type=int, default=32)
+    codec_train.add_argument("--lr", type=float, default=2e-4)
+    codec_train.add_argument("--seed", type=int, default=42)
     train = sub.add_parser("msdzip-train", help="Train original MSDZip on reviewed train H0 residuals only")
     train.add_argument("--dataset-run", required=True)
     train.add_argument("--out", required=True)
@@ -233,6 +249,9 @@ def main(argv=None):
         elif command == "msdzip-train":
             from importlib import import_module
             result = import_module(".2026-10-04_msdzip_h0", __package__).train_msdzip_h0(**args)
+        elif command == "arib-train":
+            from .codec_training import train_arib_h0
+            result = train_arib_h0(**args)
         elif command == "geoscd":
             from .geoscd import run_geoscd
             result = run_geoscd(**args)

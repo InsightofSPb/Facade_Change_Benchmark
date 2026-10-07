@@ -90,6 +90,7 @@ class TileCodecScorer:
             raise ValueError("Unknown codec input representation")
         self.codec, self.representation = codec, representation
         self.raw_scores, self.native_prediction = None, None
+        self.theoretical = codec.metadata.get("cost_mode") == "theoretical"
         self.metadata = {
             "method": method, "output_kind": "score", "implementation_version": 1,
             "codec": codec.metadata, "representation": representation,
@@ -97,9 +98,11 @@ class TileCodecScorer:
             "tile_grid": "top-left origins range(0,H,stride), range(0,W,stride)",
             "boundary": "zero-padded complete tiles; full tile RGB-byte denominator",
             "support": "base geometric support only; unsupported input pixels zeroed",
-            "raw_units": "actual encoded bits per RGB byte; headers included",
+            "raw_units": ("author theoretical variational bits per RGB byte; not a bitstream rate" if self.theoretical
+                          else "actual encoded bits per RGB byte; headers included"),
             "score_formula": "1-exp(-bits_per_byte/8); average covering tiles; no map normalization",
-            "cost_scope": ("complete residual image stream" if representation != "rgb_pair" else
+            "cost_scope": ("original author inference().sum(); headers, initialization and weights excluded" if self.theoretical else
+                           "complete residual image stream" if representation != "rgb_pair" else
                            "P-frame packet including its headers, conditioned on separately decoded I frame; I cost recorded separately"),
         }
 
@@ -124,21 +127,29 @@ class TileCodecScorer:
                 b = np.zeros_like(a)
                 a[:end_row-row, :end_col-col] = left[region]
                 b[:end_row-row, :end_col-col] = right[region]
-                length, stats = self.codec.encode(a, b)
-                bpb = 8 * length / b.size
-                charged_bytes += length
-                stream_bytes += stats["stream_bytes"]
-                i_bytes += stats.get("reference_i_bytes", 0)
+                if self.theoretical:
+                    bpb = self.codec.theoretical_bpb(b)
+                    if not np.isfinite(bpb) or bpb < 0:
+                        raise RuntimeError("Author theoretical tile cost must be finite and nonnegative")
+                else:
+                    length, stats = self.codec.encode(a, b)
+                    bpb = 8 * length / b.size
+                    charged_bytes += length
+                    stream_bytes += stats["stream_bytes"]
+                    i_bytes += stats.get("reference_i_bytes", 0)
                 totals[region] += bpb
                 counts[region] += 1
                 tiles += 1
         values = np.divide(totals, counts, out=np.zeros_like(totals), where=counts != 0)
         self.raw_scores = values.astype(np.float32)
         self.raw_scores[~support] = np.nan
-        self.metadata["last_codec_stats"] = {"tiles": tiles, "cost_mode": "bitstream", "charged_bytes": charged_bytes,
+        self.metadata["last_codec_stats"] = ({"tiles": tiles, "cost_mode": "theoretical",
+             "supported_mean_theoretical_bpb": float(values[support].mean()),
+             "bitstream_measured": False, "all_tiles_roundtrip_verified": False} if self.theoretical else
+             {"tiles": tiles, "cost_mode": "bitstream", "charged_bytes": charged_bytes,
               "all_stream_bytes": stream_bytes, "reference_i_bytes": i_bytes,
               "all_tiles_roundtrip_verified": True,
-              "note": "overlapping independent tile streams; totals are not a whole-image compression rate"}
+              "note": "overlapping independent tile streams; totals are not a whole-image compression rate"})
         result = (-np.expm1(-values / 8)).astype(np.float32)
         result[~support] = np.nan
         return result

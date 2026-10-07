@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/ZZ022/ArIB-BPS",
+  "commit": "bdc3c61d7cf3377dc72d411a32713f5f353d61e8",
+  "sha256": {
+    "src/compress.py": "742a9cf55479ce572ca3f991b4173205b8d263356ad728b628c8a5726e728c2c",
+    "src/config/cifar_config.py": "012b0f749580bfe57ea323bc85a586f00c86142cf3878bba3e41ee33d48277c4",
+    "src/config/config.py": "fdb4f59af5fde3134cd58cb108056689599d2b3e59eaaa0db49635f2e8a8f47a",
+    "src/config/imagenet32_config.py": "9bff4a8f26133f26c38062c0460a24f11a4c782d6f1afb1d343b0979c580ae9a",
+    "src/config/imagenet64_config.py": "9feb8dc3a7d8805b429857c19c77cd65b865c4f3bd51a40165b3ad87a6563c15",
+    "src/config/imagenet64_small_config.py": "b108e10c7f0ecbbef943532ec021e410c1ae9427ac2314abca3ba2439728f505",
+    "src/generate_finetune_dataset.py": "d8bb7ee30947da412423d518d78df4dc692ab4f8462e49fb61643a315de23c89",
+    "src/modules/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/modules/arib_bps.py": "49daf87a272c77dc89ce1b24a5bbb9ef131ed1b10161add48716b80784f53526",
+    "src/modules/eca_module.py": "4112ef4b61171f776177113d4bde32c1a0d7c7a5d82c08cc89d826ff38ef6d2f",
+    "src/modules/guided_diffusion/__init__.py": "ec30483aa641d5c1b9cc8910554324949f2288eadd085310d4c312cdda294c73",
+    "src/modules/guided_diffusion/fp16_util.py": "4e3057f62b6bb93c47d553b0ecf4bc3de8aca85399964491d63226dbfd3ca28e",
+    "src/modules/guided_diffusion/logger.py": "ca25f8fea91feb04cd3f3fc725964eace96e4eafd698b35b395c54dd0a990320",
+    "src/modules/guided_diffusion/nn.py": "964744192dee79f8283cda2658db04a950314e2258a84068b12f43ddea63de94",
+    "src/modules/guided_diffusion/unet.py": "a1a18e79b84f7ee25815d41f686f7fea4f2196e3404b4d7a03195352bd494022",
+    "src/modules/lvae.py": "9f7ac7222db048086a6534cbf58148cef99d4755947817446e9095814ac24b1a",
+    "src/modules/wnres.py": "14f34802de59e536d39892cf949ee172a0602ada59e60f4a148b7cdbf00d63f1",
+    "src/test.py": "3c01bd4c6e420967506353fcab5f5da1e3b6f1e84018510d66ab893ff4717eea",
+    "src/train.py": "dda445ffbe89b026247c5e591adf4cc00567a2433db6d5cc9c73c48759faaa76",
+    "src/utils/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "src/utils/coder/mix_coder.h": "a5a8488fff06c41b2072490a9cdab44258d6dc39436029c0b49316ae36d8cb5e",
+    "src/utils/coder/python_interface.cpp": "77548095344397a43237ba4f02bc4f3ac29d94c7e724759cd82f908f3bf83e28",
+    "src/utils/datasets.py": "5f885c96ef1f735e5520316b3c0fbb3c2c7253955c7c6e2539c8b48193a1eea8",
+    "src/utils/helpers.py": "b71b3ae05d477e9178b389668a342eaf2d2e3280084605d6e82b03c26d2baac3",
+    "src/utils/rand.py": "7e768e523741e648c4d04d79095ae235a5889eaf18cbaad058bfc5d79533a651",
+    "src/utils/transforms.py": "7a1e5669f9508dd813d56d0f109b4eb3051c34c728e027805e60d3467eedf585"
+  },
+  "verification": "All 26 source Git blob SHA-1 values independently matched the recursive tree at the pinned GitHub commit; manifest hashes are SHA-256 of those exact bytes."
+}

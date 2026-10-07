@@ -24,14 +24,14 @@ def score_diagnostics(scores, support, prediction=None):
             "native_changed_fraction": float(prediction[support].mean()) if prediction is not None else None}
 
 
-def check_methods(benchmark_config, out, methods, max_val_bases=1):
+def check_methods(benchmark_config, out, methods, max_val_bases=1, bitstream_check=False):
     args = benchmark_arguments({"benchmark_config": benchmark_config})
     options = args.get("method_options", {})
     methods = tuple(methods)
     if not methods or len(set(methods)) != len(methods):
         raise ValueError("Select distinct methods")
     from .methods.registry import ALL_METHODS
-    allowed = {name for name in ALL_METHODS if name.startswith(("rscd_", "jpegls_")) or name == "h264_rgb"}
+    allowed = {name for name in ALL_METHODS if name.startswith(("rscd_", "jpegls_", "arib_bps_")) or name == "h264_rgb"}
     if set(methods) - allowed:
         raise ValueError("methods-check accepts RSCD and lossless image/video codec adapters")
     controls, fingerprints = [], None
@@ -66,11 +66,15 @@ def check_methods(benchmark_config, out, methods, max_val_bases=1):
                 validation.append((case["case_id"], a, b, support))
             a, _, support = h0._rgb_inputs(root, parent, base, selected_cases[0], checked)
             validation.append((base["base_id"]+"-identity-AA", a, a.copy(), support))
+    if any(method.startswith("arib_bps_") for method in methods) and fingerprints is None:
+        h0 = importlib.import_module(".2026-10-04_msdzip_h0", __package__)
+        _, _, _, _, fingerprints = h0._parent(args["dataset_run"])
     out = new_directory(out)
     record = run_record("method_checks", {"benchmark_config": str(Path(benchmark_config).resolve()),
         "benchmark_config_sha256": sha256(benchmark_config),
         "method_options": {method: options.get(method, {}) for method in methods},
         "methods": list(methods), "max_val_bases": max_val_bases, "input_sha256": fingerprints,
+        "bitstream_check": bool(bitstream_check),
         "scope": "small codec roundtrips and validation-only RSCD/identity controls; no training, tuning or TEST inference"})
     write_json(out / "run.json", record)
     reports = {}
@@ -82,6 +86,10 @@ def check_methods(benchmark_config, out, methods, max_val_bases=1):
                                   **options.get(method, {})}
                 if not method.startswith("rscd_"):
                     scorer_options["tile_size"], scorer_options["stride"] = 32, 32
+                if method.startswith("arib_bps_"):
+                    scorer_options["dataset_fingerprint"] = fingerprints
+                    if bitstream_check:
+                        scorer_options["cost_mode"] = "bitstream"
                 scorer = RemoteScorer(method, scorer_options, pool)
                 scorer.activate()
                 rows = []

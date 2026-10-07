@@ -41,7 +41,8 @@ def benchmark_arguments(arguments):
             local_methods[method] = {
                 key: _path(value, methods_file.parent) if key in {
                     "worker_python", "source_root", "checkpoint_path", "dino_root", "dino_checkpoint",
-                    "py_utils_root", "sam_checkpoint", "backbone_checkpoint", "calibration_checkpoint"
+                    "py_utils_root", "sam_checkpoint", "backbone_checkpoint", "calibration_checkpoint",
+                    "training_run", "model_config"
                 } and value else value for key, value in values.items()}
         options["method_options"] = {**local_methods, **options.get("method_options", {})}
     return options
