@@ -6,6 +6,9 @@ inference crops are not statistical units and must be merged before this module.
 from __future__ import annotations
 
 import csv
+import colorsys
+import hashlib
+import html
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -364,3 +367,144 @@ def write_reports(out: str | Path, metrics: dict) -> dict[str, str]:
     if metrics.get("per_auxiliary_image"):
         write("auxiliary_per_image", metrics["per_auxiliary_image"], ["image_id", *_SUMMARY_METRICS])
     return paths
+
+
+_CLASS_NAMES_RU = {
+    "WATER_STAIN": "Следы воды", "MISSING_ELEMENT": "Утраченный элемент",
+    "DELAMINATION": "Отслоение", "SPALLING": "Выкрашивание",
+    "ORNAMENT_INTACT": "Сохранный декор", "CRACK": "Трещина",
+    "REPAIRS": "Ремонт", "EFFLORESCENCE": "Высолы",
+    "TEXT_OR_IMAGES": "Надписи и изображения", "CORROSION": "Коррозия",
+    "ADVERTISEMENTS": "Реклама",
+}
+
+
+def _gallery_colors(categories):
+    """Use COCO colors, or a stable category identity rather than channel order."""
+    colors = []
+    for category in categories:
+        color = category.get("color")
+        if isinstance(color, str) and len(color) == 7 and color.startswith("#"):
+            try:
+                colors.append(tuple(int(color[i:i + 2], 16) for i in (1, 3, 5)))
+                continue
+            except ValueError:
+                pass
+        identity = f"{category['id']}:{category['name']}".encode("utf-8")
+        hue = int.from_bytes(hashlib.sha256(identity).digest()[:4], "big") / 2**32
+        colors.append(tuple(round(255 * value) for value in colorsys.hsv_to_rgb(hue, .72, .94)))
+    return np.asarray(colors, dtype=np.uint8)
+
+
+def _gallery_panels(rgb, labels, valid, colors):
+    """Render all active channels with stripes; per-class panels remain exact.
+
+    A single RGB pixel cannot encode arbitrary overlapping labels unambiguously.
+    The overview alternates the colors of its active classes spatially, never
+    selects the highest-scoring class, and is complemented by separate channels.
+    """
+    labels = labels & valid[None]
+    count = labels.sum(axis=0)
+    yy, xx = np.indices(valid.shape)
+    checker = np.where(((xx // 8 + yy // 8) % 2)[..., None], 74, 94)
+    colored = np.zeros((*valid.shape, 3), dtype=np.uint8)
+    ordinal = np.cumsum(labels, axis=0) - 1
+    stripe = ((xx + yy) // 3) % np.maximum(count, 1)
+    for channel, color in enumerate(colors):
+        selected = labels[channel] & (ordinal[channel] == stripe)
+        colored[selected] = color
+    overlay = rgb.copy()
+    selected = count > 0
+    overlay[selected] = np.rint(.45 * rgb[selected] + .55 * colored[selected]).astype(np.uint8)
+    overlay[~valid] = np.broadcast_to(checker, rgb.shape)[~valid]
+    colored[~valid] = np.broadcast_to(checker, rgb.shape)[~valid]
+    return overlay, colored
+
+
+def write_gallery(out: str | Path, previews: Iterable[dict], categories: list[dict],
+                  split="val", epoch=None, checkpoint_name=None) -> Path:
+    """Save already computed original crops beside a selected checkpoint.
+
+    Previews contain RGB H,W,3 uint8, boolean target/prediction C,H,W, boolean
+    valid H,W, and image_id/building_id/crop_id. The caller chooses a small fixed
+    sample without consulting prediction quality. No inference runs here.
+    """
+    from PIL import Image
+
+    if split not in {"train", "val"}:
+        raise ValueError("gallery split must be train or val")
+    previews = list(previews)
+    colors = _gallery_colors(categories)
+    for preview in previews:
+        rgb, target, valid, prediction = (np.asarray(preview[key])
+                                          for key in ("rgb", "target", "valid", "prediction"))
+        confusion_counts(prediction, target, valid)
+        if (rgb.shape != (*valid.shape, 3) or rgb.dtype != np.uint8
+                or len(target) != len(categories)):
+            raise ValueError("gallery requires RGB uint8 and one target/prediction channel per category")
+    out = Path(out)
+    folder = out / "previews"
+    folder.mkdir(parents=True, exist_ok=True)
+    escape = lambda value: html.escape(str(value), quote=True)
+    title = f"DINOv2: {split.upper()}"
+    if epoch is not None:
+        title += f" · эпоха {epoch}"
+    sections = ["<!doctype html><html lang='ru'><head><meta charset='utf-8'>",
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+                f"<title>{escape(title)}</title>",
+                "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:1500px;margin:24px auto;padding:0 20px;background:#f2f4f7;color:#17212b}section{background:white;padding:20px;margin:24px 0;border-radius:10px}.panels{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}figure{margin:0}figcaption{font-weight:600;margin-bottom:8px}img{max-width:100%;height:auto}.legend{display:flex;flex-wrap:wrap;gap:10px 20px;padding:16px;background:white;border-radius:10px}.key{display:inline-block;width:16px;height:16px;vertical-align:-3px;margin-right:7px;border:1px solid #555}.class-pair{max-width:1024px}summary{cursor:pointer;padding:8px 0}.muted{color:#53606f}@media(max-width:1000px){.panels{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head><body>",
+                f"<h1>{escape(title)}</h1>"]
+    if checkpoint_name:
+        sections.append(f"<p>Снимок весов: <code>{escape(checkpoint_name)}</code>.</p>")
+    sections.append("<p>Фиксированные первые размеченные кропы выбранных фасадов; "
+                    "это иллюстрации, а не подборка всех ошибок. Решения по каждому классу: sigmoid ≥ 0.5. "
+                    "Серая клетка — пиксели вне размеченной поддержки: они не оценивались и не считаются фоном. "
+                    "Чёрный на карте прогноза — ни один класс не предсказан на допустимом пикселе. "
+                    "Пересекающиеся классы чередуются полосами; точное наложение каждого класса видно "
+                    "в отдельных панелях ниже. RGB показан без маскирования.</p><div class='legend'>")
+    for category, color in zip(categories, colors):
+        css_color = "#" + "".join(f"{value:02x}" for value in color)
+        name = category["name"]
+        label = _CLASS_NAMES_RU.get(name, name)
+        suffix = f" ({name})" if label != name else ""
+        sections.append(f"<span><i class='key' style='background:{css_color}'></i>"
+                        f"{escape(label + suffix)} · ID {escape(category['id'])}</span>")
+    sections.append("</div>")
+    for number, preview in enumerate(previews):
+        rgb, target, valid, prediction = (np.asarray(preview[key])
+                                          for key in ("rgb", "target", "valid", "prediction"))
+        stem = f"{split}-{number:02d}"
+        gt_overlay, _ = _gallery_panels(rgb, target, valid, colors)
+        pred_overlay, pred_mask = _gallery_panels(rgb, prediction, valid, colors)
+        panels = [("Оригинальный RGB", "rgb.jpg", rgb),
+                  ("Разметка на RGB", "target.png", gt_overlay),
+                  ("Прогноз на RGB", "prediction.png", pred_overlay),
+                  ("Предсказанные классы", "classes.png", pred_mask)]
+        building = preview.get("building_id") or "Адрес не подтверждён — TRAIN"
+        sections.append(f"<section><h2>{escape(building)}</h2><p class='muted'>"
+                        f"Фото {escape(preview.get('image_id'))} · кроп {escape(preview.get('crop_id'))}"
+                        "</p><div class='panels'>")
+        for caption, suffix, pixels in panels:
+            filename = f"{stem}-{suffix}"
+            Image.fromarray(pixels).save(folder / filename)
+            sections.append(f"<figure><figcaption>{caption}</figcaption>"
+                            f"<a href='previews/{filename}'><img src='previews/{filename}' "
+                            f"alt='{caption}' loading='lazy'></a></figure>")
+        sections.append("</div><h3>По классам: разметка слева, прогноз справа</h3>")
+        for channel, (category, color) in enumerate(zip(categories, colors)):
+            name = category["name"]
+            label = _CLASS_NAMES_RU.get(name, name)
+            filename = f"{stem}-class-{category['id']}.jpg"
+            pair = [_gallery_panels(rgb, labels[channel:channel + 1], valid, color[None])[0]
+                    for labels in (target, prediction)]
+            Image.fromarray(np.concatenate(pair, axis=1)).save(folder / filename, quality=95)
+            sections.append(f"<details><summary>{escape(label)} · {escape(name)}</summary>"
+                            f"<img class='class-pair' src='previews/{filename}' "
+                            "alt='Разметка слева, прогноз справа' loading='lazy'></details>")
+        sections.append("</section>")
+    if not previews:
+        sections.append("<p>Нет подходящих размеченных кропов для этой подборки.</p>")
+    sections.append("</body></html>")
+    path = out / "gallery.html"
+    path.write_text("\n".join(sections), encoding="utf-8")
+    return path

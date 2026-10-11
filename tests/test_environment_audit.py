@@ -294,6 +294,49 @@ class CleanupAuditTests(unittest.TestCase):
         self.assertEqual(evidence.statistics()["omitted_occurrences"], 98)
         self.assertLess(len(json.dumps(evidence.rows())), 3000)
 
+    def test_environment_package_relative_hashes_do_not_become_run_artifacts(self):
+        latest = self.run_dir("latest")
+        package = self.root / "facade_change"
+        (package / "methods").mkdir(parents=True)
+        (package / "research").mkdir()
+        for relative in ("alignment.py", "methods/dinov2.py", "research/paid.py"):
+            (package / relative).write_text("# source fingerprint fixture")
+        self.json(latest / "nested" / "run.json", {"status": "completed", "environment": {
+            "source_sha256": {"alignment.py": "a" * 64, "methods/dinov2.py": "b" * 64,
+                              "paid.py": "c" * 64, "retired_module.py": "d" * 64}}})
+        report = self.plan(latest)
+        self.assertEqual(report["unresolved_statistics"]["occurrences"], 0)
+        self.assertEqual(report["missing_source_snapshot_statistics"]["occurrences"], 1)
+        self.assertTrue(report["dependency_scan_complete"])
+        self.assertEqual(report["missing_source_snapshots"][0]["value"], "retired_module.py")
+
+    def test_qualified_source_hash_still_retains_cross_run_dependency(self):
+        source = self.run_dir("source")
+        latest = self.run_dir("latest")
+        self.json(latest / "provenance.json", {"source_sha256": {"../source/missing.py": "a" * 64}})
+        report = self.plan(latest)
+        self.assertEqual(self.decisions(report)["source"], "retained")
+        self.assertEqual(report["missing_source_snapshot_statistics"]["occurrences"], 0)
+        self.assertTrue(report["unresolved"])
+
+    def test_parse_error_survives_saturation_by_ordinary_reference_diagnostics(self):
+        latest = self.run_dir("latest")
+        for index in range(85):
+            self.json(latest / f"reference-{index:03d}.json", {"weights": f"missing-{index}.pth"})
+        broken = latest / "zzz-broken.json"
+        broken.write_text("{invalid")
+        report = self.plan(latest)
+        self.assertEqual(report["unresolved_statistics"]["reported_groups"], 80)
+        self.assertGreater(report["unresolved_statistics"]["omitted_occurrences"], 0)
+        self.assertEqual(report["scan_error_statistics"]["occurrences"], 1)
+        self.assertEqual(report["scan_errors"][0]["source"], str(broken))
+        out = Path(self.temp.name) / "audit-report"
+        out.mkdir()
+        with redirect_stdout(io.StringIO()) as output:
+            AUDIT["write_cleanup_report"](out, report)
+        self.assertIn("zzz-broken.json", output.getvalue())
+        self.assertIn("metadata_not_parsed:", output.getvalue())
+
     def test_cli_cleanup_does_not_probe_environment_or_load_models(self):
         latest = self.run_dir("latest")
         out = Path(self.temp.name) / "report"

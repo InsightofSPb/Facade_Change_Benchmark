@@ -24,7 +24,8 @@ if HAS_TORCH:
     from facade_change.segmentation import data as segmentation_data
     from facade_change.segmentation.model import FrozenDinoSegmenter
     from facade_change.segmentation.prepared import PreparedAugmentations, prepare_augmentations
-    from facade_change.segmentation.train import dino_paths, ownership_masks, train
+    from facade_change.segmentation.train import (OnlineTrainingMetrics, dino_paths, ownership_masks,
+                                                   train, train_evaluation_epochs)
 
     class TinyBackbone(nn.Module):
         patch_size = 14
@@ -51,6 +52,43 @@ def make_grid(width, height, size, xs, ys):
 
 @unittest.skipUnless(HAS_TORCH, "optional torch dependency is unavailable")
 class OwnershipTests(unittest.TestCase):
+    def test_full_train_schedule_always_includes_final_without_changing_val(self):
+        self.assertEqual(train_evaluation_epochs(20, .2), [4, 8, 12, 16, 20])
+        self.assertEqual(train_evaluation_epochs(7, .4), [3, 6, 7])
+        self.assertEqual(train_evaluation_epochs(1, .2), [1])
+        for fraction in (0, -1, 1.01, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                train_evaluation_epochs(20, fraction)
+
+    def test_online_counts_match_pooled_batch_labels_and_preserve_group_overlaps(self):
+        from facade_change.segmentation.metrics import (confusion_counts, group_confusion_counts,
+                                                       loss_statistics)
+        categories = [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]
+        groups = [{"name": "both", "channels": [0, 1], "category_ids": [1, 2],
+                   "category_names": ["a", "b"]}]
+        values = torch.tensor([[[[1., -2.], [.1, 3.]], [[2., .5], [-1., -3.]]]])
+        target = torch.tensor([[[[1., 1.], [0., 0.]], [[1., 0.], [1., 0.]]]])
+        valid = torch.tensor([[[True, True], [True, False]]])
+        metric = OnlineTrainingMetrics(categories, groups, "cpu")
+        metric.update(values, target, valid)
+        metric.update(-values, target, valid)
+        report = metric.report(.3)
+        expected = sum(confusion_counts(v[0].numpy() >= 0, target[0].bool().numpy(), valid[0].numpy())
+                       for v in (values, -values))
+        np.testing.assert_array_equal([[r[k] for k in ("tp", "fp", "fn")]
+                                       for r in report["per_class"]], expected)
+        group_expected = sum(group_confusion_counts(v[0].numpy() >= 0, target[0].bool().numpy(),
+                                                     valid[0].numpy(), groups) for v in (values, -values))
+        np.testing.assert_array_equal([[r[k] for k in ("tp", "fp", "fn")]
+                                       for r in report["per_group"]], group_expected)
+        self.assertEqual(report["samples"], 2)
+        self.assertEqual(report["valid_pixel_observations"], 6)
+        self.assertFalse(report["checkpoint_selection"])
+        expected_bce = np.mean([loss_statistics(v.sigmoid()[0].numpy(), target[0].bool().numpy(),
+                                               valid[0].numpy(), logits=v[0].numpy())["bce_sum"]
+                               for v in (values, -values)]) / 3
+        self.assertAlmostEqual(report["primary"]["bce"], expected_bce, places=6)
+
     def test_edge_anchored_overlapping_grid_counts_each_native_pixel_once(self):
         width, height, size = 16, 17, 8
         # Last crops are edge-anchored and therefore overlap more than the stride.
@@ -301,6 +339,67 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(record["status"], "completed_exploratory")
         self.assertEqual(record["artifact_sha256"]["best.pth"], sha256(out / "best.pth"))
 
+    def test_sparse_train_eval_independent_best_checkpoints_and_no_extra_forward(self):
+        import importlib
+        training_module = importlib.import_module("facade_change.segmentation.train")
+        augmentations = self.root / "cadence-augmentations"
+        prepare_augmentations(self.dataset, augmentations)
+        calls, reports, heads = [], {"train": 0, "val": 0}, {}
+
+        def fixture(source, checkpoint, classes, device, trust):
+            model = FrozenDinoSegmenter(TinyBackbone(), classes).to(device)
+            model.register_forward_hook(lambda module, args, output: calls.append(module.training))
+            return model, {"fixture": "cadence", "backbone_frozen": True}
+
+        original_evaluate = training_module.evaluate
+
+        def selected_reports(model, *args, **kwargs):
+            report = original_evaluate(model, *args, **kwargs)
+            split = kwargs["split"]
+            reports[split] += 1
+            # Deliberately distinct maxima prove that the TRAIN file is not a
+            # renamed copy of the VAL checkpoint. Scores here are fixture-only.
+            scores = {"val": [.2, .3, .9, .5, .4], "train": [.8, .5, .4]}
+            report["primary"]["miou"] = scores[split][reports[split] - 1]
+            if (split == "val" and reports[split] == 3) or (split == "train" and reports[split] == 1):
+                heads[split] = {key: value.clone() for key, value in model.head.state_dict().items()}
+            return report
+
+        out = self.root / "cadence-training"
+        with patch.object(training_module, "load_model", side_effect=fixture), \
+                patch.object(training_module, "evaluate", side_effect=selected_reports):
+            summary = train(self.dataset, out, augmentations=augmentations,
+                            source_root=self.source, checkpoint=self.weights, device="cpu",
+                            epochs=5, batch_size=2, train_eval_fraction=.4)
+        self.assertEqual(reports, {"train": 3, "val": 5})
+        self.assertEqual(sum(calls), 30)  # 12 fixed samples / batch 2 * 5 epochs.
+        self.assertEqual(len(calls), 41)  # 5 VAL + 3 * 2 TRAIN original image batches.
+        self.assertEqual(summary["train_eval_epochs"], [2, 4, 5])
+        self.assertEqual(summary["best_epoch"], 3)
+        self.assertEqual(summary["best_train_epoch"], 2)
+        for filename, split, expected_epoch in (("best.pth", "val", 3), ("best-train.pth", "train", 2)):
+            saved = torch.load(out / filename, map_location="cpu", weights_only=True)
+            self.assertEqual(saved["epoch"], expected_epoch)
+            for key, value in saved["head_state_dict"].items():
+                torch.testing.assert_close(value, heads[split][key])
+        train_best = torch.load(out / "best-train.pth", map_location="cpu", weights_only=True)
+        self.assertEqual(train_best["train_miou"], .8)
+        self.assertEqual(read_json(out / "best-train.json")["primary"]["miou"], .8)
+        self.assertEqual(read_json(out / "metrics.json")["primary"]["miou"], .9)
+        self.assertFalse(read_json(out / "train-at-best-val.json")["evaluated"])
+        for epoch, entry in enumerate(read_json(out / "history.json"), 1):
+            evaluated = epoch in {2, 4, 5}
+            self.assertEqual(entry["train_evaluated"], evaluated)
+            self.assertEqual((out / f"train-epoch-{epoch:03d}.json").exists(), evaluated)
+            self.assertTrue((out / f"val-epoch-{epoch:03d}.json").is_file())
+            online = read_json(out / f"train-online-epoch-{epoch:03d}.json")
+            self.assertTrue(online["diagnostic_only"])
+            self.assertEqual(online["samples"], 12)
+            if not evaluated:
+                self.assertIsNone(entry["train_miou"])
+        for split in ("train", "val"):
+            self.assertTrue((out / f"best-{split}" / "gallery.html").is_file())
+
     def test_frozen_robustness_export_parity_and_checkpoint_guards(self):
         from facade_change.methods.dinov2 import _source_provenance
         from facade_change.segmentation.evaluate import evaluate_checkpoint
@@ -399,7 +498,8 @@ class RobustnessTransformTests(unittest.TestCase):
                      "--methods-config": "methods.json", "--source-root": "dino",
                      "--checkpoint": "weights.pth", "--trust-checkpoint": None,
                      "--epochs": "20", "--learning-rate": "0.001", "--seed": "42",
-                     "--cutmix-prob": "0.25", "--cutout-prob": "0.125"}
+                     "--cutmix-prob": "0.25", "--cutout-prob": "0.125",
+                     "--train-eval-fraction": "0.2"}
         with patch("facade_change.segmentation.evaluate.evaluate_checkpoint",
                    return_value={"out": "report"}) as evaluate:
             for option, value in forbidden.items():

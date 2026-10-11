@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--out", help="New run directory; never overwritten")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--train-eval-fraction", type=float, default=0.2,
+                        help="Full original TRAIN evaluation every ceil(epochs*fraction) epochs and at the end; default 0.2 (4,8,12,16,20 for 20 epochs). VAL and online TRAIN metrics run every epoch")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
@@ -64,6 +66,8 @@ def main():
         if prepare_only:
             if arguments["smoke"] or arguments["augmentations"]:
                 parser.error("--prepare-only creates a complete snapshot; do not combine with --smoke/--augmentations")
+            if any(value.split("=", 1)[0] == "--train-eval-fraction" for value in sys.argv[1:]):
+                parser.error("--train-eval-fraction applies to training only")
             from .prepared import prepare_augmentations
             result = prepare_augmentations(arguments["dataset"], arguments["out"], seed=arguments["seed"],
                                            cutmix_prob=.25 if cutmix is None else cutmix,

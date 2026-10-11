@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from facade_change.segmentation.metrics import (
     aggregate_metrics,
@@ -13,6 +14,7 @@ from facade_change.segmentation.metrics import (
     loss_statistics,
     merge_loss_statistics,
     resolve_groups,
+    write_gallery,
     write_reports,
 )
 
@@ -192,6 +194,50 @@ class SegmentationMetricsTests(unittest.TestCase):
         stats = loss_statistics(np.zeros((2, 1, 1)), np.zeros((2, 1, 1), bool), np.ones((1, 1), bool))
         with self.assertRaisesRegex(ValueError, "every image or none"):
             aggregate_metrics([row, {**row, "image_id": 2, "loss_stats": stats}], self.categories)
+
+    def test_gallery_preserves_multilabel_overlaps_and_marks_ignored_support(self):
+        categories = [{"id": 8, "name": "CRACK", "color": "#ff0000"},
+                      {"id": 2, "name": "REPAIRS", "color": "#00ff00"}]
+        rgb = np.full((24, 24, 3), 120, dtype=np.uint8)
+        labels = np.zeros((2, 24, 24), bool)
+        labels[:, 4:20, 4:20] = True
+        valid = np.ones((24, 24), bool)
+        valid[:2] = False
+        # Predictions outside support must not appear as evaluated classes.
+        prediction = labels.copy()
+        prediction[:, :2] = True
+        original_prediction = prediction.copy()
+        preview = {"rgb": rgb, "target": labels, "valid": valid, "prediction": prediction,
+                   "image_id": 5, "building_id": "facade <test>", "crop_id": "fixed-01"}
+        with tempfile.TemporaryDirectory() as directory:
+            gallery = write_gallery(directory, [preview], categories, epoch=4, checkpoint_name="best.pth")
+            page = gallery.read_text(encoding="utf-8")
+            for text in ("Оригинальный RGB", "Разметка на RGB", "Прогноз на RGB",
+                         "Предсказанные классы", "Серая клетка", "полосами", "best.pth",
+                         "эпоха 4", "Трещина", "Ремонт", "facade &lt;test&gt;"):
+                self.assertIn(text, page)
+            self.assertNotIn("facade <test>", page)
+            folder = Path(directory) / "previews"
+            with Image.open(folder / "val-00-classes.png") as image:
+                colors = np.asarray(image)
+            region_colors = set(map(tuple, colors[4:20, 4:20].reshape(-1, 3)))
+            self.assertEqual(region_colors, {(255, 0, 0), (0, 255, 0)})
+            np.testing.assert_array_equal(colors[2, 0], [0, 0, 0])
+            self.assertTrue(np.all(colors[:2, :, 0] == colors[:2, :, 1]))
+            self.assertEqual(len(list(folder.glob("*-class-*.jpg"))), 2)
+            for category in categories:
+                with Image.open(folder / f"val-00-class-{category['id']}.jpg") as pair:
+                    self.assertEqual(pair.size, (48, 24))
+            np.testing.assert_array_equal(prediction, original_prediction)
+
+    def test_gallery_rejects_inconsistent_channels_before_writing(self):
+        preview = {"rgb": np.zeros((3, 3, 3), np.uint8), "target": np.zeros((1, 3, 3), bool),
+                   "prediction": np.zeros((1, 3, 3), bool), "valid": np.ones((3, 3), bool)}
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "preview"
+            with self.assertRaisesRegex(ValueError, "one target/prediction channel"):
+                write_gallery(out, [preview], self.categories)
+            self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":

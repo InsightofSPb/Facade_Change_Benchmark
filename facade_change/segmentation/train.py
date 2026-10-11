@@ -2,23 +2,23 @@
 from __future__ import annotations
 
 import contextlib
-import html
 import importlib.metadata
 import math
 import random
+import shutil
 import subprocess
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 from tqdm import tqdm
 
 from ..io import finish_record, new_directory, read_json, run_record, sha256, write_json
 from .data import PreparedData
 from .metrics import (aggregate_metrics, confusion_counts, group_confusion_counts,
-                      loss_statistics, merge_loss_statistics, resolve_groups, write_reports)
+                      loss_statistics, merge_loss_statistics, resolve_groups, write_reports,
+                      _class_metrics, _group_metrics, _summary)
 from .model import load_model, masked_multilabel_loss
 from .prepared import PreparedAugmentations
 
@@ -132,49 +132,15 @@ def fixed_batches(prepared, records, batch_size, rng):
         yield [prepared.load(records[int(index)]) for index in order[offset:offset + batch_size]]
 
 
-def _save_gallery_crop(out, number, data, image_id, row, crop, prediction):
-    folder = out / "previews"
-    folder.mkdir(exist_ok=True)
-    rgb, target, valid = crop
-    stem = f"val-{number:02d}"
-    Image.fromarray(rgb).save(folder / (stem + "-rgb.jpg"))
-    # One panel per class preserves overlaps instead of rendering an argmax map.
-    paths = []
-    for channel, category in enumerate(data.categories):
-        panels = []
-        for values, color in ((target[channel], [30, 220, 80]), (prediction[channel], [255, 80, 40])):
-            panel = (rgb.astype(np.float32) * .35).astype(np.uint8)
-            panel[valid] = rgb[valid]
-            selected = values & valid
-            panel[selected] = (.45 * rgb[selected] + .55 * np.asarray(color)).astype(np.uint8)
-            panels.append(panel)
-        name = f"{stem}-class-{category['id']}.jpg"
-        Image.fromarray(np.concatenate(panels, axis=1)).save(folder / name)
-        paths.append((category["name"], "previews/" + name))
-    return {"image_id": image_id, "building_id": data.images[image_id]["building_id"],
-            "crop_id": row["crop_id"], "rgb": "previews/" + stem + "-rgb.jpg", "classes": paths}
-
-
-def _gallery(out, previews):
-    sections = ["<!doctype html><html lang='ru'><meta charset='utf-8'><title>DINOv2 — VAL</title>",
-                "<style>body{font:16px sans-serif;max-width:1100px;margin:30px auto;background:#f4f4f4}img{max-width:100%}section{background:white;padding:20px;margin:20px 0}summary{cursor:pointer;padding:8px}</style>",
-                "<h1>DINOv2: сегментация VAL</h1><p>Фиксированный первый размеченный кроп каждого фасада. Это подборка, а не все ошибки. Слева разметка, справа прогноз. Затемнённые пиксели не участвуют в оценке. Классы показаны отдельно, пересечения сохранены.</p>"]
-    for preview in previews:
-        sections.append(f"<section><h2>{html.escape(str(preview['building_id']))}</h2><p>{html.escape(preview['crop_id'])}</p><img width='512' src='{preview['rgb']}' alt='RGB'>")
-        for name, path in preview["classes"]:
-            sections.append(f"<details><summary>{html.escape(name)}</summary><img src='{path}' alt='GT слева, прогноз справа'></details>")
-        sections.append("</section>")
-    sections.append("</html>")
-    (out / "gallery.html").write_text("\n".join(sections), encoding="utf-8")
-
-
 def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, gallery_out=None,
-             split="val", groups=None, prepared=None, prediction_callback=None):
+             split="val", groups=None, prepared=None, prediction_callback=None,
+             preview_buffer=None):
     model.eval()
     groups = groups if groups is not None else resolve_groups(data.categories)
     if split not in {"train", "val"} or any(data.images[key]["split"] != split for key in ids):
         raise ValueError("Evaluation IDs must belong to the named TRAIN or VAL split")
     records, previews, shown = [], [], set()
+    collect_previews = gallery_out is not None or preview_buffer is not None
     for image_id in tqdm(ids, desc=f"DINO {split.upper()} оценка", unit="фото"):
         image = data.images[image_id]
         all_rows = data.crops_by_image[image_id]
@@ -202,9 +168,13 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
                     prediction_callback(image_id=image_id, row=row, crop=crop, valid=valid,
                                         probability=probability, logits=values)
                 building = image["building_id"]
-                if gallery_out is not None and building not in shown:
-                    previews.append(_save_gallery_crop(gallery_out, len(previews), data, image_id, row, crop, prediction))
-                    shown.add(building)
+                identity = ("building", building) if building else ("unknown-image", image_id)
+                if collect_previews and identity not in shown and len(previews) < 6:
+                    previews.append({"image_id": image_id, "building_id": building,
+                                     "crop_id": row["crop_id"], "rgb": crop[0].copy(),
+                                     "target": crop[1].copy(), "valid": crop[2].copy(),
+                                     "prediction": prediction.copy()})
+                    shown.add(identity)
 
         supervised_crops = 0
         for row in rows:
@@ -233,20 +203,89 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
                   crop_overlap_accounting="each native pixel once; fixed midpoint ownership",
                   evaluation_scope="annotated opaque non-crowd union only; not full-image background evaluation",
                   image_records=records)
+    if preview_buffer is not None:
+        preview_buffer.extend(previews)
     if gallery_out is not None:
-        _gallery(gallery_out, previews)
+        from .metrics import write_gallery
+        write_gallery(gallery_out, previews, data.categories, split=split)
     return report
 
 
-def _save_checkpoint(path, model, optimizer, epoch, config, provenance, score):
+def train_evaluation_epochs(epochs, fraction):
+    """Full original TRAIN evaluations; VAL remains an every-epoch operation."""
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("train_eval_fraction must be finite and in (0, 1]")
+    interval = max(1, math.ceil(epochs * fraction))
+    return list(range(interval, epochs + 1, interval)) + ([] if epochs % interval == 0 else [epochs])
+
+
+class OnlineTrainingMetrics:
+    """Accumulate existing optimizer-batch predictions without another forward.
+
+    These diagnostics pool repeated crop/augmentation pixels from changing model
+    states. They intentionally do not claim native-pixel or facade aggregation.
+    """
+    def __init__(self, categories, groups, device):
+        self.categories, self.groups = categories, groups
+        self.counts = torch.zeros((len(categories), 3), dtype=torch.int64, device=device)
+        self.group_counts = torch.zeros((len(groups), 3), dtype=torch.int64, device=device)
+        self.stats = torch.zeros((4, len(categories)), dtype=torch.float64, device=device)
+        self.valid_pixels = torch.zeros((), dtype=torch.int64, device=device)
+        self.samples = 0
+
+    @torch.no_grad()
+    def update(self, logits, target, valid):
+        values, truth, support = logits.detach().float(), target.bool(), valid[:, None]
+        prediction = values >= 0
+        axes = (0, 2, 3)
+        self.counts += torch.stack(((prediction & truth & support).sum(axes),
+                                   (prediction & ~truth & support).sum(axes),
+                                   (~prediction & truth & support).sum(axes)), dim=1)
+        for index, group in enumerate(self.groups):
+            pred_group = prediction[:, group["channels"]].any(1) & valid
+            true_group = truth[:, group["channels"]].any(1) & valid
+            self.group_counts[index] += torch.stack(((pred_group & true_group).sum(),
+                                                     (pred_group & ~true_group).sum(),
+                                                     (~pred_group & true_group).sum()))
+        probability = values.sigmoid()
+        bce = torch.nn.functional.softplus(values) - values * target
+        # Accumulate compact C-channel statistics on device, transfer once/epoch.
+        self.stats += torch.stack(((bce * support).sum(axes),
+                                   (probability * support).sum(axes),
+                                   (target * support).sum(axes),
+                                   (probability * target * support).sum(axes))).double()
+        self.valid_pixels += valid.sum()
+        self.samples += len(logits)
+
+    def report(self, optimizer_loss):
+        arrays = self.stats.cpu().tolist()
+        stats = dict(zip(("bce_sum", "probability_sum", "target_sum", "intersection"), arrays))
+        stats["valid_pixels"] = int(self.valid_pixels.item())
+        counts, groups = self.counts.cpu().numpy(), self.group_counts.cpu().numpy()
+        classes = _class_metrics(counts, self.categories, stats)
+        return {"split": "train", "diagnostic_only": True, "test_evaluated": False,
+                "aggregation": "pixel-pooled optimizer samples; original and fixed augmented crops, repeated overlaps",
+                "prediction_source": "existing train-mode batch logits during changing model weights; no extra forward",
+                "checkpoint_selection": False, "samples": self.samples,
+                "valid_pixel_observations": stats["valid_pixels"],
+                "optimizer_loss": optimizer_loss,
+                "optimizer_loss_aggregation": "mean mini-batch objectives during weight updates",
+                "primary": _summary(classes, stats), "per_class": classes,
+                "per_group": _group_metrics(groups, self.groups, stats)}
+
+
+def _save_checkpoint(path, model, optimizer, epoch, config, provenance, score, train_score=None):
     value = {"schema_version": 1, "kind": "frozen_dinov2_semantic_head", "epoch": epoch,
              "head_state_dict": {key: tensor.detach().cpu() for key, tensor in model.head.state_dict().items()},
              "optimizer_state_dict": optimizer.state_dict(), "config": config,
-             "backbone_provenance": provenance, "val_miou": score}
+             "backbone_provenance": provenance, "val_miou": score,
+             "train_miou": train_score,
+             "selection_metric": ("unselected_last_epoch" if path.name == "last.pth" else
+                                  "original_train_facade_miou" if train_score is not None else
+                                  "val_facade_miou")}
     temporary = path.with_suffix(".tmp")
     torch.save(value, temporary)
     temporary.replace(path)
-
 
 
 def _format_metrics(values):
@@ -272,11 +311,12 @@ def _print_epoch_report(split, report):
 def train(dataset, out, augmentations=None, methods_config=None, source_root=None,
           checkpoint=None, device="cuda:0", epochs=20, batch_size=4,
           learning_rate=1e-3, seed=42, no_amp=False, smoke=False,
-          trust_checkpoint=False, class_groups=None):
+          trust_checkpoint=False, class_groups=None, train_eval_fraction=.2):
     if min(epochs, batch_size) < 1 or not math.isfinite(learning_rate) or learning_rate <= 0:
         raise ValueError("Epochs, batch size and learning rate must be positive")
     if not augmentations:
         raise ValueError("Training requires --augmentations from a completed --prepare-only run")
+    train_evaluation_epochs(epochs, train_eval_fraction)
     root, weights, config_hashes = dino_paths(methods_config, source_root, checkpoint)
     data = PreparedData(dataset)
     prepared = PreparedAugmentations(augmentations, data)
@@ -287,6 +327,7 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
     if smoke:
         train_ids, val_ids = train_ids[:2], val_ids[:2]
         epochs = 1
+    train_eval_epochs = train_evaluation_epochs(epochs, train_eval_fraction)
     selected_train = set(train_ids)
     all_samples = [item for item in prepared.records
                    if item["split"] == "train" and item["image_id"] in selected_train]
@@ -318,9 +359,11 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
               "training_samples": len(samples), "prepared_train_samples": len(all_samples),
               "skipped_unannotated_samples": sum(item["valid_pixels"] == 0 for item in all_samples),
               "augmentations": prepared.metadata,
-              "epoch_evaluation": "original TRAIN and VAL; fixed native-pixel ownership; no augmentation",
+              "train_eval_fraction": train_eval_fraction, "train_eval_epochs": train_eval_epochs,
+              "epoch_evaluation": "VAL originals every epoch; TRAIN originals on scheduled epochs; fixed native-pixel ownership",
+              "online_train_evaluation": "pixel-pooled existing optimizer logits every epoch; augmented and repeated crop pixels; changing weights",
               "unknown_train_aggregation": "separate equal-image diagnostic, never counted as known facades",
-              "decision": "independent sigmoid >=0.5; checkpoint by equal-facade VAL mIoU",
+              "decision": "independent sigmoid >=0.5; primary best.pth by equal-facade VAL mIoU; diagnostic best-train.pth by scheduled original TRAIN known-facade mIoU",
               "supervision_assumption": "inside annotated union, unmarked categories are negative; outside union all categories unknown"}
     destination = new_directory(out)
     record = run_record("dino_semantic_training", config)
@@ -331,7 +374,9 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
     try:
         print(f"TRAIN: {len(train_ids)} фото, {len(samples)} сохранённых примеров/эпоха; "
               f"VAL: {len(val_ids)} фото; классов: {len(data.categories)}; TEST не оценивается.", flush=True)
-        print("DINOv2 заморожен. Аугментации читаются с диска. TRAIN/VAL метрики — на оригиналах.", flush=True)
+        print(f"Результаты: {destination}", flush=True)
+        print("DINOv2 заморожен. Аугментации читаются с диска. VAL — на оригиналах каждую эпоху.", flush=True)
+        print(f"Полная TRAIN оценка: эпохи {train_eval_epochs}; TRAIN online — каждую эпоху на учебных batch.", flush=True)
         model, provenance = load_model(root, weights, len(data.categories), device, trust_checkpoint)
         record["model"] = provenance
         write_json(destination / "run.json", record)
@@ -341,10 +386,13 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
                   if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler")
                   else torch.cuda.amp.GradScaler(enabled=amp))
         best, best_epoch, history = -1., 0, []
+        best_train_score, best_train_epoch = -1., None
+        from .metrics import write_gallery
         for epoch in range(1, epochs + 1):
             start = time.monotonic()
             model.train()
             losses = []
+            online = OnlineTrainingMetrics(data.categories, groups, device)
             batches = fixed_batches(prepared, samples, batch_size, np.random.default_rng(seed + epoch))
             progress = tqdm(batches, total=math.ceil(len(samples) / batch_size),
                             desc=f"DINO TRAIN {epoch}/{epochs}", unit="batch")
@@ -363,13 +411,20 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
                     raise RuntimeError("Non-finite training gradients; try --no-amp")
                 scaler.step(optimizer)
                 scaler.update()
+                online.update(logits, target, valid)
                 losses.append(float(loss.detach()))
                 progress.set_postfix(loss=f"{np.mean(losses):.4f}")
-            # Both reports use the same frozen end-of-epoch model state and originals.
-            reports = {}
-            for split, ids in (("train", train_ids), ("val", val_ids)):
+            online_report = online.report(float(np.mean(losses)))
+            write_json(destination / f"train-online-epoch-{epoch:03d}.json", online_report)
+            _print_epoch_report("train online (augmented, pooled)", online_report)
+            reports, previews = {}, {}
+            splits = [("train", train_ids)] if epoch in train_eval_epochs else []
+            splits.append(("val", val_ids))
+            for split, ids in splits:
+                previews[split] = []
                 reports[split] = evaluate(model, data, ids, device, batch_size, amp, smoke,
-                                          split=split, groups=groups, prepared=prepared)
+                                          split=split, groups=groups, prepared=prepared,
+                                          preview_buffer=previews[split])
                 write_json(destination / f"{split}-epoch-{epoch:03d}.json", reports[split])
                 write_reports(destination / f"epoch-{epoch:03d}" / split, reports[split])
                 _print_epoch_report(split, reports[split])
@@ -380,10 +435,12 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
                      "optimizer_loss_aggregation": "mean augmented mini-batch objectives during weight updates",
                      "learning_rate": optimizer.param_groups[0]["lr"],
                      "seconds": time.monotonic() - start,
-                     "train": reports["train"]["primary"], "val": reports["val"]["primary"]}
-            for split, report in reports.items():
+                     "train_evaluated": "train" in reports,
+                     "train_online": online_report["primary"],
+                     "train": reports.get("train", {}).get("primary"), "val": reports["val"]["primary"]}
+            for split in ("train", "val"):
                 for metric in ("miou", "f1", "precision", "recall", "loss"):
-                    entry[f"{split}_{metric}"] = report["primary"][metric]
+                    entry[f"{split}_{metric}"] = reports.get(split, {}).get("primary", {}).get(metric)
             history.append(entry)
             write_json(destination / "history.json", history)
             _save_checkpoint(destination / "last.pth", model, optimizer, epoch, config, provenance, score)
@@ -391,21 +448,44 @@ def train(dataset, out, augmentations=None, methods_config=None, source_root=Non
                 best, best_epoch = score, epoch
                 _save_checkpoint(destination / "best.pth", model, optimizer, epoch, config, provenance, score)
                 write_json(destination / "best-val.json", reports["val"])
+                write_json(destination / "train-at-best-val.json", {
+                    "epoch": epoch, "evaluated": "train" in reports,
+                    "report": reports.get("train"), "online_diagnostic": online_report})
+                write_gallery(destination / "best-val", previews["val"], data.categories,
+                              split="val", epoch=epoch, checkpoint_name="best.pth")
+            train_score = reports.get("train", {}).get("primary", {}).get("miou")
+            if train_score is not None and train_score > best_train_score:
+                best_train_score, best_train_epoch = train_score, epoch
+                _save_checkpoint(destination / "best-train.pth", model, optimizer, epoch,
+                                 config, provenance, score, train_score=train_score)
                 write_json(destination / "best-train.json", reports["train"])
+                write_gallery(destination / "best-train", previews["train"], data.categories,
+                              split="train", epoch=epoch, checkpoint_name="best-train.pth")
+                print(f"Сохранён best-train.pth: TRAIN mIoU={train_score:.2%}, эпоха {epoch}", flush=True)
             scheduler.step()
             print(f"Эпоха {epoch}: лучший VAL mIoU={best:.2%} (эпоха {best_epoch})", flush=True)
         saved = torch.load(destination / "best.pth", map_location="cpu", weights_only=True)
         model.head.load_state_dict(saved["head_state_dict"], strict=True)
-        final = evaluate(model, data, val_ids, device, batch_size, amp, smoke,
-                         gallery_out=destination, split="val", groups=groups, prepared=prepared)
+        # The saved report and gallery already correspond to the exact best VAL
+        # head. Reuse them instead of running another full inference pass.
+        final = read_json(destination / "best-val.json")
         write_json(destination / "metrics.json", final)
         write_reports(destination, final)
-        best_train = read_json(destination / "best-train.json")
-        write_json(destination / "train-metrics.json", best_train)
-        write_reports(destination / "train", best_train)
+        shutil.copy2(destination / "best-val" / "gallery.html", destination / "gallery.html")
+        shutil.copytree(destination / "best-val" / "previews", destination / "previews")
+        train_best = read_json(destination / "best-train.json") if best_train_epoch is not None else None
+        if train_best is not None:
+            write_json(destination / "train-metrics.json", train_best)
+            write_reports(destination / "train", train_best)
         summary = {"status": "completed_smoke" if smoke else "completed_exploratory", "out": str(destination),
                    "best_epoch": best_epoch, "best_val_miou": best, "metrics": final["primary"],
-                   "train_metrics": best_train["primary"], "training_samples_per_epoch": len(samples),
+                   "best_train_epoch": best_train_epoch,
+                   "best_train_miou": best_train_score if best_train_epoch is not None else None,
+                   "train_metrics": train_best["primary"] if train_best is not None else None,
+                   "train_metrics_checkpoint": "best-train.pth" if train_best is not None else None,
+                   "train_checkpoint_selection": "known-facade original TRAIN mIoU among scheduled evaluations only; diagnostic, not model selection",
+                   "train_eval_epochs": train_eval_epochs,
+                   "training_samples_per_epoch": len(samples),
                    "augmentations": str(prepared.path), "test_evaluated": False,
                    "scope": "semantic multilabel metrics on annotated union; no background or temporal-change claim",
                    "physical_disjointness_verified": data.metadata["leakage_check"]["physical_disjointness_verified"]}

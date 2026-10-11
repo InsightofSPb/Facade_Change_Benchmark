@@ -145,7 +145,7 @@ def _path_strings(value, key=""):
             hashed = isinstance(child, str) and len(child) == 64 and all(c in "0123456789abcdef" for c in child.lower())
             if (isinstance(name, str) and ((hashed and Path(name).suffix.lower() in PATH_SUFFIXES)
                     or name.startswith(("/", "../", "./", "~/")))):
-                yield name, "dictionary_key"
+                yield name, "source_sha256" if key == "source_sha256" else "dictionary_key"
             yield from _path_strings(child, str(name))
     elif isinstance(value, list):
         for child in value:
@@ -273,6 +273,7 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
 
     seeds, edges, unresolved, metadata_hashes = set(), {}, _Evidence(), {}
     external_references, warnings = _Evidence(), []
+    scan_errors, source_snapshot_missing = _Evidence(32), _Evidence(8)
     metadata_digest, metadata_files_scanned = hashlib.sha256(), 0
     scan_incomplete = False
     external = {}
@@ -299,6 +300,10 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
         row = {"source": str(origin), "error": error}
         row.update({k: v for k, v in (("value", raw), ("key", key), ("resolved", resolved)) if v is not None})
         unresolved.add((str(origin), key, error), row)
+        if error.startswith(("metadata_not_parsed:", "run_not_parsed:", "invalid_path_reference")):
+            # Ordinary missing artifacts must never crowd out the reason why
+            # dependency scanning itself could not finish.
+            scan_errors.add((str(origin), error), row)
 
     def retain(path, reason):
         target = owner(path)
@@ -324,10 +329,21 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
     def record_reference(source, origin, raw, key):
         candidate = Path(raw).expanduser()
         bases = [origin.parent, owner(origin), repository, runs]
+        source_snapshot = (key == "source_sha256" and candidate.suffix == ".py"
+                           and not raw.startswith(("/", "./", "../", "~/", "runs/")))
+        if source_snapshot:
+            # io.environment() stores package-relative names; the research
+            # modules store names relative to facade_change/research. These
+            # describe code provenance, not paths inside an experiment run.
+            bases += [repository / "facade_change", repository / "facade_change" / "research"]
         candidates = {candidate} if candidate.is_absolute() else {
             base / candidate for base in bases if base is not None}
         paths = sorted({_lexical(p) for p in candidates})
         found = [p for p in paths if p.exists() or _symlink_component(p)]
+        if not found and source_snapshot:
+            source_snapshot_missing.add(str(source), {"source": str(origin), "value": raw,
+                                                      "note": "historical source fingerprint; current source file unavailable"})
+            return
         if not found:
             found = [p for p in paths if owner(p) in entries]
         if not found:
@@ -516,6 +532,9 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
             "external_references": external_references.rows(),
             "external_reference_statistics": external_references.statistics(),
             "unresolved": unresolved.rows(), "unresolved_statistics": unresolved.statistics(),
+            "scan_errors": scan_errors.rows(), "scan_error_statistics": scan_errors.statistics(),
+            "missing_source_snapshots": source_snapshot_missing.rows(),
+            "missing_source_snapshot_statistics": source_snapshot_missing.statistics(),
             "dependency_scan_complete": not scan_incomplete,
             "metadata_sha256": metadata_hashes, "metadata_files_scanned": metadata_files_scanned,
             "metadata_hashes_omitted": metadata_files_scanned - len(metadata_hashes),
@@ -553,6 +572,10 @@ def write_cleanup_report(out, report):
               f"metadata files scanned: {report['metadata_files_scanned']}",
               f"External items: {len(report['external_inventory'])}; unverified items are not deletion candidates.",
               report["scope"], *report["warnings"], f"Report: {out / 'cleanup.json'}"]
+    if report["scan_errors"]:
+        lines.append("Dependency scan errors (first 8; details in cleanup.json scan_errors):")
+        for row in report["scan_errors"][:8]:
+            lines.append(f"  {row['source']}: {row['error']}")
     text = "\n".join(lines) + "\n"
     (out / "summary.txt").write_text(text, encoding="utf-8")
     print(text)
