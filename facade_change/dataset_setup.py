@@ -10,6 +10,7 @@ from pathlib import Path
 from .data import DEFAULT_METADATA_RULES, build_manifest, normalized_name, preprocess_coco, read_rename_maps
 from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
 from .preparation import prepare_dataset, semantic_crop_boxes, semantic_crop_count
+from .semantic_training import include_auxiliary_training
 
 
 def _names(images):
@@ -115,7 +116,7 @@ def discover_previous_split(runs_root, image_names, split_policy=None):
     complete = [(path, split, stamp) for path, split, stamp in candidates
                 if split["building_assignments"] == all_owners and
                 (_merged_semantic_history([split]) == _merged_semantic_history([item[1] for item in candidates])
-                 if first.get("split_policy", "legacy") == "series-v2" else
+                 if first.get("split_policy", "legacy") != "legacy" else
                  _cohort(split, "historical_cohort") == all_history)]
     if not complete:
         raise ValueError("Reviewed split histories branched; choose --previous-split explicitly: " +
@@ -133,7 +134,7 @@ def _csv(path, rows, fields):
 def _image_reports(out, images):
     fields = ["image_id", "file_name", "image_path", "image_status", "resolution_rule",
               "view_id", "building_id", "year", "reviewed", "notes", "split", "exclusion_reasons",
-              "semantic_eligible", "temporal_eligible", "temporal_exclusion_reasons"]
+              "semantic_eligible", "temporal_eligible", "temporal_exclusion_reasons", "training_role"]
     rows = [{**row, "reviewed": "true" if row.get("metadata_status") == "reviewed" else "false",
              "notes": row.get("metadata_notes", ""),
              "temporal_exclusion_reasons": ";".join(row.get("temporal_exclusion_reasons", [])),
@@ -155,6 +156,7 @@ def _crop_index(out, images, crop_size, crop_stride):
                         "image_id": row["image_id"], "file_name": row["file_name"],
                         "image_path": row["image_path"], "image_sha256": row["sha256"],
                         "building_id": row["building_id"], "view_id": row.get("view_id"), "split": row["split"],
+                        "training_role": row.get("training_role", "reviewed"),
                         "x": x, "y": y, "width": width, "height": height,
                         "pad_right": crop_size - width, "pad_bottom": crop_size - height}
                 stream.write(json.dumps(crop, ensure_ascii=False, allow_nan=False) + "\n")
@@ -174,7 +176,8 @@ def _class_coverage(out, prepared, coco):
         key = (row["split"], annotation["category_id"])
         counts[key] += 1
         image_ids.setdefault(key, set()).add(row["image_id"])
-        buildings.setdefault(key, set()).add(row["building_id"])
+        if row.get("building_id") and row.get("metadata_status") == "reviewed":
+            buildings.setdefault(key, set()).add(row["building_id"])
     rows = [{"split": split, "category_id": category["id"], "category_name": category["name"],
              "annotation_count": counts[(split, category["id"])],
              "image_count": len(image_ids.get((split, category["id"]), set())),
@@ -216,15 +219,19 @@ def _split_transition(out, previous_path, previous, prepared):
 
 def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous_split=None,
                        metadata_rules=DEFAULT_METADATA_RULES, rename_maps=None,
-                       crop_size=512, crop_stride=448, metadata_csv=None, split_policy="series-v2"):
+                       crop_size=512, crop_stride=448, metadata_csv=None, split_policy="facades-v3",
+                       include_unreviewed_train=None):
     """Audit current COCO, extend reviewed owners and index native semantic crops.
 
     Does not align temporal pairs, rasterize masks, train models or copy images.
     Extra files outside COCO are never added to the dataset.
     """
     coco_path, image_root = Path(coco_path).expanduser().resolve(), Path(image_root).expanduser().resolve()
-    if split_policy not in {"legacy", "series-v2"}:
-        raise ValueError("split_policy must be legacy or series-v2")
+    if split_policy not in {"legacy", "series-v2", "facades-v3"}:
+        raise ValueError("split_policy must be legacy, series-v2 or facades-v3")
+    if include_unreviewed_train is None:
+        include_unreviewed_train = split_policy == "facades-v3"
+    balance_unit = "buildings" if split_policy == "facades-v3" else "crops"
     if not coco_path.is_file() or not image_root.is_dir():
         raise ValueError("COCO must be an existing file and images must be an existing directory")
     semantic_crop_count(1, 1, crop_size, crop_stride)  # Validate geometry before creating a run.
@@ -251,7 +258,9 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
     try:
         previous_path = (Path(previous_split).expanduser().resolve() if previous_split else
                          discover_previous_split(runs_root, image_names, split_policy))
-        if previous_path is None and split_policy == "series-v2":
+        if previous_path is None and split_policy == "facades-v3":
+            previous_path = discover_previous_split(runs_root, image_names, "series-v2")
+        if previous_path is None and split_policy != "legacy":
             previous_path = discover_previous_split(runs_root, image_names, "legacy")
         previous = _validate_previous(previous_path) if previous_path else None
         if previous and split_policy == "legacy" and previous.get("split_policy", "legacy") != "legacy":
@@ -275,8 +284,9 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
               "metadata_csv": str(metadata_csv) if metadata_csv else None,
               "previous_split": str(previous_path) if previous_path else None,
               "split_policy": split_policy, "new_split_version": migration,
+              "include_unreviewed_train": include_unreviewed_train,
               "previous_split_use": "metadata_cache_and_transition_only" if migration else "frozen_extension",
-              "balance_unit": "crops", "crop_size": crop_size, "crop_stride": crop_stride,
+              "balance_unit": balance_unit, "crop_size": crop_size, "crop_stride": crop_stride,
               "input_sha256": input_hashes, "image_selection": "current_coco_images_only"}
     record = run_record("dataset_setup", config)
     write_json(out / "run.json", record)
@@ -318,11 +328,11 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                 print(f"{key}: {values}", flush=True)
         if not split_error:
             fractions = inherited["fractions"] if inherited else (
-                {"train": .80, "val": .08, "test": .12} if split_policy == "series-v2" else
+                {"train": .80, "val": .08, "test": .12} if split_policy != "legacy" else
                 {"train": .70, "val": .10, "test": .20})
             reviewed = [row for row in images if row["image_status"] == "ready" and
                         row.get("metadata_status") == "reviewed" and row.get("building_id") and row.get("sha256")
-                        and (split_policy == "series-v2" or (row.get("view_id") and
+                        and (split_policy != "legacy" or (row.get("view_id") and
                         type(row.get("year")) is int and 1800 <= row["year"] <= 2100))]
             if not reviewed or (split_policy == "legacy" and inherited is None and len({row["building_id"] for row in reviewed}) <
                                 sum(fraction > 0 for fraction in fractions.values())):
@@ -332,16 +342,34 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                 prepared = prepare_dataset(out / "inventory/manifest.json", out / "prepared", split_mode="reviewed",
                                            previous_split=inherited_path, seed=inherited["seed"] if inherited else 42,
                                            val_fraction=fractions["val"], test_fraction=fractions["test"],
-                                           balance_unit="crops", crop_size=crop_size, crop_stride=crop_stride,
+                                           balance_unit=balance_unit, crop_size=crop_size, crop_stride=crop_stride,
                                            split_policy=split_policy)
-                images = prepared["images"]
+                semantic, auxiliary = include_auxiliary_training(
+                    prepared, read_json(out / "prepared/split.json"), include_unreviewed_train)
+                images = semantic["images"]
                 _image_reports(out, images)
                 counts = _crop_index(out, images, crop_size, crop_stride)
                 balance = prepared["summary"]["split_balance"]
-                if sum(counts.values()) != balance["eligible_crop_count"]:
+                extra_crops = sum(semantic_crop_count(row["width"], row["height"], crop_size, crop_stride)
+                                  for row in images if row.get("training_role") == "auxiliary_semantic_train")
+                if sum(counts.values()) != balance["eligible_crop_count"] + extra_crops:
                     raise ValueError("Crop index count differs from the split balancing count")
                 summary.update(preparation=prepared["summary"], balance=balance,
-                               crop_count=sum(counts.values()), crop_splits=counts)
+                               crop_count=sum(counts.values()), crop_splits=counts,
+                               auxiliary_train_image_count=len(auxiliary["included_images"]),
+                               auxiliary_train_crop_count=extra_crops,
+                               physical_disjointness_verified=auxiliary["physical_disjointness_verified"],
+                               semantic_image_splits=dict(Counter(row["split"] for row in images)),
+                               auxiliary_training=auxiliary)
+                semantic_path = out / "semantic_manifest.json"
+                semantic["summary"]["reviewed_eligible_crop_count"] = balance["eligible_crop_count"]
+                semantic["summary"]["eligible_crop_count"] = sum(counts.values())
+                write_json(semantic_path, semantic)
+                write_json(out / "auxiliary_training.json", auxiliary)
+                for row in auxiliary["included_images"]:
+                    print(f"Семантический TRAIN: {row['file_name']} — адрес не установлен; временные пары исключены", flush=True)
+                for row in auxiliary["blocked_images"] + auxiliary["duplicate_images"]:
+                    print(f"Не добавлено в TRAIN: {row['file_name']} — {row['reason']}", flush=True)
                 series = balance.get("series_constraints", {}).get("buildings", {})
                 if series:
                     _csv(out / "building_series.csv", [
@@ -351,7 +379,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                         ["building_id", "split", "series_class", "max_distinct_years_per_view",
                          "image_count", "crop_count", "observations_without_temporal_metadata",
                          "historical_assignment", "view_years"])
-                summary["class_coverage"] = _class_coverage(out, prepared, read_json(preprocessing["coco_path"]))
+                summary["class_coverage"] = _class_coverage(out, semantic, read_json(preprocessing["coco_path"]))
                 if migration:
                     summary["split_transition"] = _split_transition(out, previous_path, previous, prepared)
                 unreviewed = [row for row in images if row["image_status"] == "ready" and row["split"] == "excluded"]
@@ -365,6 +393,8 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                 summary["status"] = ("needs_metadata_review" if unreviewed else "completed_with_issues"
                                      if issues or any(annotation_issues.values()) or
                                      prepared["summary"]["missing_gold_sha256"] else "completed")
+                if auxiliary["included_images"] and not unreviewed and not any(annotation_issues.values()):
+                    summary["status"] = "completed_exploratory_train_only"
                 constraints = balance.get("series_constraints", {})
                 if constraints.get("status") == "insufficient":
                     summary["status"] = "needs_split_review"
@@ -373,7 +403,12 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                 write_json(out / "dataset.json", {
                     "schema_version": 1, "kind": "semantic_crop_index", "source_coco": preprocessing["coco_path"],
                     "source_coco_sha256": sha256(preprocessing["coco_path"]), "original_coco": str(coco_path),
-                    "manifest": str(out / "prepared/manifest.json"), "split": str(out / "prepared/split.json"),
+                    "manifest": str(semantic_path), "split": str(out / "prepared/split.json"),
+                    "reviewed_manifest": str(out / "prepared/manifest.json"),
+                    "physical_disjointness_verified": auxiliary["physical_disjointness_verified"],
+                    "auxiliary_training": str(out / "auxiliary_training.json"),
+                    "evaluation_scope": ("exploratory_until_training_building_membership_is_resolved"
+                                         if auxiliary["included_images"] else "reviewed_building_split"),
                     "crops": str(out / "semantic_crops.jsonl"), "crop_size": crop_size, "stride": crop_stride,
                     "crop_splits": counts, "categories": prepared["categories"],
                     "split_policy": split_policy,
@@ -390,16 +425,27 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
         lines = [f"Статус: {summary['status']}",
                  f"COCO: {len(images)}; проверены и пригодны: {summary['ready_image_count']}; проблемные: {len(issues)}",
                  f"Предыдущий split: {previous_path}", f"Кропы: {crop_size}×{crop_size}, шаг {crop_stride}"]
+        lines.append("Подтверждённые здания (доли кропов справочные):")
         for name, stats in summary.get("balance", {}).get("partitions", {}).items():
             lines.append(f"{name}: {stats['building_count']} фасадов; {stats['image_count']} фото "
                          f"({stats['image_fraction']:.2%}); {stats['crop_count']} кропов "
-                         f"({stats['crop_fraction']:.2%}); цель {stats['target_crop_fraction']:.2%}")
+                         f"({stats['crop_fraction']:.2%})")
+        if summary.get("crop_count"):
+            lines.append(f"Дополнительно в семантическом TRAIN без установленного адреса: "
+                         f"{summary['auxiliary_train_image_count']} фото; {summary['auxiliary_train_crop_count']} кропов.")
+            for name, count in summary["crop_splits"].items():
+                lines.append(f"Весь семантический {name}: {summary['semantic_image_splits'].get(name, 0)} фото; "
+                             f"{count} кропов ({count / summary['crop_count']:.2%}).")
         lines.extend([("Создана новая версия split; старые результаты сохранены отдельно." if migration else
                        "Внутри выбранной версии прежние назначения сохраняются."),
-                      "Баланс приблизительный; все виды и кропы одного здания остаются вместе.",
+                      "Все подтверждённые виды и кропы одного здания остаются вместе.",
                       "Кропы записаны координатами; исходные фото и COCO не изменены.",
                       "Число кропов геометрическое: фильтрация по поддержке/разметке может изменить доли.",
                       f"Отчёт: {out / 'summary.json'}", f"Проверка имён: {out / 'metadata_review_with_names.csv'}"])
+        if summary.get("auxiliary_train_image_count"):
+            lines.append("Все добавленные снимки доступны для семантического обучения. "
+                         "Независимость TRAIN от VAL/TEST по физическим зданиям пока не подтверждена "
+                         "для снимков без адреса; результаты обучения с ними — exploratory.")
         if split_error:
             lines.append(split_error)
         text = "\n".join(lines) + "\n"

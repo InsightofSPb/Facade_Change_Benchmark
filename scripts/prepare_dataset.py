@@ -1,4 +1,4 @@
-"""Prepare COCO with an 80/8/12 series-aware facade split using two input paths."""
+"""Prepare semantic TRAIN and temporal pairs, splitting by buildings with 7–10 TEST facades."""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +18,10 @@ def main():
     parser.add_argument("--out", type=Path)
     parser.add_argument("--runs-root", type=Path, help="Where to find previous reviewed preparation runs")
     parser.add_argument("--previous-split", type=Path, help="Explicit override of automatic split discovery")
-    parser.add_argument("--split-policy", choices=("series-v2", "legacy"), default="series-v2",
-                        help="series-v2: 80/8/12 crop targets, medium-series holdouts; legacy: preserve the old policy")
+    parser.add_argument("--split-policy", choices=("facades-v3", "series-v2", "legacy"), default="facades-v3",
+                        help="facades-v3: building counts, 7–10 TEST buildings, unknown-address photos in semantic TRAIN")
+    parser.add_argument("--include-unreviewed-train", action="store_true", default=None,
+                        help="Include unknown-address photos in semantic TRAIN (automatic for facades-v3)")
     parser.add_argument("--rename-map", type=Path, action="append", dest="rename_maps")
     parser.add_argument("--metadata-rules", type=Path, default=DEFAULT_METADATA_RULES)
     parser.add_argument("--metadata-csv", type=Path, help="Reviewed table using current COCO image IDs")
@@ -31,7 +33,7 @@ def main():
     except (OSError, ValueError) as exc:
         print(f"Подготовка не завершена: {exc}", file=sys.stderr)
         return 2
-    return 0 if result["status"] == "completed" else 2
+    return 0 if result["status"] in {"completed", "completed_exploratory_train_only"} else 2
 
 
 if __name__ == "__main__":

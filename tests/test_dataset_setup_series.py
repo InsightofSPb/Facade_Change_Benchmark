@@ -34,7 +34,7 @@ class SeriesDatasetSetupTests(unittest.TestCase):
 
     def image(self, name, building=None, size=(32, 32)):
         image_id = len(self.images) + 1
-        Image.new("RGB", size, (image_id, image_id * 3, image_id * 5)).save(self.photos / name)
+        Image.new("RGB", size, (image_id, (image_id * 3) % 256, (image_id * 5) % 256)).save(self.photos / name)
         row = {"id": image_id, "file_name": f"deadbeef-{name}", "width": size[0], "height": size[1]}
         self.images.append(row)
         if building:
@@ -71,6 +71,7 @@ class SeriesDatasetSetupTests(unittest.TestCase):
         return path
 
     def prepare(self, coco, name, **kwargs):
+        kwargs.setdefault("split_policy", "series-v2")
         kwargs.setdefault("metadata_rules", self.rules)
         if self.review.is_file():
             kwargs.setdefault("metadata_csv", self.review)
@@ -85,7 +86,7 @@ class SeriesDatasetSetupTests(unittest.TestCase):
         return [json.loads(line) for line in (self.runs / name / "semantic_crops.jsonl").read_text(
             encoding="utf-8").splitlines()]
 
-    def test_default_v2_keeps_undated_semantic_images_in_train_and_temporal_pairs_separate(self):
+    def test_series_v2_keeps_undated_semantic_images_in_train_and_temporal_pairs_separate(self):
         coco = self.dataset(undated=True)
         summary = self.prepare(coco, "first")
         out = self.runs / "first"
@@ -240,17 +241,104 @@ class SeriesDatasetSetupTests(unittest.TestCase):
         self.assertNotIn(self.unknown["id"], crop_ids)
         self.assertIn(self.undated["id"], crop_ids)
 
-    def test_cli_defaults_to_series_v2(self):
-        coco = self.dataset()
+    def test_explicit_auxiliary_train_inclusion_does_not_relabel_physical_split(self):
+        coco = self.dataset(undated=True, unknown=True)
+        originals = {path: sha256(path) for path in [coco, self.rules, self.review, *self.photos.glob("*.png")]}
+        summary = self.prepare(coco, "auxiliary", include_unreviewed_train=True)
+        out = self.runs / "auxiliary"
+        self.assertEqual(summary["status"], "completed_exploratory_train_only")
+        self.assertEqual(summary["auxiliary_train_image_count"], 1)
+        physical = read_json(out / "prepared/manifest.json")
+        unknown = next(row for row in physical["images"] if row["image_id"] == self.unknown["id"])
+        self.assertEqual(unknown["split"], "excluded")
+        self.assertIsNone(unknown["building_id"])
+        self.assertNotEqual(unknown["metadata_status"], "reviewed")
+        self.assertTrue(all(self.unknown["id"] not in (row["reference_id"], row["source_id"])
+                            for row in physical["pairs"]))
+        semantic = read_json(out / "semantic_manifest.json")
+        auxiliary = next(row for row in semantic["images"] if row["image_id"] == self.unknown["id"])
+        self.assertEqual(auxiliary["split"], "train")
+        self.assertIsNone(auxiliary["building_id"])
+        self.assertEqual(auxiliary["metadata_status"], unknown["metadata_status"])
+        self.assertEqual(auxiliary["training_role"], "auxiliary_semantic_train")
+        dataset = read_json(out / "dataset.json")
+        self.assertFalse(dataset["physical_disjointness_verified"])
+        crops = self.crops("auxiliary")
+        extra_crops = [row for row in crops if row["image_id"] == self.unknown["id"]]
+        self.assertEqual(len(extra_crops), 1)
+        self.assertEqual(extra_crops[0]["split"], "train")
+        self.assertIsNone(extra_crops[0]["building_id"])
+        self.assertEqual(summary["crop_count"], summary["balance"]["eligible_crop_count"] + 1)
+        self.assertEqual(summary["crop_count"], len(crops))
+        self.assertEqual(summary["crop_splits"]["train"],
+                         summary["balance"]["partitions"]["train"]["crop_count"] + 1)
+        for name in ("val", "test"):
+            self.assertEqual(summary["crop_splits"][name], summary["balance"]["partitions"][name]["crop_count"])
+        self.assertTrue(all(sha256(path) == digest for path, digest in originals.items()))
+
+    def test_explicit_false_keeps_unreviewed_images_out_of_training(self):
+        coco = self.dataset(undated=True, unknown=True)
+        summary = self.prepare(coco, "strict", include_unreviewed_train=False)
+        self.assertEqual(summary["status"], "needs_metadata_review")
+        self.assertEqual(summary.get("auxiliary_train_image_count", 0), 0)
+        self.assertEqual(summary["crop_count"], summary["balance"]["eligible_crop_count"])
+        self.assertNotIn(self.unknown["id"], {row["image_id"] for row in self.crops("strict")})
+        self.assertIn(self.undated["id"], {row["image_id"] for row in self.crops("strict")})
+
+    def test_v2_to_v3_migration_then_extension_preserves_old_files_and_new_owners(self):
+        coco = self.dataset(medium_count=12, unknown=True)
+        self.prepare(coco, "v2_original")
+        v2_path = self.runs / "v2_original/prepared/split.json"
+        original_hashes = {path: sha256(path) for path in (self.runs / "v2_original").rglob("*")
+                           if path.is_file()}
+        migrated = self.prepare(coco, "v3_migration", split_policy="facades-v3")
+        v3_path = self.runs / "v3_migration/prepared/split.json"
+        v3 = read_json(v3_path)
+        self.assertEqual(migrated["status"], "completed_exploratory_train_only")
+        self.assertTrue(migrated["new_split_version"])
+        self.assertEqual(migrated["previous_split"], str(v2_path))
+        self.assertEqual(migrated["auxiliary_train_image_count"], 1)
+        self.assertEqual(sum(owner == "test" for owner in v3["building_assignments"].values()), 7)
+        self.assertTrue(all(sha256(path) == digest for path, digest in original_hashes.items()))
+        v3_hashes = {path: sha256(path) for path in (self.runs / "v3_migration").rglob("*") if path.is_file()}
+
+        extended = self.prepare(coco, "v3_extension", split_policy="facades-v3")
+        final = read_json(self.runs / "v3_extension/prepared/split.json")
+        self.assertEqual(extended["status"], "completed_exploratory_train_only")
+        self.assertFalse(extended["new_split_version"])
+        self.assertEqual(extended["previous_split"], str(v3_path))
+        self.assertEqual(extended["auxiliary_train_image_count"], 1)
+        self.assertEqual(final["building_assignments"], v3["building_assignments"])
+        self.assertEqual(final["gold_cohort"], v3["gold_cohort"])
+        for name in ("v3_migration", "v3_extension"):
+            extra = [row for row in self.crops(name) if row["image_id"] == self.unknown["id"]]
+            self.assertEqual(len(extra), 1)
+            self.assertEqual(extra[0]["split"], "train")
+            self.assertIsNone(extra[0]["building_id"])
+        self.assertTrue(all(sha256(path) == digest for path, digest in v3_hashes.items()))
+
+    def test_cli_defaults_to_facades_v3_with_unknown_images_in_semantic_train(self):
+        coco = self.dataset(medium_count=12, undated=True, unknown=True)
         script = Path(__file__).resolve().parents[1] / "scripts/prepare_dataset.py"
         out = self.runs / "cli"
         process = subprocess.run([sys.executable, "-s", str(script), str(coco), str(self.photos),
                                   "--runs-root", str(self.runs), "--out", str(out),
-                                  "--metadata-rules", str(self.rules), "--crop-size", "32", "--crop-stride", "24"],
+                                  "--metadata-rules", str(self.rules), "--metadata-csv", str(self.review),
+                                  "--crop-size", "32", "--crop-stride", "24"],
                                  capture_output=True, text=True, timeout=30)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
-        self.assertEqual(read_json(out / "summary.json")["split_policy"], "series-v2")
-        self.assertEqual(read_json(out / "dataset.json")["split_policy"], "series-v2")
+        summary = read_json(out / "summary.json")
+        self.assertEqual(summary["split_policy"], "facades-v3")
+        self.assertEqual(summary["auxiliary_train_image_count"], 1)
+        self.assertEqual(read_json(out / "dataset.json")["split_policy"], "facades-v3")
+        self.assertFalse(read_json(out / "dataset.json")["physical_disjointness_verified"])
+        unknown = next(row for row in self.crops("cli") if row["image_id"] == self.unknown["id"])
+        self.assertEqual(unknown["split"], "train")
+        self.assertIsNone(unknown["building_id"])
+        physical = read_json(out / "prepared/manifest.json")
+        row = next(row for row in physical["images"] if row["image_id"] == self.unknown["id"])
+        self.assertEqual(row["split"], "excluded")
+        self.assertNotEqual(row["metadata_status"], "reviewed")
 
 
 if __name__ == "__main__":
