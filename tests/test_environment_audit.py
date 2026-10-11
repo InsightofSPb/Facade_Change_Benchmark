@@ -130,15 +130,15 @@ class CleanupAuditTests(unittest.TestCase):
         self.assertTrue(all(row["decision"] == "retained" for row in report["runs"]))
         self.assertTrue(report["unresolved"])
 
-    def test_jsonl_indexes_and_artifact_key_references_preserve_archives(self):
+    def test_recorded_lineage_and_input_hash_references_preserve_archives(self):
         latest = self.run_dir("latest")
         source = self.run_dir("source")
         archive = self.root / "runs" / "preserved.tar.gz"
         archive.write_bytes(b"not read as an archive")
         disposable = self.root / "runs" / "old.tar.gz"
         disposable.write_bytes(b"not read")
-        (latest / "index.jsonl").write_text(json.dumps({"parent": "../source"}) + "\n")
-        self.json(source / "artifacts.json", {"../preserved.tar.gz": "a" * 64})
+        self.json(latest / "config.json", {"parent": "../source"})
+        self.json(source / "provenance.json", {"input_sha256": {"../preserved.tar.gz": "a" * 64}})
         report = self.plan(latest)
         self.assertEqual(self.decisions(report)[archive.name], "retained")
         self.assertEqual(self.decisions(report)[disposable.name], "review_candidate")
@@ -150,13 +150,13 @@ class CleanupAuditTests(unittest.TestCase):
         self.json(outside / "run.json", {"unrelated": "secret"})
         (latest / "linked").symlink_to(outside, target_is_directory=True)
         (self.root / "runs" / "link-source").symlink_to(source, target_is_directory=True)
-        self.json(latest / "links.json", {"checkpoint": "../link-source/model.pth"})
-        original = Path.read_bytes
-        def guarded(path):
-            if path.is_relative_to(outside):
+        self.json(latest / "config.json", {"checkpoint": "../link-source/model.pth"})
+        original = Path.open
+        def guarded(path, *args, **kwargs):
+            if path.resolve().is_relative_to(outside):
                 raise AssertionError("External symlink contents must never be read")
-            return original(path)
-        with patch.object(Path, "read_bytes", guarded):
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", guarded):
             report = self.plan(latest)
         self.assertEqual(self.decisions(report)["source"], "retained")
         self.assertEqual(self.decisions(report)["link-source"], "retained")
@@ -232,11 +232,10 @@ class CleanupAuditTests(unittest.TestCase):
         image = external / "facade.png"
         image.write_bytes(b"do not decode")
         count = 3000
-        with (latest / "index.jsonl").open("w") as stream:
-            for i in range(count):
-                stream.write(json.dumps({"source_run": str(parent), "image_path": str(image),
-                                         "rgb": f"samples/missing-{i}.png",
-                                         "file_name": "facade.png"}) + "\n")
+        self.json(latest / "manifest.json", {"images": [
+            {"source_run": str(parent), "image_path": str(image),
+             "rgb": f"samples/missing-{i}.png", "file_name": "facade.png"}
+            for i in range(count)]})
         report = self.plan(latest, scan_roots=[Path(self.temp.name)])
         self.assertLess(len(json.dumps(report).encode()), 30_000)
         self.assertEqual(self.decisions(report)["parent"], "retained")
@@ -270,19 +269,20 @@ class CleanupAuditTests(unittest.TestCase):
         self.assertEqual(self.decisions(report)["current-cleanup"], "retained")
         self.assertNotIn(str(previous / "cleanup.json"), report["metadata_sha256"])
 
-    def test_jsonl_total_size_can_exceed_bound_without_loading_whole_file(self):
+    def test_artifact_index_is_not_parsed_even_when_larger_than_metadata_bound(self):
         latest = self.run_dir("latest")
         index = latest / "index.jsonl"
         index.write_text((json.dumps({"image_id": 1, "file_name": "photo.png"}) + "\n") * 100)
         with patch.dict(AUDIT["cleanup_plan"].__globals__, {"MAX_METADATA_BYTES": 256}):
             report = self.plan(latest)
         self.assertTrue(report["dependency_scan_complete"])
-        self.assertIn(str(index), report["metadata_sha256"])
+        self.assertNotIn(str(index), report["metadata_sha256"])
+        self.assertEqual(report["artifact_payload_files_not_parsed"], 1)
 
     def test_parse_failure_blocks_deletion_recommendations_and_diagnostics_are_capped(self):
         latest = self.run_dir("latest")
         unused = self.run_dir("unused")
-        self.json(latest / "too-large.json", {"notes": "x" * 500})
+        self.json(latest / "large_config.json", {"notes": "x" * 500})
         with patch.dict(AUDIT["cleanup_plan"].__globals__, {"MAX_METADATA_BYTES": 256}):
             report = self.plan(latest)
         self.assertFalse(report["dependency_scan_complete"])
@@ -322,8 +322,8 @@ class CleanupAuditTests(unittest.TestCase):
     def test_parse_error_survives_saturation_by_ordinary_reference_diagnostics(self):
         latest = self.run_dir("latest")
         for index in range(85):
-            self.json(latest / f"reference-{index:03d}.json", {"weights": f"missing-{index}.pth"})
-        broken = latest / "zzz-broken.json"
+            self.json(latest / f"reference-{index:03d}_config.json", {"weights": f"missing-{index}.pth"})
+        broken = latest / "zzz-broken_config.json"
         broken.write_text("{invalid")
         report = self.plan(latest)
         self.assertEqual(report["unresolved_statistics"]["reported_groups"], 80)
@@ -334,8 +334,66 @@ class CleanupAuditTests(unittest.TestCase):
         out.mkdir()
         with redirect_stdout(io.StringIO()) as output:
             AUDIT["write_cleanup_report"](out, report)
-        self.assertIn("zzz-broken.json", output.getvalue())
+        self.assertIn("zzz-broken_config.json", output.getvalue())
         self.assertIn("metadata_not_parsed:", output.getvalue())
+
+    def test_console_reference_sample_is_bounded_and_labels_occurrences(self):
+        latest = self.run_dir("latest")
+        for index in range(8):
+            self.json(latest / f"references-{index}_config.json", {"weights": ["missing.pth"] * (index + 1)})
+        report = self.plan(latest)
+        out = Path(self.temp.name) / "sampled-audit"
+        out.mkdir()
+        with redirect_stdout(io.StringIO()) as output:
+            AUDIT["write_cleanup_report"](out, report)
+        sample = [line for line in output.getvalue().splitlines() if line.startswith("  count=")]
+        self.assertEqual(len(sample), 5)
+        self.assertIn("count=8", sample[0])
+        self.assertIn("key=weights", sample[0])
+        self.assertIn("value=missing.pth", sample[0])
+        self.assertIn("not unique missing files", output.getvalue())
+
+    def test_annotation_payloads_not_opened_while_input_owners_are_retained(self):
+        dataset = self.run_dir("dataset")
+        prior_annotations = self.run_dir("prior-annotations")
+        prior_checkpoint = self.run_dir("prior-checkpoint")
+        unrelated = self.run_dir("unrelated")
+        annotations = prior_annotations / "preprocessed" / "annotations.json"
+        annotations.parent.mkdir()
+        annotations.write_text("not parsed as JSON" * 100)
+        checkpoint = prior_checkpoint / "best.pth"
+        checkpoint.write_bytes(b"never load a checkpoint")
+        self.json(dataset / "prepared" / "manifest.json", {"source": {"coco_json": str(annotations)}})
+        model = self.run_dir("model", dataset_run=str(dataset), checkpoint=str(checkpoint))
+        original = Path.open
+        def guarded(path, *args, **kwargs):
+            if path == annotations or path == checkpoint:
+                raise AssertionError("Only paths, never annotation/checkpoint contents, may be inspected")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", guarded), patch.dict(
+                AUDIT["cleanup_plan"].__globals__, {"MAX_METADATA_BYTES": 1024}):
+            report = self.plan(model)
+        self.assertTrue(report["dependency_scan_complete"])
+        self.assertEqual(self.decisions(report)["prior-annotations"], "retained")
+        self.assertEqual(self.decisions(report)["prior-checkpoint"], "retained")
+        self.assertEqual(self.decisions(report)["dataset"], "retained")
+        self.assertEqual(self.decisions(report)["unrelated"], "review_candidate")
+        self.assertEqual(report["scan_error_statistics"]["occurrences"], 0)
+        self.assertNotIn(str(annotations), report["metadata_sha256"])
+        self.assertEqual(report["artifact_payload_files_not_parsed"], 1)
+
+    def test_output_hash_tables_and_pixel_results_are_not_lineage(self):
+        latest = self.run_dir("latest")
+        unrelated = self.run_dir("unrelated")
+        self.json(latest / "run.json", {"status": "completed", "config": {},
+                                        "artifact_sha256": {"old/missing.png": "a" * 64}})
+        self.json(latest / "metrics.json", {"example_path": str(unrelated)})
+        (latest / "index.jsonl").write_text("incomplete or malformed generated index")
+        report = self.plan(latest)
+        self.assertTrue(report["dependency_scan_complete"])
+        self.assertEqual(report["unresolved_statistics"]["occurrences"], 0)
+        self.assertEqual(self.decisions(report)["unrelated"], "review_candidate")
+        self.assertEqual(report["artifact_payload_files_not_parsed"], 2)
 
     def test_cli_cleanup_does_not_probe_environment_or_load_models(self):
         latest = self.run_dir("latest")

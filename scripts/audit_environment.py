@@ -133,11 +133,21 @@ PATH_KEY_SUFFIXES = ("_path", "_paths", "_root", "_roots", "_run", "_runs", "_di
                      "_file", "_files", "_checkpoint", "_json", "_csv", "_mask", "_rgb")
 NAME_KEYS = {"file_name", "resolved_file_name", "old_name", "new_name"}
 TEXT_KEYS = {"notes", "metadata_notes", "note", "description", "scope", "message", "error"}
+LINEAGE_METADATA_NAMES = {"run.json", "config.json", "summary.json", "dataset.json", "manifest.json",
+                          "semantic_manifest.json", "lineage.json", "provenance.json", "analysis_contract.json",
+                          "extension_guard.json", "split_transition.json"}
+
+
+def _lineage_metadata(path):
+    name = path.name.lower()
+    return name in LINEAGE_METADATA_NAMES or name.endswith(("_config.json", "_manifest.json", "_run.json"))
 
 
 def _path_strings(value, key=""):
     """Extract path fields, not image aliases, prose, metric names or COCO RLE."""
-    if key in {"segmentation", "counts"}:
+    # finish_record's artifact_sha256 enumerates this run's outputs, not inputs.
+    # Input/parent hashes and source provenance remain eligible dependencies.
+    if key in {"segmentation", "counts", "artifact_sha256"}:
         return
     if isinstance(value, dict):
         for name, child in value.items():
@@ -275,6 +285,7 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
     external_references, warnings = _Evidence(), []
     scan_errors, source_snapshot_missing = _Evidence(32), _Evidence(8)
     metadata_digest, metadata_files_scanned = hashlib.sha256(), 0
+    artifact_payload_files_not_parsed = 0
     scan_incomplete = False
     external = {}
     for raw in scan_roots:
@@ -374,10 +385,11 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
                 external_reference(ref)
 
     def inspect_metadata(source, path):
-        nonlocal metadata_files_scanned, scan_incomplete
+        nonlocal metadata_files_scanned, scan_incomplete, artifact_payload_files_not_parsed
         # Audit output describes every inspected file: ingesting it would turn the
         # previous inventory into fake dependencies and recursively grow the report.
-        if path.name == "cleanup.json":
+        if path.name == "cleanup.json" or (source != "configs" and not _lineage_metadata(path)):
+            artifact_payload_files_not_parsed += 1
             return
         try:
             digest = hashlib.sha256()
@@ -537,9 +549,13 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output
             "missing_source_snapshot_statistics": source_snapshot_missing.statistics(),
             "dependency_scan_complete": not scan_incomplete,
             "metadata_sha256": metadata_hashes, "metadata_files_scanned": metadata_files_scanned,
+            "artifact_payload_files_not_parsed": artifact_payload_files_not_parsed,
             "metadata_hashes_omitted": metadata_files_scanned - len(metadata_hashes),
             "metadata_inventory_sha256": metadata_digest.hexdigest(), "warnings": warnings,
-            "scope": "Dependency closure from metadata/configs and best-effort live process paths. "
+            "scope": "Run-folder cleanup only: dependency closure from run/config/dataset/manifest/summary "
+                     "records and best-effort live process paths. COCO annotations, crop indexes, prediction/metric "
+                     "payloads and output checksum maps are intentionally not inspected; input file paths still "
+                     "retain their owning runs. "
                      "Candidates require review; no assertion that unreferenced scientific evidence is disposable. "
                      "External sources, weights and scripts are never deletion candidates; symlinks are not traversed. "
                      "Evidence is grouped and sampled; dependency edges are not sampled. "
@@ -569,9 +585,16 @@ def write_cleanup_report(out, report):
               f"shown diagnostic groups: {report['unresolved_statistics']['reported_groups']} "
               f"(at most 2 examples/group; omitted occurrences: {report['unresolved_statistics']['omitted_occurrences']})",
               f"Dependency scan complete: {report['dependency_scan_complete']}; "
-              f"metadata files scanned: {report['metadata_files_scanned']}",
+              f"lineage/config files scanned: {report['metadata_files_scanned']}; "
+              f"artifact payload files intentionally not parsed: {report['artifact_payload_files_not_parsed']}",
               f"External items: {len(report['external_inventory'])}; unverified items are not deletion candidates.",
               report["scope"], *report["warnings"], f"Report: {out / 'cleanup.json'}"]
+    if report["unresolved"]:
+        lines.append("Sample of stored unresolved groups (up to 5; counts are occurrences, not unique missing files):")
+        for row in sorted(report["unresolved"], key=lambda item: item["count"], reverse=True)[:5]:
+            value = str(row.get("value", ""))[:160]
+            lines.append(f"  count={row['count']} source={row['source']} key={row.get('key', '')} "
+                         f"error={row['error']} value={value}")
     if report["scan_errors"]:
         lines.append("Dependency scan errors (first 8; details in cleanup.json scan_errors):")
         for row in report["scan_errors"][:8]:
