@@ -462,5 +462,34 @@
     "view_id": "Pushkinskaya_9",
     "building_id": "Pushkinskaya_9",
     "notes": "Owner-confirmed singleton; Pushkinskaya 6 and 7 are distinct, 2026-10-03"
+  },
+  {
+    "view_id": "Kamennoostrovskii_57",
+    "building_id": "Kamennoostrovskii_57",
+    "notes": "Owner-requested named-series inclusion, 2026-10-11; years from filename suffixes"
+  },
+  {
+    "view_id": "Sablinskaya_16",
+    "building_id": "Sablinskaya_16",
+    "notes": "Owner-requested named-series inclusion, 2026-10-11; years from filename suffixes"
+  },
+  {
+    "file_name": "Sablinskaya_16_2026_v1.jpg",
+    "view_id": "Sablinskaya_16",
+    "building_id": "Sablinskaya_16",
+    "year": 2026,
+    "notes": "Owner-requested named-series inclusion, 2026-10-11; both 2026 observations retained in the series, acquisition source/order unspecified"
+  },
+  {
+    "file_name": "Sablinskaya_16_2026_v2.jpg",
+    "view_id": "Sablinskaya_16",
+    "building_id": "Sablinskaya_16",
+    "year": 2026,
+    "notes": "Owner-requested named-series inclusion, 2026-10-11; both 2026 observations retained in the series, acquisition source/order unspecified"
+  },
+  {
+    "view_id": "Kamenoostrovskii_prospect_25_2",
+    "building_id": "Kamenoostrovskii_prospect_25_2",
+    "notes": "Owner-requested named-series inclusion, 2026-10-11; years from filename suffixes"
   }
 ]

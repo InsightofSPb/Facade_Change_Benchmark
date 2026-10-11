@@ -160,6 +160,13 @@ def _split_series_buildings(images, weights, fractions, fixed, seed, split_polic
         desired_buildings = {name: (max(7, min(10, round(fractions[name] * len(weights))))
                                    if name == "test" else max(2, round(fractions[name] * len(weights))))
                              for name in holdouts}
+    elif split_policy == "facades-v4":
+        desired_buildings = {name: round(fractions[name] * len(weights)) for name in holdouts}
+        minimum_buildings = {name: min(2, desired_buildings[name]) for name in holdouts}
+        desired_buildings = {"train": len(weights) - sum(desired_buildings.values()),
+                             "val": desired_buildings.get("val", 0), "test": desired_buildings.get("test", 0)}
+    history_goals = {name: min(history_goal, desired_buildings[name]) if split_policy == "facades-v4"
+                     else history_goal for name in holdouts}
 
     def score(candidate):
         medium_counts = Counter(candidate[group] for group in medium)
@@ -170,9 +177,16 @@ def _split_series_buildings(images, weights, fractions, fixed, seed, split_polic
         # Coverage precedes crop fractions. Under shortage, squared deficits spread
         # scarce buildings across holdouts; no non-medium building is substituted.
         coverage = sum(max(0, minimum_buildings[name] - medium_counts[name]) ** 2 for name in holdouts)
-        result = (coverage, sum(max(0, history_goal - history_counts[name]) ** 2 for name in holdouts),
+        result = (coverage, sum(max(0, history_goals[name] - history_counts[name]) ** 2 for name in holdouts),
                   max(0, 1 - medium_counts["train"]))
-        if desired_buildings is not None:
+        if split_policy == "facades-v4":
+            # Building-count proportions take priority over preferred history
+            # length. Preserve one medium TRAIN building and never move a fresh
+            # short/long/incomplete series into a holdout to fill a deficit.
+            result = (max(0, 1 - medium_counts["train"]),
+                      sum((counts[name] - desired_buildings[name]) ** 2 for name in holdouts),
+                      coverage, result[1])
+        elif desired_buildings is not None:
             excess = max(0, counts["test"] - 10) if "test" in holdouts else 0
             result = (excess,) + result + (sum((counts[name] - desired_buildings[name]) ** 2 for name in holdouts),)
         return result + (sum((counts[name] - targets[name]) ** 2 for name in active),)
@@ -205,8 +219,8 @@ def _split_series_buildings(images, weights, fractions, fixed, seed, split_polic
         if medium_counts[name] < minimum_buildings[name]:
             issues.append(f"{name}: only {medium_counts[name]} medium-series buildings; "
                           f"requested at least {minimum_buildings[name]}")
-        if history_counts[name] < history_goal:
-            issues.append(f"{name}: only {history_counts[name]} buildings with 5–7 reviewed years; requested {history_goal}")
+        if history_counts[name] < history_goals[name]:
+            issues.append(f"{name}: only {history_counts[name]} buildings with 5–7 reviewed years; requested {history_goals[name]}")
     if not medium_counts["train"]:
         issues.append("train: no medium-series building remains")
     exceptions = sorted(group for group in weights.keys() & fixed.keys()
@@ -228,6 +242,7 @@ def _split_series_buildings(images, weights, fractions, fixed, seed, split_polic
         "desired_building_counts": desired_buildings,
         "test_building_range": [7, 10] if split_policy == "facades-v3" else None,
         "preferred_5_to_7_year_buildings_per_holdout": history_goal,
+        "preferred_5_to_7_year_buildings_by_holdout": history_goals,
         "medium_buildings_by_split": {name: medium_counts[name] for name in fractions},
         "history_buildings_by_split": {name: history_counts[name] for name in fractions},
         "historical_policy_exceptions": exceptions,
@@ -248,15 +263,18 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
     Fractions are explicit arguments (the two-path v2 entrypoint uses .08/.12).
     ``facades-v3`` instead balances physical-building counts, aiming for 7–10 TEST
     buildings and at least two VAL buildings before the soft requested fractions.
+    ``facades-v4`` rounds the requested VAL/TEST building fractions with no TEST
+    cap and keeps remaining buildings in TRAIN, subject to frozen ownership and
+    series eligibility. Optional history coverage cannot override count targets.
     """
     if balance_unit not in {"images", "crops", "buildings"}:
         raise ValueError("balance_unit must be images, crops or buildings")
-    if split_policy not in {"legacy", "series-v2", "facades-v3"}:
-        raise ValueError("split_policy must be legacy, series-v2 or facades-v3")
+    if split_policy not in {"legacy", "series-v2", "facades-v3", "facades-v4"}:
+        raise ValueError("split_policy must be legacy, series-v2, facades-v3 or facades-v4")
     if split_policy == "series-v2" and balance_unit != "crops":
         raise ValueError("series-v2 requires balance_unit=crops")
-    if split_policy == "facades-v3" and balance_unit != "buildings":
-        raise ValueError("facades-v3 requires balance_unit=buildings")
+    if split_policy in {"facades-v3", "facades-v4"} and balance_unit != "buildings":
+        raise ValueError(f"{split_policy} requires balance_unit=buildings")
     if not 0 <= val_fraction < 1 or not 0 <= test_fraction < 1 or val_fraction + test_fraction >= 1:
         raise ValueError("Split fractions must be nonnegative and leave a positive training fraction")
     crop_geometry = _crop_geometry(crop_size, crop_stride)
@@ -382,6 +400,11 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
     if split_policy == "facades-v3":
         balance["note"] += (" Physical-building counts determine this split. The 7–10 TEST-building aim and "
                             "series coverage precede requested fractions; image and crop fractions are diagnostics only.")
+    elif split_policy == "facades-v4":
+        balance["note"] += (" Physical-building counts determine this split. VAL/TEST targets are rounded "
+                            "requested building fractions, with no TEST-count cap; remaining buildings are TRAIN. "
+                            "Series eligibility and frozen owners remain mandatory; image and crop fractions "
+                            "are diagnostics only.")
     return assignments, balance
 
 
@@ -400,7 +423,8 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
     ``series-v2`` additionally permits semantic-only observations without a view
     or year, requires crop balancing, and reports medium-series holdout coverage.
     Such observations cannot form temporal pairs. Legacy eligibility is unchanged.
-    ``facades-v3`` uses the same series eligibility but targets building counts.
+    ``facades-v3`` and ``facades-v4`` use the same series eligibility but target
+    building counts; v4 rounds requested fractions without the v3 TEST-count cap.
     ``first-anchor`` uses one earliest-year photo per view, breaking ties by
     normalized basename and SHA-256 without dropping other original observations.
     No crop or temporal ground truth is implied.
@@ -409,12 +433,12 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
         raise ValueError("split_mode must be dev or reviewed")
     if balance_unit not in {"images", "crops", "buildings"}:
         raise ValueError("balance_unit must be images, crops or buildings")
-    if split_policy not in {"legacy", "series-v2", "facades-v3"}:
-        raise ValueError("split_policy must be legacy, series-v2 or facades-v3")
+    if split_policy not in {"legacy", "series-v2", "facades-v3", "facades-v4"}:
+        raise ValueError("split_policy must be legacy, series-v2, facades-v3 or facades-v4")
     if split_policy == "series-v2" and (split_mode != "reviewed" or balance_unit != "crops"):
         raise ValueError("series-v2 requires split_mode=reviewed and balance_unit=crops")
-    if split_policy == "facades-v3" and (split_mode != "reviewed" or balance_unit != "buildings"):
-        raise ValueError("facades-v3 requires split_mode=reviewed and balance_unit=buildings")
+    if split_policy in {"facades-v3", "facades-v4"} and (split_mode != "reviewed" or balance_unit != "buildings"):
+        raise ValueError(f"{split_policy} requires split_mode=reviewed and balance_unit=buildings")
     crop_geometry = _crop_geometry(crop_size, crop_stride)
     if previous_split and split_mode != "reviewed":
         raise ValueError("previous_split requires split_mode=reviewed; dev cannot extend a gold split")

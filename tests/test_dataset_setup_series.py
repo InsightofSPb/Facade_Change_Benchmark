@@ -317,7 +317,49 @@ class SeriesDatasetSetupTests(unittest.TestCase):
             self.assertIsNone(extra[0]["building_id"])
         self.assertTrue(all(sha256(path) == digest for path, digest in v3_hashes.items()))
 
-    def test_cli_defaults_to_facades_v3_with_unknown_images_in_semantic_train(self):
+    def test_v3_to_v4_migration_uses_new_fractions_and_then_freezes_owners(self):
+        coco = self.dataset(medium_count=20, unknown=True)
+        self.prepare(coco, "old_v3", split_policy="facades-v3")
+        old_path = self.runs / "old_v3/prepared/split.json"
+        old_hashes = {path: sha256(path) for path in (self.runs / "old_v3").rglob("*") if path.is_file()}
+        with patch("facade_change.data.load_rgb", side_effect=AssertionError("reuse verified RGB")):
+            migrated = self.prepare(coco, "new_v4", split_policy="facades-v4")
+        new_path = self.runs / "new_v4/prepared/split.json"
+        split = read_json(new_path)
+        self.assertEqual(migrated["status"], "completed_exploratory_train_only")
+        self.assertTrue(migrated["new_split_version"])
+        self.assertEqual(migrated["previous_split"], str(old_path))
+        self.assertAlmostEqual(split["fractions"]["train"], .70)
+        self.assertEqual((split["fractions"]["val"], split["fractions"]["test"]), (.10, .20))
+        owners = split["building_assignments"]
+        self.assertEqual([list(owners.values()).count(name) for name in ("train", "val", "test")], [16, 2, 4])
+        report = read_json(self.runs / "new_v4/leakage_check.json")
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["violations"], [])
+        self.assertTrue(report["known_identity_disjointness_verified"])
+        self.assertFalse(report["physical_disjointness_verified"])
+        self.assertEqual(len(report["unverified_train_images"]), 1)
+        self.assertTrue(all(sha256(path) == digest for path, digest in old_hashes.items()))
+        extended = self.prepare(coco, "extend_v4", split_policy="facades-v4")
+        final = read_json(self.runs / "extend_v4/prepared/split.json")
+        self.assertFalse(extended["new_split_version"])
+        self.assertEqual(extended["previous_split"], str(new_path))
+        self.assertEqual(final["building_assignments"], owners)
+        self.assertEqual(final["gold_cohort"], split["gold_cohort"])
+
+    def test_leakage_failure_saves_report_and_prevents_semantic_index_export(self):
+        coco = self.dataset(medium_count=12, unknown=True)
+        report = {"status": "failed", "violations": [{"type": "cross_split_identity"}]}
+        with patch("facade_change.dataset_setup.audit_semantic_leakage", return_value=report):
+            with self.assertRaisesRegex(ValueError, "Split leakage check failed"):
+                self.prepare(coco, "leaking", split_policy="facades-v4")
+        out = self.runs / "leaking"
+        self.assertEqual(read_json(out / "leakage_check.json"), report)
+        self.assertEqual(read_json(out / "run.json")["status"], "failed")
+        self.assertFalse((out / "dataset.json").exists())
+        self.assertFalse((out / "semantic_crops.jsonl").exists())
+
+    def test_cli_defaults_to_facades_v4_with_unknown_images_in_semantic_train(self):
         coco = self.dataset(medium_count=12, undated=True, unknown=True)
         script = Path(__file__).resolve().parents[1] / "scripts/prepare_dataset.py"
         out = self.runs / "cli"
@@ -328,9 +370,10 @@ class SeriesDatasetSetupTests(unittest.TestCase):
                                  capture_output=True, text=True, timeout=30)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         summary = read_json(out / "summary.json")
-        self.assertEqual(summary["split_policy"], "facades-v3")
+        self.assertEqual(summary["split_policy"], "facades-v4")
         self.assertEqual(summary["auxiliary_train_image_count"], 1)
-        self.assertEqual(read_json(out / "dataset.json")["split_policy"], "facades-v3")
+        self.assertEqual(read_json(out / "dataset.json")["split_policy"], "facades-v4")
+        self.assertEqual(read_json(out / "leakage_check.json")["status"], "passed")
         self.assertFalse(read_json(out / "dataset.json")["physical_disjointness_verified"])
         unknown = next(row for row in self.crops("cli") if row["image_id"] == self.unknown["id"])
         self.assertEqual(unknown["split"], "train")

@@ -10,7 +10,7 @@ from pathlib import Path
 from .data import DEFAULT_METADATA_RULES, build_manifest, normalized_name, preprocess_coco, read_rename_maps
 from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
 from .preparation import prepare_dataset, semantic_crop_boxes, semantic_crop_count
-from .semantic_training import include_auxiliary_training
+from .semantic_training import audit_semantic_leakage, include_auxiliary_training
 
 
 def _names(images):
@@ -219,7 +219,7 @@ def _split_transition(out, previous_path, previous, prepared):
 
 def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous_split=None,
                        metadata_rules=DEFAULT_METADATA_RULES, rename_maps=None,
-                       crop_size=512, crop_stride=448, metadata_csv=None, split_policy="facades-v3",
+                       crop_size=512, crop_stride=448, metadata_csv=None, split_policy="facades-v4",
                        include_unreviewed_train=None):
     """Audit current COCO, extend reviewed owners and index native semantic crops.
 
@@ -227,11 +227,11 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
     Extra files outside COCO are never added to the dataset.
     """
     coco_path, image_root = Path(coco_path).expanduser().resolve(), Path(image_root).expanduser().resolve()
-    if split_policy not in {"legacy", "series-v2", "facades-v3"}:
-        raise ValueError("split_policy must be legacy, series-v2 or facades-v3")
+    if split_policy not in {"legacy", "series-v2", "facades-v3", "facades-v4"}:
+        raise ValueError("split_policy must be legacy, series-v2, facades-v3 or facades-v4")
     if include_unreviewed_train is None:
-        include_unreviewed_train = split_policy == "facades-v3"
-    balance_unit = "buildings" if split_policy == "facades-v3" else "crops"
+        include_unreviewed_train = split_policy in {"facades-v3", "facades-v4"}
+    balance_unit = "buildings" if split_policy in {"facades-v3", "facades-v4"} else "crops"
     if not coco_path.is_file() or not image_root.is_dir():
         raise ValueError("COCO must be an existing file and images must be an existing directory")
     semantic_crop_count(1, 1, crop_size, crop_stride)  # Validate geometry before creating a run.
@@ -258,7 +258,9 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
     try:
         previous_path = (Path(previous_split).expanduser().resolve() if previous_split else
                          discover_previous_split(runs_root, image_names, split_policy))
-        if previous_path is None and split_policy == "facades-v3":
+        if previous_path is None and split_policy == "facades-v4":
+            previous_path = discover_previous_split(runs_root, image_names, "facades-v3")
+        if previous_path is None and split_policy in {"facades-v3", "facades-v4"}:
             previous_path = discover_previous_split(runs_root, image_names, "series-v2")
         if previous_path is None and split_policy != "legacy":
             previous_path = discover_previous_split(runs_root, image_names, "legacy")
@@ -328,7 +330,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                 print(f"{key}: {values}", flush=True)
         if not split_error:
             fractions = inherited["fractions"] if inherited else (
-                {"train": .80, "val": .08, "test": .12} if split_policy != "legacy" else
+                {"train": .80, "val": .08, "test": .12} if split_policy in {"series-v2", "facades-v3"} else
                 {"train": .70, "val": .10, "test": .20})
             reviewed = [row for row in images if row["image_status"] == "ready" and
                         row.get("metadata_status") == "reviewed" and row.get("building_id") and row.get("sha256")
@@ -344,8 +346,13 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                                            val_fraction=fractions["val"], test_fraction=fractions["test"],
                                            balance_unit=balance_unit, crop_size=crop_size, crop_stride=crop_stride,
                                            split_policy=split_policy)
-                semantic, auxiliary = include_auxiliary_training(
-                    prepared, read_json(out / "prepared/split.json"), include_unreviewed_train)
+                split = read_json(out / "prepared/split.json")
+                semantic, auxiliary = include_auxiliary_training(prepared, split, include_unreviewed_train)
+                leakage = audit_semantic_leakage(semantic, split)
+                write_json(out / "leakage_check.json", leakage)
+                if leakage["status"] != "passed":
+                    raise ValueError("Split leakage check failed; see leakage_check.json")
+                semantic["leakage_check"] = leakage
                 images = semantic["images"]
                 _image_reports(out, images)
                 counts = _crop_index(out, images, crop_size, crop_stride)
@@ -360,14 +367,14 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                                auxiliary_train_crop_count=extra_crops,
                                physical_disjointness_verified=auxiliary["physical_disjointness_verified"],
                                semantic_image_splits=dict(Counter(row["split"] for row in images)),
-                               auxiliary_training=auxiliary)
+                               auxiliary_training=auxiliary, leakage_check=leakage)
                 semantic_path = out / "semantic_manifest.json"
                 semantic["summary"]["reviewed_eligible_crop_count"] = balance["eligible_crop_count"]
                 semantic["summary"]["eligible_crop_count"] = sum(counts.values())
                 write_json(semantic_path, semantic)
                 write_json(out / "auxiliary_training.json", auxiliary)
                 for row in auxiliary["included_images"]:
-                    print(f"Семантический TRAIN: {row['file_name']} — адрес не установлен; временные пары исключены", flush=True)
+                    print(f"Семантический TRAIN: {row['file_name']} — принадлежность зданию не подтверждена; временные пары исключены", flush=True)
                 for row in auxiliary["blocked_images"] + auxiliary["duplicate_images"]:
                     print(f"Не добавлено в TRAIN: {row['file_name']} — {row['reason']}", flush=True)
                 series = balance.get("series_constraints", {}).get("buildings", {})
@@ -407,6 +414,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                     "reviewed_manifest": str(out / "prepared/manifest.json"),
                     "physical_disjointness_verified": auxiliary["physical_disjointness_verified"],
                     "auxiliary_training": str(out / "auxiliary_training.json"),
+                    "leakage_check": str(out / "leakage_check.json"),
                     "evaluation_scope": ("exploratory_until_training_building_membership_is_resolved"
                                          if auxiliary["included_images"] else "reviewed_building_split"),
                     "crops": str(out / "semantic_crops.jsonl"), "crop_size": crop_size, "stride": crop_stride,
@@ -427,9 +435,12 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                  f"Предыдущий split: {previous_path}", f"Кропы: {crop_size}×{crop_size}, шаг {crop_stride}"]
         lines.append("Подтверждённые здания (доли кропов справочные):")
         for name, stats in summary.get("balance", {}).get("partitions", {}).items():
-            lines.append(f"{name}: {stats['building_count']} фасадов; {stats['image_count']} фото "
+            lines.append(f"{name}: {stats['building_count']} фасадов ({stats['building_fraction']:.2%} зданий); {stats['image_count']} фото "
                          f"({stats['image_fraction']:.2%}); {stats['crop_count']} кропов "
                          f"({stats['crop_fraction']:.2%})")
+        if summary.get("leakage_check"):
+            lines.append("Пересечения известных зданий / видов / SHA-256 между TRAIN, VAL и TEST: нет. "
+                         "Принадлежность концов временных пар проверена; см. leakage_check.json.")
         if summary.get("crop_count"):
             lines.append(f"Дополнительно в семантическом TRAIN без установленного адреса: "
                          f"{summary['auxiliary_train_image_count']} фото; {summary['auxiliary_train_crop_count']} кропов.")
