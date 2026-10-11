@@ -19,4 +19,4 @@ msdzip = ["torch>=1.12.1", "tqdm>=4.66,<5"]
 facade = "facade_change.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["facade_change*"]
+include = ["facade_change*", "data_analysis*"]
