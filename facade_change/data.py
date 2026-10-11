@@ -5,7 +5,7 @@ import csv
 import os
 import re
 from collections import Counter, defaultdict
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .io import load_rgb, new_directory, read_json, run_record, sha256, finish_record, write_json
 
@@ -75,16 +75,93 @@ def filename_metadata(name: str) -> dict:
             "metadata_source": "filename_suffix" if match else None}
 
 
+def _rename_name(value, path, line, field):
+    """CSV names are relative image names, never destinations outside roots."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Rename map {path}:{line} needs a nonempty {field}")
+    name = value.strip().replace("\\", "/")
+    if ("\x00" in name or Path(name).is_absolute() or PureWindowsPath(name).drive
+            or any(part in {"", ".", ".."} for part in name.split("/"))
+            or Path(name).suffix.lower() not in EXTENSIONS):
+        raise ValueError(f"Rename map {path}:{line} has an unsafe image name: {value!r}")
+    return name
+
+
+def read_rename_maps(paths):
+    """Validate explicit CSVs; return bidirectional chains, final names, hashes."""
+    if paths is None:
+        paths = []
+    if not isinstance(paths, (list, tuple)):
+        raise ValueError("rename_maps must be a list of CSV paths")
+    forward, reverse, sources = {}, {}, []
+    for supplied in paths:
+        path = Path(supplied).expanduser().resolve()
+        source_hash = sha256(path)
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if (not reader.fieldnames or len(set(reader.fieldnames)) != len(reader.fieldnames)
+                    or not {"old_name", "new_name"}.issubset(reader.fieldnames)):
+                raise ValueError(f"Rename map {path} needs old_name,new_name columns")
+            for line, row in enumerate(reader, 2):
+                old = _rename_name(row.get("old_name"), path, line, "old_name")
+                new = _rename_name(row.get("new_name"), path, line, "new_name")
+                if old in forward and forward[old] != new:
+                    raise ValueError(f"Conflicting rename map row for {old}")
+                if new in reverse and reverse[new] != old:
+                    raise ValueError(f"Conflicting rename map destination: {new}")
+                forward[old], reverse[new] = new, old
+        if sha256(path) != source_hash:
+            raise ValueError(f"Rename map changed while reading: {path}")
+        sources.append({"path": str(path), "sha256": source_hash})
+    identities = {old for old, new in forward.items() if old == new}
+    forward = {old: new for old, new in forward.items() if old != new}
+    reverse = {new: old for old, new in forward.items()}
+    checked = set()
+    for start in sorted(forward):
+        visited, node = set(), start
+        while node in forward and node not in checked:
+            if node in visited:
+                raise ValueError(f"Rename map cycle containing {node}")
+            visited.add(node)
+            node = forward[node]
+        checked.update(visited)
+    groups = {name: (name,) for name in identities}
+    canonical = {name: name for name in identities}
+    for start in sorted(set(forward) - set(reverse)):
+        chain, node = [start], start
+        while node in forward:
+            node = forward[node]
+            chain.append(node)
+        group = tuple(chain)
+        for name in chain:
+            groups[name], canonical[name] = group, node
+    return groups, canonical, sources
+
+
+def _normalized_relative_name(name):
+    path = Path(name)
+    return path.with_name(normalized_name(path.name)).as_posix()
+
+
 class ImageResolver:
     """Index only explicitly supplied roots. Ambiguous matches are errors."""
 
-    def __init__(self, roots):
+    def __init__(self, roots, rename_maps=None):
         self.roots = sorted({Path(root).expanduser().resolve() for root in roots})
         if not self.roots or any(not root.is_dir() for root in self.roots):
             raise ValueError("Every image_root must be an existing directory")
         self.exact = defaultdict(set)
         self.normalized = defaultdict(set)
         self.folded = defaultdict(set)
+        self.relative = defaultdict(set)
+        self.relative_normalized = defaultdict(set)
+        self.relative_folded = defaultdict(set)
+        self.rename_groups, self.rename_canonical, self.rename_map_sources = read_rename_maps(rename_maps)
+        self.rename_basenames = defaultdict(set)
+        self.rename_normalized = defaultdict(set)
+        for name, group in self.rename_groups.items():
+            self.rename_basenames[Path(name).name].add(group)
+            self.rename_normalized[normalized_name(Path(name).name)].add(group)
         for root in self.roots:
             for folder, dirs, files in os.walk(root, followlinks=False):
                 dirs[:] = sorted(d for d in dirs if not d.startswith("."))
@@ -95,9 +172,55 @@ class ImageResolver:
                     self.exact[name].add(path)
                     self.normalized[normalized_name(name)].add(path)
                     self.folded[normalized_name(name).casefold()].add(path)
+                    if root in path.parents:
+                        relative = path.relative_to(root).as_posix()
+                        self.relative[relative].add(path)
+                        self.relative_normalized[_normalized_relative_name(relative)].add(path)
+                        self.relative_folded[_normalized_relative_name(relative).casefold()].add(path)
 
     def contains(self, path: Path) -> bool:
         return any(path == root or root in path.parents for root in self.roots)
+
+    def _rename_matches(self, names):
+        names = {str(raw).replace("\\", "/") for raw in names}
+        stages = [{self.rename_groups[name] for name in names if name in self.rename_groups},
+                  set().union(*(self.rename_basenames[Path(name).name] for name in names)),
+                  set().union(*(self.rename_normalized[normalized_name(Path(name).name)] for name in names))]
+        for groups in stages:
+            if groups:
+                return set().union(*groups), len(groups) > 1
+        return set(), False
+
+    def canonical_name(self, name, resolved_path=None):
+        """Mapped final basename for metadata; COCO identity is kept separately."""
+        raw = str(name).replace("\\", "/")
+        if raw in self.rename_canonical:
+            return Path(self.rename_canonical[raw]).name
+        if resolved_path is not None:
+            candidates = {resolved_path.relative_to(root).as_posix() for root in self.roots
+                          if root in resolved_path.parents}
+            mapped = {self.rename_canonical[item] for item in candidates if item in self.rename_canonical}
+            if len(mapped) == 1:
+                return Path(next(iter(mapped))).name
+        aliases, ambiguous = self._rename_matches([raw])
+        if aliases and not ambiguous:
+            return Path(self.rename_canonical[next(iter(aliases))]).name
+        return Path(raw).name
+
+    def _alias_candidates(self, names, mode):
+        candidates = set()
+        for name in names:
+            qualified = len(Path(name).parts) > 1
+            if mode == "exact":
+                index, key = (self.relative, name) if qualified else (self.exact, name)
+            elif mode == "normalized":
+                index, key = ((self.relative_normalized, _normalized_relative_name(name)) if qualified
+                              else (self.normalized, normalized_name(name)))
+            else:
+                index, key = ((self.relative_folded, _normalized_relative_name(name).casefold()) if qualified
+                              else (self.folded, normalized_name(name).casefold()))
+            candidates.update(index[key])
+        return candidates
 
     def resolve(self, row: dict) -> tuple[Path | None, str, list[str]]:
         direct = set()
@@ -113,11 +236,19 @@ class ImageResolver:
                 resolved = item.resolve()
                 if self.contains(resolved) and resolved.is_file():
                     direct.add(resolved)
-        stages = [("explicit_path", direct),
-                  ("exact_basename", set().union(*(self.exact[n] for n in names))),
-                  ("stripped_prefix", set().union(*(self.normalized[normalized_name(n)] for n in names))),
-                  ("casefold", set().union(*(self.folded[normalized_name(n).casefold()] for n in names)))]
-        for rule, candidates in stages:
+        for rule, candidates in [("explicit_path", direct),
+                                 ("exact_basename", set().union(*(self.exact[n] for n in names)))]:
+            if len(candidates) > 1:
+                return None, "ambiguous_" + rule, sorted(str(p) for p in candidates)
+            if len(candidates) == 1:
+                return next(iter(candidates)), rule, []
+        aliases, ambiguous = self._rename_matches(row.get(key) for key in ("file_name", "path") if row.get(key))
+        mapped = self._alias_candidates(aliases, "exact")
+        if ambiguous:
+            return None, "ambiguous_rename_map", sorted(str(p) for p in mapped)
+        for rule, candidates in [("rename_map", mapped),
+                  ("stripped_prefix", self._alias_candidates(names | aliases, "normalized")),
+                  ("casefold", self._alias_candidates(names | aliases, "folded"))]:
             if len(candidates) > 1:
                 return None, "ambiguous_" + rule, sorted(str(p) for p in candidates)
             if len(candidates) == 1:
@@ -153,7 +284,7 @@ def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
     return result
 
 
-def read_filename_rules(path, images) -> dict:
+def read_filename_rules(path, images, resolver=None) -> dict:
     """Apply confirmed views, then filename exceptions, to current image IDs."""
     if path is None:
         return {}
@@ -162,7 +293,7 @@ def read_filename_rules(path, images) -> dict:
         raise ValueError("Metadata rules must be a JSON list")
     by_name, by_view = defaultdict(list), defaultdict(list)
     for row in images:
-        name = Path(row["file_name"]).name
+        name = Path(row.get("resolved_file_name") or row["file_name"]).name
         by_name[normalized_name(name)].append(row)
         candidate = filename_metadata(name)
         if candidate["view_id"]:
@@ -186,7 +317,8 @@ def read_filename_rules(path, images) -> dict:
         year = rule.get("year")
         if isinstance(year, bool) or not isinstance(year, int) or not 1800 <= year <= 2100:
             raise ValueError("Each metadata rule needs a valid integer year")
-        name = normalized_name(Path(rule["file_name"]).name)
+        name = normalized_name(resolver.canonical_name(rule["file_name"]) if resolver
+                               else Path(rule["file_name"]).name)
         if name in seen or len(by_name[name]) > 1:
             raise ValueError(f"Duplicate or ambiguous metadata rule: {name}")
         seen.add(name)
@@ -218,33 +350,48 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
         return str(p.resolve() if p.is_absolute() else (config_path.parent / p).resolve())
     coco_path = Path(absolute(config["coco_json"]))
     roots = [absolute(root) for root in config["image_roots"]]
+    rename_values = config.get("rename_maps", [])
+    if rename_values is None:
+        rename_values = []
+    if not isinstance(rename_values, list):
+        raise ValueError("rename_maps must be a list of CSV paths")
+    resolver = ImageResolver(roots, [absolute(path) for path in rename_values])
+    canonical_basenames = defaultdict(set)
+    for name in set(resolver.rename_canonical.values()):
+        canonical_basenames[normalized_name(Path(name).name)].add(name)
+    for name, identities in canonical_basenames.items():
+        if len(identities) > 1:
+            raise ValueError(f"Ambiguous canonical rename-map basename: {name}: {sorted(identities)}")
     coco_hash = sha256(coco_path)
     coco = read_json(coco_path)
     images = coco["images"]
     ids = {str(row["id"]) for row in images}
     if len(ids) != len(images):
         raise ValueError("Duplicate COCO image ids")
+    resolved = [resolver.resolve(image) for image in images]
+    metadata_images = [{**image, "resolved_file_name": resolver.canonical_name(image["file_name"], path)}
+                       for image, (path, _, _) in zip(images, resolved)]
     previous_path = Path(previous_manifest).expanduser().resolve() if previous_manifest else None
     previous_hash = sha256(previous_path) if previous_path else None
     previous_names = defaultdict(list)
     if previous_path:
         previous = read_json(previous_path)
         for row in previous["images"]:
-            name = normalized_name(Path(str(row.get("file_name") or "")).name)
+            name = normalized_name(resolver.canonical_name(row.get("resolved_file_name") or row.get("file_name") or ""))
             if name:
                 previous_names[name].append(row)
-    current_names = Counter(normalized_name(Path(image["file_name"]).name) for image in images)
+    current_names = Counter(normalized_name(image["resolved_file_name"]) for image in metadata_images)
     rules_value = config.get("metadata_rules", str(DEFAULT_METADATA_RULES))
     rules_path = Path(absolute(rules_value)) if rules_value else None
     rules_hash = sha256(rules_path) if rules_path else None
-    metadata = {**read_filename_rules(rules_path, images), **read_overrides(overrides, ids)}
-    resolver = ImageResolver(roots)
+    metadata = {**read_filename_rules(rules_path, metadata_images, resolver), **read_overrides(overrides, ids)}
     config = {"coco_json": str(coco_path), "image_roots": roots,
               "coco_sha256": coco_hash,
               "previous_manifest_path": str(previous_path) if previous_path else None,
               "previous_manifest_sha256": previous_hash,
               "metadata_rules_path": str(rules_path) if rules_path else None,
               "metadata_rules_sha256": rules_hash,
+              "rename_maps": resolver.rename_map_sources,
               "overrides_sha256": sha256(overrides) if overrides else None}
     out = new_directory(out)
     record = run_record("manifest", config)
@@ -252,16 +399,16 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
     try:
         rows = []
         reused_count = decoded_count = inherited_count = 0
-        for image in images:
+        for image, (path, rule, candidates) in zip(metadata_images, resolved):
             row = {"image_id": image["id"], "file_name": image["file_name"],
+                   "resolved_file_name": image["resolved_file_name"],
                    "coco_path": image.get("path"), "coco_width": image["width"],
                    "coco_height": image["height"], "split": "unassigned",
                    "inventory_validation": "not_resolved"}
-            row.update(filename_metadata(image["file_name"]))
-            name = normalized_name(Path(image["file_name"]).name)
+            row.update(filename_metadata(image["resolved_file_name"]))
+            name = normalized_name(image["resolved_file_name"])
             old_rows = previous_names.get(name, [])
             old = old_rows[0] if len(old_rows) == current_names[name] == 1 else None
-            path, rule, candidates = resolver.resolve(image)
             row.update(image_path=str(path) if path else None, resolution_rule=rule,
                        image_status="missing" if rule == "not_found" else "ambiguous")
             if candidates:
@@ -338,6 +485,9 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
             raise ValueError("Previous manifest changed during inspection")
         if rules_path and sha256(rules_path) != rules_hash:
             raise ValueError("Metadata rules changed during inspection")
+        for source in resolver.rename_map_sources:
+            if sha256(source["path"]) != source["sha256"]:
+                raise ValueError(f"Rename map changed during inspection: {source['path']}")
         status = "completed" if all(r["image_status"] == "ready" for r in rows) else "completed_with_issues"
         finish_record(out, record, status)
         return result

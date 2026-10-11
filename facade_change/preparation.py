@@ -59,10 +59,75 @@ def _write_csv(path, rows, fields):
         writer.writerows(rows)
 
 
+def _crop_geometry(crop_size, crop_stride):
+    if type(crop_size) is not int or crop_size <= 0:
+        raise ValueError("crop_size must be a positive integer")
+    if type(crop_stride) is not int or not 0 < crop_stride <= crop_size:
+        raise ValueError("crop_stride must be an integer in [1, crop_size]")
+    return {"crop_size": crop_size, "crop_stride": crop_stride,
+            "overlap": crop_size - crop_stride,
+            "origin_policy": "regular stride plus final edge-anchored origin",
+            "small_image_policy": "partial crop padded to crop_size; padding is ignored",
+            "scope": "single-observation semantic crops, not aligned temporal pairs"}
+
+
+def _crop_dimensions(width, height):
+    if any(type(value) is not int or value <= 0 for value in (width, height)):
+        raise ValueError("Semantic crop dimensions must be positive integers")
+
+
+def _crop_origins(length, crop_size, crop_stride):
+    # Same edge-anchored grid as derived._starts, without importing RGB tools.
+    last = max(0, length - crop_size)
+    yield from range(0, last + 1, crop_stride)
+    if last % crop_stride:
+        yield last
+
+
+def semantic_crop_boxes(width, height, crop_size=512, crop_stride=448):
+    """Yield native-grid (x, y, width, height); small axes need ignored padding.
+
+    No photograph is opened or resized. The final crop reaches each image edge;
+    therefore its overlap can exceed the nominal ``crop_size - crop_stride``.
+    """
+    _crop_geometry(crop_size, crop_stride)
+    _crop_dimensions(width, height)
+    for y in _crop_origins(height, crop_size, crop_stride):
+        for x in _crop_origins(width, crop_size, crop_stride):
+            yield x, y, min(crop_size, width - x), min(crop_size, height - y)
+
+
+def semantic_crop_count(width, height, crop_size=512, crop_stride=448):
+    """Count the same semantic grid without materializing crops or their origins."""
+    _crop_geometry(crop_size, crop_stride)
+    _crop_dimensions(width, height)
+    return ((max(0, width - crop_size) + crop_stride - 1) // crop_stride + 1) * (
+        (max(0, height - crop_size) + crop_stride - 1) // crop_stride + 1)
+
+
 def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=42,
-                             fixed_assignments=None):
-    """Target image fractions using whole buildings; historical owners never move."""
-    weights = Counter(row["building_id"] for row in images)
+                             fixed_assignments=None, balance_unit="images",
+                             crop_size=512, crop_stride=448):
+    """Target image or semantic-crop fractions; historical buildings never move."""
+    if balance_unit not in {"images", "crops"}:
+        raise ValueError("balance_unit must be images or crops")
+    if not 0 <= val_fraction < 1 or not 0 <= test_fraction < 1 or val_fraction + test_fraction >= 1:
+        raise ValueError("Split fractions must be nonnegative and leave a positive training fraction")
+    crop_geometry = _crop_geometry(crop_size, crop_stride)
+    image_weights = Counter(row["building_id"] for row in images)
+    crop_weights = Counter()
+    crop_metadata_complete = True
+    for row in images:
+        try:
+            count = semantic_crop_count(row.get("width"), row.get("height"), crop_size, crop_stride)
+        except ValueError as exc:
+            if balance_unit == "crops":
+                raise ValueError(f"Image {row.get('image_id')} lacks valid dimensions for crop balancing") from exc
+            crop_metadata_complete = False
+            continue
+        crop_weights[row["building_id"]] += count
+    crop_total = sum(crop_weights.values()) if crop_metadata_complete else None
+    weights = crop_weights if balance_unit == "crops" else image_weights
     fractions = {"train": 1 - val_fraction - test_fraction, "val": val_fraction, "test": test_fraction}
     active = [name for name, fraction in fractions.items() if fraction > 0]
     fixed_assignments = dict(fixed_assignments or {})
@@ -73,7 +138,8 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
     groups = sorted(group for group in weights if group not in fixed_assignments)
     random.Random(seed).shuffle(groups)
     groups.sort(key=lambda group: -weights[group])
-    targets = {name: fraction * len(images) for name, fraction in fractions.items()}
+    target_total = sum(weights.values())
+    targets = {name: fraction * target_total for name, fraction in fractions.items()}
     counts = {name: sum(size for group, size in weights.items() if fixed_assignments.get(group) == name)
               for name in fractions}
     group_counts = {name: sum(fixed_assignments.get(group) == name for group in weights) for name in fractions}
@@ -124,18 +190,32 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
         else:
             assignments[second] = source
 
+    image_counts = {name: sum(size for group, size in image_weights.items() if assignments[group] == name)
+                    for name in fractions}
+    crop_counts = {name: sum(size for group, size in crop_weights.items() if assignments[group] == name)
+                   for name in fractions} if crop_metadata_complete else {name: None for name in fractions}
     balance = {
-        "target_unit": "images", "method": "seeded_largest_first_then_building_moves_and_swaps",
+        "target_unit": balance_unit, "method": "seeded_largest_first_then_building_moves_and_swaps",
         "eligible_image_count": len(images), "reviewed_building_count": len(weights),
+        "eligible_crop_count": crop_total, "crop_metadata_complete": crop_metadata_complete,
+        "crop_geometry": crop_geometry,
         "fixed_building_count": len(weights.keys() & fixed_assignments.keys()),
         "new_building_count": len(groups),
         "absent_historical_building_count": len(fixed_assignments.keys() - weights.keys()),
-        "note": "Whole buildings and historical assignments stay intact. Image fractions are approximate; global optimality is not guaranteed.",
+        "note": (f"Whole buildings and historical assignments stay intact. {balance_unit.capitalize()} fractions "
+                 "are approximate; global optimality is not guaranteed. Crop counts describe single observations, "
+                 "not temporal-pair crops or annotation-filtered samples."),
         "partitions": {name: {
-            "target_image_fraction": fractions[name], "target_image_count": targets[name],
-            "image_count": counts[name], "image_fraction": counts[name] / len(images),
-            "image_count_deviation": counts[name] - targets[name],
-            "image_fraction_deviation": counts[name] / len(images) - fractions[name],
+            "target_image_fraction": fractions[name], "target_image_count": fractions[name] * len(images),
+            "image_count": image_counts[name], "image_fraction": image_counts[name] / len(images),
+            "image_count_deviation": image_counts[name] - fractions[name] * len(images),
+            "image_fraction_deviation": image_counts[name] / len(images) - fractions[name],
+            "target_crop_fraction": fractions[name],
+            "target_crop_count": fractions[name] * crop_total if crop_total is not None else None,
+            "crop_count": crop_counts[name],
+            "crop_fraction": crop_counts[name] / crop_total if crop_total else None,
+            "crop_count_deviation": crop_counts[name] - fractions[name] * crop_total if crop_total is not None else None,
+            "crop_fraction_deviation": crop_counts[name] / crop_total - fractions[name] if crop_total else None,
             "building_count": group_counts[name], "building_fraction": group_counts[name] / len(weights),
         } for name in fractions},
     }
@@ -144,20 +224,25 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
 
 def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                     pair_policy="first-anchor", seed=42, val_fraction=.10, test_fraction=.20,
-                    assets_config=None, previous_split=None) -> dict:
+                    assets_config=None, previous_split=None, balance_unit="images",
+                    crop_size=512, crop_stride=448) -> dict:
     """Prepare metadata without opening source photographs or rasterizing COCO.
 
     ``dev`` puts all usable observations in one exploratory partition. ``reviewed``
     partitions confirmed buildings; unresolved observations remain in the manifest
     with explicit exclusion reasons. ``previous_split`` freezes historical building
-    ownership and the initial gold cohort while new buildings target the same image
-    fractions. Image continuity uses source bytes rather than COCO numeric ids.
+    ownership and the initial gold cohort while new buildings target the same
+    fractions, weighted by images or recorded single-observation semantic crops.
+    Image continuity uses source bytes rather than COCO numeric ids.
     ``first-anchor`` uses one earliest-year photo per view, breaking ties by
     normalized basename and SHA-256 without dropping other original observations.
     No crop or temporal ground truth is implied.
     """
     if split_mode not in {"dev", "reviewed"}:
         raise ValueError("split_mode must be dev or reviewed")
+    if balance_unit not in {"images", "crops"}:
+        raise ValueError("balance_unit must be images or crops")
+    crop_geometry = _crop_geometry(crop_size, crop_stride)
     if previous_split and split_mode != "reviewed":
         raise ValueError("previous_split requires split_mode=reviewed; dev cannot extend a gold split")
     if pair_policy not in {"adjacent", "first-anchor", "all"}:
@@ -197,6 +282,7 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
               "assets_config_sha256": sha256(assets_config) if assets_config else None,
               "split_mode": split_mode, "pair_policy": pair_policy, "seed": seed,
               "val_fraction": val_fraction, "test_fraction": test_fraction,
+              "balance_unit": balance_unit, "crop_geometry": crop_geometry,
               "previous_split_path": str(previous_path) if previous_path else None,
               "previous_split_sha256": previous_hash,
               "source_images_revalidated": False}
@@ -231,7 +317,8 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
         gold_cohort, historical_cohort, extended_cohort = [], [], []
         if split_mode == "reviewed":
             fixed = previous["building_assignments"] if previous else {}
-            assignments, split_balance = split_reviewed_buildings(eligible, val_fraction, test_fraction, seed, fixed)
+            assignments, split_balance = split_reviewed_buildings(
+                eligible, val_fraction, test_fraction, seed, fixed, balance_unit, crop_size, crop_stride)
             for row in eligible:
                 row["split"] = assignments[row["building_id"]]
             validate_partitions(images)
@@ -331,6 +418,7 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                                "possible_overlapping_views": ";".join(overlaps.get(view, [])),
                                "review_note": "Confirm physical building across all views; filename overlap is only a warning"})
         summary = {"image_count": len(images), "eligible_image_count": len(eligible),
+                   "eligible_crop_count": split_balance["eligible_crop_count"] if split_balance else None,
                    "pair_count": len(pairs), "excluded_pair_count": len(excluded_pairs),
                    "image_splits": dict(Counter(r["split"] for r in images)),
                    "pair_splits": dict(Counter(r["split"] for r in pairs)),
@@ -365,6 +453,7 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
         _write_csv(out / "group_review.csv", group_rows, group_fields)
         write_json(out / "split.json", {"schema_version": 2, "mode": split_mode, "seed": seed,
                                         "fractions": fractions, "building_assignments": assignments,
+                                        "balance_unit": balance_unit, "crop_geometry": crop_geometry,
                                         "gold_cohort": gold_cohort, "extended_cohort": extended_cohort,
                                         "historical_cohort": historical_cohort,
                                         "provenance": {
@@ -383,6 +472,10 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                                  f"target {stats['target_image_fraction']:.1%}; "
                                  f"deviation {100 * stats['image_fraction_deviation']:+.2f} percentage points; "
                                  f"{stats['building_count']} buildings ({stats['building_fraction']:.1%}).\n")
+                if stats["crop_count"] is not None:
+                    balance_text += (f"  Single-observation semantic crops: {stats['crop_count']} "
+                                     f"({stats['crop_fraction']:.1%}); target {stats['target_crop_fraction']:.1%}; "
+                                     f"deviation {100 * stats['crop_fraction_deviation']:+.2f} percentage points.\n")
             balance_text += split_balance["note"] + "\n"
             balance_text += (f"Frozen gold: {len(gold_cohort)} images; present: {summary['current_gold_image_count']}; "
                              f"missing source hashes: {len(summary['missing_gold_sha256'])}.\n")
