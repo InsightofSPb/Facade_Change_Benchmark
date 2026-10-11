@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "description": "Operational reporting groups for the current 11-class COCO dataset; not a replacement ontology. Group detection masks are unions of member classes. Group loss uses the original member-class channels.",
+  "groups": [
+    {"name": "structural_damage", "categories": ["MISSING_ELEMENT", "DELAMINATION", "SPALLING", "CRACK"]},
+    {"name": "surface_changes", "categories": ["WATER_STAIN", "EFFLORESCENCE", "CORROSION"]},
+    {"name": "repairs", "categories": ["REPAIRS"]},
+    {"name": "intact_ornament", "categories": ["ORNAMENT_INTACT"]},
+    {"name": "additions", "categories": ["TEXT_OR_IMAGES", "ADVERTISEMENTS"]}
+  ]
+}

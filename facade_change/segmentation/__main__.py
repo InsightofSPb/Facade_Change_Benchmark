@@ -1,4 +1,4 @@
-"""Train a local frozen-DINOv2 semantic baseline on a prepared dataset."""
+"""Prepare fixed crops/augmentations or train the local DINOv2 semantic head."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,10 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, help="Completed preparation directory or dataset.json")
+    parser.add_argument("--prepare-only", action="store_true", help="Save every TRAIN crop plus two augmentations; VAL originals only; no model/GPU")
+    parser.add_argument("--augmentations", help="Completed fixed augmentation directory used for training")
+    parser.add_argument("--reuse-augmentations", help="During preparation, reuse unchanged assets from an earlier snapshot")
+    parser.add_argument("--class-groups", help="Explicit semantic class-group JSON (default: repository semantic_class_groups.json)")
     parser.add_argument("--methods-config", help="Existing methods or benchmark JSON containing DINOv2 paths")
     parser.add_argument("--source-root", help="Local original DINOv2 repository; overrides methods config")
     parser.add_argument("--checkpoint", help="Local dinov2_vits14_pretrain.pth; overrides methods config")
@@ -17,18 +21,35 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--crops-per-image", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cutmix-prob", type=float, default=.5)
-    parser.add_argument("--cutout-prob", type=float, default=.25)
+    parser.add_argument("--cutmix-prob", type=float, help="Preparation only; default 0.25")
+    parser.add_argument("--cutout-prob", type=float, help="Preparation only; default 0.125")
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--smoke", action="store_true", help="One epoch, two images/split, four VAL crops/image; not a quality result")
+    parser.add_argument("--smoke", action="store_true", help="Short training check using an already complete augmentation snapshot")
     arguments = vars(parser.parse_args())
     if arguments["out"] is None:
         tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        arguments["out"] = str(Path("runs") / (tag + "-dino-seg" + ("-smoke" if arguments["smoke"] else "")))
+        suffix = "-semantic-augmentations" if arguments["prepare_only"] else "-dino-seg" + ("-smoke" if arguments["smoke"] else "")
+        arguments["out"] = str(Path("runs") / (tag + suffix))
     try:
+        prepare_only = arguments.pop("prepare_only")
+        reuse = arguments.pop("reuse_augmentations")
+        cutmix, cutout = arguments.pop("cutmix_prob"), arguments.pop("cutout_prob")
+        if prepare_only:
+            if arguments["smoke"] or arguments["augmentations"]:
+                parser.error("--prepare-only creates a complete snapshot; do not combine with --smoke/--augmentations")
+            from .prepared import prepare_augmentations
+            result = prepare_augmentations(arguments["dataset"], arguments["out"], seed=arguments["seed"],
+                                           cutmix_prob=.25 if cutmix is None else cutmix,
+                                           cutout_prob=.125 if cutout is None else cutout, reuse=reuse)
+            print(f"\nГотовые кропы: {result['out']}; TRAIN оригиналы: {result['train_originals']}, "
+                  f"аугментации: {result['train_augmented']}; VAL: {result['val_originals']}", flush=True)
+            return
+        if reuse is not None or cutmix is not None or cutout is not None:
+            parser.error("Augmentation options belong to --prepare-only; training reads --augmentations unchanged")
+        if not arguments["augmentations"]:
+            parser.error("Training requires --augmentations from a completed --prepare-only run")
         from .train import train
         result = train(**arguments)
     except (ImportError, ModuleNotFoundError) as error:

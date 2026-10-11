@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 from collections import Counter
 from datetime import datetime, timezone
@@ -23,6 +24,91 @@ def _cohort(split, key):
     return {tuple(row.get(field) for field in
                   ("sha256", "building_id", "view_id", "year", "split"))
             for row in split.get(key, [])}
+
+
+def _history_union(*collections):
+    """Keep both unresolved and later resolved identities; IDs may be re-keyed."""
+    result = {}
+    fields = ("sha256", "split", "building_id", "view_id", "year", "training_role")
+    for rows in collections:
+        for row in rows:
+            if row.get("split") not in {"train", "val", "test"} or not row.get("sha256"):
+                continue
+            key = tuple(str(row.get(field) or "") for field in fields)
+            result[key] = {field: row.get(field) for field in
+                           (*fields, "image_id", "file_name", "resolved_file_name")}
+    return [result[key] for key in sorted(result)]
+
+
+def _semantic_history(path, visited=None):
+    """Read verified semantic ownership, including formerly unknown TRAIN photos.
+
+    Older prepared/split.json files contain reviewed photos only. Their sibling
+    semantic manifest supplies the omitted auxiliary TRAIN identities. New runs
+    retain a cumulative snapshot so temporarily omitted COCO images stay protected.
+    """
+    path = Path(path).resolve()
+    visited = set() if visited is None else visited
+    if path in visited:
+        raise ValueError(f"Cyclic semantic preparation history: {path}")
+    visited.add(path)
+    split = _validate_previous(path)
+    history = _history_union(split["historical_cohort"], split["gold_cohort"])
+    outer = path.parent.parent
+    record_path = outer / "run.json"
+    if path.parent.name != "prepared" or not record_path.is_file():
+        return history
+    record = read_json(record_path)
+    if record.get("kind") != "dataset_setup":
+        return history
+
+    def verified(name):
+        artifact = outer / name
+        expected = record.get("artifact_sha256", {}).get(name)
+        if not expected or not artifact.is_file() or sha256(artifact) != expected:
+            raise ValueError(f"Semantic ownership artifact is missing or changed: {artifact}")
+        return read_json(artifact)
+
+    if (outer / "semantic_history.json").exists() or "semantic_history.json" in record.get("artifact_sha256", {}):
+        snapshot = verified("semantic_history.json")
+        if snapshot.get("kind") != "semantic_ownership_history":
+            raise ValueError(f"Invalid semantic ownership snapshot: {outer}")
+        return _history_union(history, snapshot["images"])
+    if (outer / "semantic_manifest.json").exists() or "semantic_manifest.json" in record.get("artifact_sha256", {}):
+        history = _history_union(history, verified("semantic_manifest.json")["images"])
+    previous = record.get("config", {}).get("previous_split")
+    if previous and not record.get("config", {}).get("new_split_version"):
+        history = _history_union(history, _semantic_history(previous, visited))
+    return history
+
+
+def _extension_owners(images, previous, history):
+    """Propagate historical byte/view ownership to newly identified buildings."""
+    normalize = lambda value: str(value or "").strip().casefold()
+    owners = {key: {} for key in ("sha256", "view_id", "building_id")}
+    for row in history:
+        for key, values in owners.items():
+            value = normalize(row.get(key))
+            if value:
+                values.setdefault(value, set()).add(row["split"])
+    fixed = previous["building_assignments"]
+    for building, owner in fixed.items():
+        owners["building_id"].setdefault(normalize(building), set()).add(owner)
+    additions = {}
+    for row in images:
+        building = row.get("building_id")
+        if row.get("image_status") != "ready" or row.get("metadata_status") != "reviewed" or not building:
+            continue
+        matched = set().union(*(values.get(normalize(row.get(key)), set()) for key, values in owners.items()))
+        if building in additions:
+            matched.add(additions[building])
+        if len(matched) > 1:
+            raise ValueError(f"Historical semantic ownership conflict for {row['file_name']} / {building}: "
+                             f"{sorted(matched)}. A former TRAIN photo/building cannot enter VAL or TEST; "
+                             "review the identity without moving frozen holdouts.")
+        if matched and building not in fixed:
+            additions[building] = next(iter(matched))
+    return additions
 
 
 def _merged_semantic_history(splits):
@@ -113,11 +199,14 @@ def discover_previous_split(runs_root, image_names, split_policy=None):
                 raise ValueError(f"Conflicting historical split for {building}: {path}; choose --previous-split explicitly")
             all_owners[building] = owner
         all_history.update(_cohort(split, "historical_cohort"))
+    semantic_histories = {path: _semantic_history(path) for path, _, _ in candidates}
+    all_semantic = _cohort({"history": _history_union(*semantic_histories.values())}, "history")
     complete = [(path, split, stamp) for path, split, stamp in candidates
                 if split["building_assignments"] == all_owners and
                 (_merged_semantic_history([split]) == _merged_semantic_history([item[1] for item in candidates])
                  if first.get("split_policy", "legacy") != "legacy" else
-                 _cohort(split, "historical_cohort") == all_history)]
+                 _cohort(split, "historical_cohort") == all_history) and
+                _cohort({"history": semantic_histories[path]}, "history") == all_semantic]
     if not complete:
         raise ValueError("Reviewed split histories branched; choose --previous-split explicitly: " +
                          ", ".join(str(item[0]) for item in candidates))
@@ -273,6 +362,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
     migration = bool(previous and previous.get("split_policy", "legacy") != split_policy)
     inherited = previous if not migration else None
     inherited_path = previous_path if not migration else None
+    semantic_history = _semantic_history(inherited_path) if inherited_path else []
     if previous_manifest and not previous_manifest.is_file():
         raise ValueError(f"Previous split requires its prepared manifest: {previous_manifest}")
     if previous_path:
@@ -341,18 +431,38 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                 summary["status"] = "needs_metadata_review"
                 print("Недостаточно подтверждённых фасадов для split; см. metadata_review_with_names.csv", flush=True)
             else:
+                extension_owners = _extension_owners(images, inherited, semantic_history) if inherited else {}
+                preparation_previous = inherited_path
+                if extension_owners:
+                    extension_input = copy.deepcopy(inherited)
+                    extension_input["building_assignments"].update(extension_owners)
+                    preparation_previous = out / "extension_input_split.json"
+                    write_json(preparation_previous, extension_input)
+                write_json(out / "extension_guard.json", {
+                    "previous_split": str(inherited_path) if inherited_path else None,
+                    "historical_semantic_identities": len(semantic_history),
+                    "inherited_building_owners": extension_owners,
+                    "staged_previous_split": str(preparation_previous) if extension_owners else None,
+                    "staged_previous_split_sha256": sha256(preparation_previous) if extension_owners else None,
+                    "rule": "Frozen building/view/SHA ownership includes all earlier auxiliary TRAIN images"})
                 prepared = prepare_dataset(out / "inventory/manifest.json", out / "prepared", split_mode="reviewed",
-                                           previous_split=inherited_path, seed=inherited["seed"] if inherited else 42,
+                                           previous_split=preparation_previous, seed=inherited["seed"] if inherited else 42,
                                            val_fraction=fractions["val"], test_fraction=fractions["test"],
                                            balance_unit=balance_unit, crop_size=crop_size, crop_stride=crop_stride,
                                            split_policy=split_policy)
                 split = read_json(out / "prepared/split.json")
                 semantic, auxiliary = include_auxiliary_training(prepared, split, include_unreviewed_train)
-                leakage = audit_semantic_leakage(semantic, split)
+                leakage = audit_semantic_leakage(semantic, {
+                    **split, "historical_cohort": _history_union(split["historical_cohort"], semantic_history)})
                 write_json(out / "leakage_check.json", leakage)
                 if leakage["status"] != "passed":
                     raise ValueError("Split leakage check failed; see leakage_check.json")
                 semantic["leakage_check"] = leakage
+                semantic_history = _history_union(semantic_history, split["historical_cohort"], semantic["images"])
+                write_json(out / "semantic_history.json", {
+                    "schema_version": 1, "kind": "semantic_ownership_history", "images": semantic_history,
+                    "previous_split": str(inherited_path) if inherited_path else None,
+                    "scope": "All historical semantic owners, including temporarily absent and auxiliary TRAIN photos"})
                 images = semantic["images"]
                 _image_reports(out, images)
                 counts = _crop_index(out, images, crop_size, crop_stride)
@@ -415,6 +525,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                     "physical_disjointness_verified": auxiliary["physical_disjointness_verified"],
                     "auxiliary_training": str(out / "auxiliary_training.json"),
                     "leakage_check": str(out / "leakage_check.json"),
+                    "semantic_history": str(out / "semantic_history.json"),
                     "evaluation_scope": ("exploratory_until_training_building_membership_is_resolved"
                                          if auxiliary["included_images"] else "reviewed_building_split"),
                     "crops": str(out / "semantic_crops.jsonl"), "crop_size": crop_size, "stride": crop_stride,

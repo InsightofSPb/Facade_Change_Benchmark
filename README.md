@@ -77,10 +77,13 @@ frozen MSDZip без контекста / с пространственным / 
 ## Обучение семантической головы DINOv2
 
 `python -m facade_change.segmentation` использует подготовленный semantic split:
-замороженный DINOv2, обучаемая линейная голова, аугментации условий съёмки,
-CutMix и CutOut только на TRAIN. Пересечения COCO-классов сохраняются, неизвестные
-пиксели исключаются из loss и метрик. Выбор checkpoint — по VAL mIoU с равными
-весами фасадов; TEST не оценивается. Команда, смысл метрики, таблицы и галерея:
+замороженный DINOv2 и обучаемая линейная голова. Сначала `--prepare-only` сохраняет
+каждый TRAIN кроп и две аугментации (CutMix 0.25, CutOut 0.125), затем обучение
+читает этот набор через `--augmentations`. После каждой эпохи: loss, F1, mIoU,
+precision и recall на оригиналах TRAIN/VAL, по классам и группам. Пересечения
+COCO-классов сохраняются, неизвестные пиксели исключаются из loss и метрик.
+Выбор checkpoint — по VAL mIoU с равными весами фасадов; TEST не оценивается.
+Команды подготовки 401 снимка, смысл метрик, таблицы и галерея:
 [обучение DINOv2 на семантических классах](docs/2026-10-11_dino_semantic_training.md).
 
 ## Единая подготовка нового набора
@@ -118,7 +121,7 @@ TEST 7–10 больше не применяется. Число кропов н
 Выход — новый `runs/<UTC>-dataset-preparation/`: `summary.json`,
 `missing_images.csv`, `image_issues.csv`, `metadata_review_with_names.csv`,
 `prepared/manifest.json`, `prepared/split.json`, `prepared/pairs.csv`,
-`dataset.json`, `semantic_manifest.json`, `semantic_crops.jsonl`, `auxiliary_training.json`,
+`dataset.json`, `semantic_manifest.json`, `semantic_history.json`, `semantic_crops.jsonl`, `auxiliary_training.json`,
 `building_series.csv`, `class_coverage.csv` и `leakage_check.json`.
 Индекс кропов содержит координаты кропов
 на исходных изображениях; RGB не копируются. COCO-полигоны и пересечения классов

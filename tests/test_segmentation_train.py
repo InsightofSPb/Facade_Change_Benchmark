@@ -1,6 +1,8 @@
 """CPU training integration and native-pixel validation ownership contracts."""
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +21,7 @@ if HAS_TORCH:
     from torch import nn
     from facade_change.segmentation import data as segmentation_data
     from facade_change.segmentation.model import FrozenDinoSegmenter
+    from facade_change.segmentation.prepared import PreparedAugmentations, prepare_augmentations
     from facade_change.segmentation.train import dino_paths, ownership_masks, train
 
     class TinyBackbone(nn.Module):
@@ -165,6 +168,18 @@ class TrainingIntegrationTests(unittest.TestCase):
 
     def test_real_optimization_best_reload_reports_and_test_isolation(self):
         loaded_models, initial_heads, initial_backbones, read_paths = [], [], [], []
+        # Unknown-address singleton photographs stay in TRAIN. Their metrics
+        # must not be presented as independent, confirmed facade statistics.
+        manifest = read_json(self.dataset / "manifest.json")
+        manifest["images"][1].update(building_id=None, view_id=None,
+                                     metadata_status="unknown_building",
+                                     training_role="auxiliary_semantic_train")
+        write_json(self.dataset / "manifest.json", manifest)
+        rows = [json.loads(line) for line in (self.dataset / "crops.jsonl").read_text().splitlines()]
+        for row in rows:
+            if row["image_id"] == 2:
+                row.update(building_id=None, view_id=None)
+        (self.dataset / "crops.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
 
         def load_fixture(source, checkpoint, num_classes, device, trust):
             model = FrozenDinoSegmenter(TinyBackbone(), num_classes).to(device)
@@ -180,17 +195,44 @@ class TrainingIntegrationTests(unittest.TestCase):
             self.assertNotEqual(Path(path).name, "image-4.png")
             return original_load_rgb(path)
 
+        augmentations = self.root / "augmentations"
+        with patch("facade_change.segmentation.data.load_rgb", side_effect=track_rgb):
+            prepared_summary = prepare_augmentations(
+                self.dataset, augmentations, cutmix_prob=1., cutout_prob=1.)
+        self.assertEqual(prepared_summary["train_originals"], 4)
+        self.assertEqual(prepared_summary["train_augmented"], 8)
+        self.assertEqual(prepared_summary["val_originals"], 2)
+        self.assertEqual(set(read_paths), {"image-1.png", "image-2.png", "image-3.png"})
+        sample_reads = []
+        original_load = PreparedAugmentations.load
+
+        def track_sample(instance, record):
+            sample_reads.append((record["image_id"], record["variant"]))
+            return original_load(instance, record)
+
         out = self.root / "trained"
+        # Preparation owns all augmentation and full photograph decoding. This
+        # makes an accidental return to on-the-fly training fail immediately.
         with patch("facade_change.segmentation.train.load_model", side_effect=load_fixture), \
-                patch("facade_change.segmentation.data.load_rgb", side_effect=track_rgb):
+                patch.object(PreparedAugmentations, "load", new=track_sample), \
+                patch.object(segmentation_data.PreparedData, "load_image",
+                             side_effect=AssertionError("training decoded a full photograph")), \
+                patch("facade_change.segmentation.data.augment_crop",
+                      side_effect=AssertionError("training generated an augmentation")), \
+                patch("facade_change.segmentation.prepared.augment_crop",
+                      side_effect=AssertionError("training generated an augmentation")), \
+                patch("facade_change.segmentation.prepared.cutmix_crop",
+                      side_effect=AssertionError("training generated CutMix")), \
+                patch("facade_change.segmentation.prepared.cutout_crop",
+                      side_effect=AssertionError("training generated CutOut")):
             summary = train(self.dataset, out, source_root=self.source, checkpoint=self.weights,
-                            device="cpu", epochs=2, batch_size=2, crops_per_image=2,
-                            learning_rate=.02, cutmix_prob=1., cutout_prob=1.)
+                            augmentations=augmentations, device="cpu", epochs=2, batch_size=2,
+                            learning_rate=.02)
         self.assertEqual(summary["status"], "completed_exploratory")
         self.assertFalse(summary["test_evaluated"])
-        self.assertEqual(set(read_paths), {"image-1.png", "image-2.png", "image-3.png"})
-        self.assertEqual(summary["augmentation_counts"]["cutmix"], 8)
-        self.assertEqual(summary["augmentation_counts"]["cutout"], 8)
+        self.assertEqual({image_id for image_id, _ in sample_reads}, {1, 2, 3})
+        self.assertEqual({variant for _, variant in sample_reads}, {0, 1, 2})
+        self.assertFalse(any(image_id == 3 and variant != 0 for image_id, variant in sample_reads))
         config = read_json(out / "config.json")
         self.assertEqual(config["training_image_ids"], [1, 2])
         self.assertEqual(config["validation_image_ids"], [3])
@@ -215,6 +257,36 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics["primary"]["miou"], best["val_miou"])
         self.assertEqual(metrics["primary"], read_json(out / "best-val.json")["primary"])
         self.assertEqual(len(read_json(out / "history.json")), 2)
+        for split, image_ids in (("train", {1, 2}), ("val", {3})):
+            for epoch in (1, 2):
+                epoch_metrics = read_json(out / f"{split}-epoch-{epoch:03d}.json")
+                self.assertEqual({row["image_id"] for row in epoch_metrics["image_records"]}, image_ids)
+                for key in ("f1", "miou", "precision", "recall", "loss"):
+                    value = epoch_metrics["primary"][key]
+                    self.assertIsNotNone(value, (split, epoch, key))
+                    self.assertTrue(np.isfinite(value), (split, epoch, key))
+                self.assertEqual(epoch_metrics["primary"]["building_count"], 1)
+                if split == "train":
+                    self.assertEqual(epoch_metrics["auxiliary_image_average"]["image_count"], 1)
+                    self.assertEqual(epoch_metrics["per_auxiliary_image"][0]["image_id"], 2)
+                per_group = {row["name"]: row for row in epoch_metrics["per_group"]}
+                self.assertEqual(set(per_group), {"structural_damage", "repairs"})
+                for group in per_group.values():
+                    self.assertTrue(all(key in group for key in ("f1", "miou", "precision", "recall", "loss")))
+                for record in epoch_metrics["image_records"]:
+                    # TRAIN diagnostics also score original native pixels once,
+                    # never three cached variants or overlapping crop duplicates.
+                    np.testing.assert_array_equal(
+                        np.asarray(record["counts"])[:, [0, 2]].sum(axis=1),
+                        [18 * 24, 20 * 25, 8 * 12],
+                    )
+                    self.assertIn("group_counts", record)
+                    self.assertIn("loss_stats", record)
+                    # Group union merges the overlapping CRACK/DELAMINATION
+                    # positives before counting, instead of summing classes.
+                    np.testing.assert_array_equal(
+                        np.asarray(record["group_counts"])[:, [0, 2]].sum(axis=1), [492, 500])
+                    self.assertEqual(record["loss_stats"]["valid_pixels"], 782)
         self.assertEqual([row["image_id"] for row in metrics["image_records"]], [3])
         np.testing.assert_array_equal(
             np.asarray(metrics["image_records"][0]["counts"])[:, [0, 2]].sum(axis=1),
@@ -226,6 +298,27 @@ class TrainingIntegrationTests(unittest.TestCase):
         record = read_json(out / "run.json")
         self.assertEqual(record["status"], "completed_exploratory")
         self.assertEqual(record["artifact_sha256"]["best.pth"], sha256(out / "best.pth"))
+
+    def test_prepare_only_cli_needs_no_model_and_legacy_crop_budget_is_rejected(self):
+        out = self.root / "cli-augmentations"
+        command = [sys.executable, "-m", "facade_change.segmentation", "--dataset", str(self.dataset)]
+        result = subprocess.run(command + ["--prepare-only", "--out", str(out)],
+                                text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = read_json(out / "summary.json")
+        self.assertEqual(summary["train_originals"], 4)
+        self.assertEqual(summary["train_augmented"], 8)
+        self.assertEqual(summary["val_originals"], 2)
+        self.assertFalse(summary["test_rgb_loaded"])
+        self.assertFalse(summary["test_annotations_rasterized"])
+        config = read_json(out / "config.json")
+        self.assertEqual(config["policy"]["cutmix_prob"], .25)
+        self.assertEqual(config["policy"]["cutout_prob"], .125)
+        rejected = subprocess.run(command + ["--crops-per-image", "4"],
+                                  text=True, capture_output=True, timeout=30)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unrecognized arguments", rejected.stderr)
+        self.assertIn("--crops-per-image", rejected.stderr)
 
 
 if __name__ == "__main__":
