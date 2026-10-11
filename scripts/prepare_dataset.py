@@ -1,4 +1,4 @@
-"""Prepare COCO images and extend the facade split with just two input paths."""
+"""Prepare COCO with an 80/8/12 series-aware facade split using two input paths."""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--out", type=Path)
     parser.add_argument("--runs-root", type=Path, help="Where to find previous reviewed preparation runs")
     parser.add_argument("--previous-split", type=Path, help="Explicit override of automatic split discovery")
+    parser.add_argument("--split-policy", choices=("series-v2", "legacy"), default="series-v2",
+                        help="series-v2: 80/8/12 crop targets, medium-series holdouts; legacy: preserve the old policy")
     parser.add_argument("--rename-map", type=Path, action="append", dest="rename_maps")
     parser.add_argument("--metadata-rules", type=Path, default=DEFAULT_METADATA_RULES)
     parser.add_argument("--metadata-csv", type=Path, help="Reviewed table using current COCO image IDs")

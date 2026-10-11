@@ -13,7 +13,7 @@ from .data import REVIEW_FIELDS, normalized_name, read_overrides
 from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
 
 
-def validate_partitions(images: list[dict]) -> None:
+def validate_partitions(images: list[dict], allow_missing_views=False) -> None:
     """Reject physical-group, view, and byte-duplicate leakage across partitions."""
     owners = {key: {} for key in ("building_id", "view_id", "sha256")}
     view_buildings = defaultdict(set)
@@ -26,11 +26,14 @@ def validate_partitions(images: list[dict]) -> None:
         for key, values in owners.items():
             value = row.get(key)
             if not value:
+                if key == "view_id" and allow_missing_views:
+                    continue
                 raise ValueError(f"Image {row['image_id']} lacks {key} for a reviewed split")
             if value in values and values[value] != split:
                 raise ValueError(f"Split leakage: {key}={value} belongs to {values[value]} and {split}")
             values[value] = split
-        view_buildings[row["view_id"]].add(row["building_id"])
+        if row.get("view_id"):
+            view_buildings[row["view_id"]].add(row["building_id"])
     if any(len(buildings) > 1 for buildings in view_buildings.values()):
         raise ValueError("A reviewed view_id belongs to multiple building_id values")
 
@@ -105,12 +108,131 @@ def semantic_crop_count(width, height, crop_size=512, crop_stride=448):
         (max(0, height - crop_size) + crop_stride - 1) // crop_stride + 1)
 
 
+def _valid_year(year):
+    return type(year) is int and 1800 <= year <= 2100
+
+
+def _building_series(images):
+    """Count distinct reviewed years per view, never photos across different views."""
+    grouped = defaultdict(list)
+    for row in images:
+        grouped[row["building_id"]].append(row)
+    result = {}
+    for building, rows in sorted(grouped.items()):
+        years = defaultdict(set)
+        incomplete = 0
+        for row in rows:
+            if row.get("view_id") and _valid_year(row.get("year")):
+                years[row["view_id"]].add(row["year"])
+            else:
+                incomplete += 1
+        length = max((len(values) for values in years.values()), default=0)
+        kind = "unknown" if incomplete else "short" if length <= 2 else "medium" if length <= 7 else "long"
+        result[building] = {"max_distinct_years_per_view": length, "series_class": kind,
+                            "view_years": {view: sorted(values) for view, values in sorted(years.items())},
+                            "observations_without_temporal_metadata": incomplete,
+                            "image_count": len(rows)}
+    return result
+
+
+def _split_series_buildings(images, weights, fractions, fixed, seed):
+    """Constrained deterministic building moves/swaps; holdouts use medium series."""
+    if any(row.get("metadata_status") != "reviewed" or not row.get("building_id")
+           or row.get("image_status") != "ready" or not row.get("sha256") for row in images):
+        raise ValueError("series-v2 requires reviewed, ready images with building_id and SHA-256")
+    series = _building_series(images)
+    holdouts = [name for name in ("val", "test") if fractions[name] > 0]
+    medium = {building for building, stats in series.items() if stats["series_class"] == "medium"}
+    history = {building for building in medium if series[building]["max_distinct_years_per_view"] >= 5}
+    movable = sorted(medium - fixed.keys())
+    random.Random(seed).shuffle(movable)
+    movable.sort(key=lambda group: -weights[group])
+    assignments = {**{building: "train" for building in weights}, **fixed}
+    active = [name for name, fraction in fractions.items() if fraction > 0]
+    targets = {name: fraction * sum(weights.values()) for name, fraction in fractions.items()}
+    available_history = sum(fixed.get(group) != "train" for group in history)
+    history_goal = 2 if holdouts and available_history >= 2 * len(holdouts) else 1
+
+    def score(candidate):
+        medium_counts = Counter(candidate[group] for group in medium)
+        history_counts = Counter(candidate[group] for group in history)
+        counts = Counter()
+        for group, weight in weights.items():
+            counts[candidate[group]] += weight
+        # Coverage precedes crop fractions. Under shortage, squared deficits spread
+        # scarce buildings across holdouts; no non-medium building is substituted.
+        return (sum(max(0, 2 - medium_counts[name]) ** 2 for name in holdouts),
+                sum(max(0, history_goal - history_counts[name]) ** 2 for name in holdouts),
+                max(0, 1 - medium_counts["train"]),
+                sum((counts[name] - targets[name]) ** 2 for name in active))
+
+    for _ in range(max(1, 6 * len(movable))):
+        best_score, best = score(assignments), None
+        for group in movable:
+            for target in active:
+                if target == assignments[group]:
+                    continue
+                candidate = {**assignments, group: target}
+                candidate_score = score(candidate)
+                if candidate_score < best_score:
+                    best_score, best = candidate_score, candidate
+        for first, second in combinations(movable, 2):
+            if assignments[first] == assignments[second]:
+                continue
+            candidate = {**assignments, first: assignments[second], second: assignments[first]}
+            candidate_score = score(candidate)
+            if candidate_score < best_score:
+                best_score, best = candidate_score, candidate
+        if best is None:
+            break
+        assignments = best
+
+    medium_counts = Counter(assignments[group] for group in medium)
+    history_counts = Counter(assignments[group] for group in history)
+    issues = []
+    for name in holdouts:
+        if medium_counts[name] < 2:
+            issues.append(f"{name}: only {medium_counts[name]} medium-series buildings; requested at least 2")
+        if history_counts[name] < history_goal:
+            issues.append(f"{name}: only {history_counts[name]} buildings with 5–7 reviewed years; requested {history_goal}")
+    if not medium_counts["train"]:
+        issues.append("train: no medium-series building remains")
+    exceptions = sorted(group for group in weights.keys() & fixed.keys()
+                        if fixed[group] in holdouts and group not in medium)
+    if exceptions:
+        issues.append("Historical holdout owners no longer satisfy the medium-series rule; ownership stays frozen")
+    for building, stats in series.items():
+        stats.update(split=assignments[building], crop_count=weights[building],
+                     historical_assignment=building in fixed)
+    return assignments, {
+        "status": "insufficient" if issues else "satisfied", "issues": issues,
+        "minimum_medium_buildings_per_holdout": 2,
+        "preferred_5_to_7_year_buildings_per_holdout": history_goal,
+        "medium_buildings_by_split": {name: medium_counts[name] for name in fractions},
+        "history_buildings_by_split": {name: history_counts[name] for name in fractions},
+        "historical_policy_exceptions": exceptions,
+        "length_unit": "distinct reviewed years within one view; building uses maximum view length",
+        "fresh_train_only": ["short: 1–2 years", "long: 8+ years", "incomplete temporal metadata"],
+        "buildings": series,
+    }
+
+
 def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=42,
                              fixed_assignments=None, balance_unit="images",
-                             crop_size=512, crop_stride=448):
-    """Target image or semantic-crop fractions; historical buildings never move."""
+                             crop_size=512, crop_stride=448, split_policy="legacy"):
+    """Target whole-building fractions; historical owners never move.
+
+    ``legacy`` retains the original unconstrained allocation. ``series-v2``
+    requires crop weights and reviewed physical groups: fresh short, long, or
+    incompletely dated buildings stay in TRAIN; only medium series enter holdouts.
+    Fractions are explicit arguments (the two-path v2 entrypoint uses .08/.12).
+    """
     if balance_unit not in {"images", "crops"}:
         raise ValueError("balance_unit must be images or crops")
+    if split_policy not in {"legacy", "series-v2"}:
+        raise ValueError("split_policy must be legacy or series-v2")
+    if split_policy == "series-v2" and balance_unit != "crops":
+        raise ValueError("series-v2 requires balance_unit=crops")
     if not 0 <= val_fraction < 1 or not 0 <= test_fraction < 1 or val_fraction + test_fraction >= 1:
         raise ValueError("Split fractions must be nonnegative and leave a positive training fraction")
     crop_geometry = _crop_geometry(crop_size, crop_stride)
@@ -133,7 +255,7 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
     fixed_assignments = dict(fixed_assignments or {})
     if any(not group or name not in active for group, name in fixed_assignments.items()):
         raise ValueError("Fixed building assignments must use a nonempty building_id and an active split")
-    if not weights or (not fixed_assignments and len(weights) < len(active)):
+    if not weights or (split_policy == "legacy" and not fixed_assignments and len(weights) < len(active)):
         raise ValueError("Too few reviewed buildings for nonempty requested splits; use --split-mode dev until reviewed")
     groups = sorted(group for group in weights if group not in fixed_assignments)
     random.Random(seed).shuffle(groups)
@@ -148,7 +270,8 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
     def objective(candidate):
         return sum((candidate[name] - targets[name]) ** 2 for name in active)
 
-    for i, group in enumerate(groups):
+    legacy_groups = groups if split_policy == "legacy" else []
+    for i, group in enumerate(legacy_groups):
         empty = [name for name in active if not group_counts[name]]
         choices = empty if len(groups) - i == len(empty) else active
         split = min(choices, key=lambda name: objective({**counts, name: counts[name] + weights[group]}))
@@ -158,9 +281,9 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
 
     # Improve single-building moves and pair swaps. This bounded local search is
     # deterministic and does not claim the globally closest possible partition.
-    for _ in range(max(1, 4 * len(groups))):
+    for _ in range(max(1, 4 * len(legacy_groups))):
         best_score, best = objective(counts), None
-        for group in groups:
+        for group in legacy_groups:
             source = assignments[group]
             if group_counts[source] <= 1:
                 continue
@@ -171,7 +294,7 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
                 score = objective(candidate)
                 if score < best_score - 1e-9:
                     best_score, best = score, (group, None, source, target, candidate)
-        for first, second in combinations(groups, 2):
+        for first, second in combinations(legacy_groups, 2):
             source, target = assignments[first], assignments[second]
             if source == target or weights[first] == weights[second]:
                 continue
@@ -190,11 +313,16 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
         else:
             assignments[second] = source
 
+    series_constraints = None
+    if split_policy == "series-v2":
+        assignments, series_constraints = _split_series_buildings(images, weights, fractions, fixed_assignments, seed)
+        group_counts = {name: sum(assignments[group] == name for group in weights) for name in fractions}
     image_counts = {name: sum(size for group, size in image_weights.items() if assignments[group] == name)
                     for name in fractions}
     crop_counts = {name: sum(size for group, size in crop_weights.items() if assignments[group] == name)
                    for name in fractions} if crop_metadata_complete else {name: None for name in fractions}
     balance = {
+        "split_policy": split_policy,
         "target_unit": balance_unit, "method": "seeded_largest_first_then_building_moves_and_swaps",
         "eligible_image_count": len(images), "reviewed_building_count": len(weights),
         "eligible_crop_count": crop_total, "crop_metadata_complete": crop_metadata_complete,
@@ -219,13 +347,16 @@ def split_reviewed_buildings(images, val_fraction=.10, test_fraction=.20, seed=4
             "building_count": group_counts[name], "building_fraction": group_counts[name] / len(weights),
         } for name in fractions},
     }
+    if series_constraints is not None:
+        balance["method"] = "series_constraints_then_seeded_building_moves_and_swaps"
+        balance["series_constraints"] = series_constraints
     return assignments, balance
 
 
 def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                     pair_policy="first-anchor", seed=42, val_fraction=.10, test_fraction=.20,
                     assets_config=None, previous_split=None, balance_unit="images",
-                    crop_size=512, crop_stride=448) -> dict:
+                    crop_size=512, crop_stride=448, split_policy="legacy") -> dict:
     """Prepare metadata without opening source photographs or rasterizing COCO.
 
     ``dev`` puts all usable observations in one exploratory partition. ``reviewed``
@@ -234,6 +365,9 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
     ownership and the initial gold cohort while new buildings target the same
     fractions, weighted by images or recorded single-observation semantic crops.
     Image continuity uses source bytes rather than COCO numeric ids.
+    ``series-v2`` additionally permits semantic-only observations without a view
+    or year, requires crop balancing, and reports medium-series holdout coverage.
+    Such observations cannot form temporal pairs. Legacy eligibility is unchanged.
     ``first-anchor`` uses one earliest-year photo per view, breaking ties by
     normalized basename and SHA-256 without dropping other original observations.
     No crop or temporal ground truth is implied.
@@ -242,6 +376,10 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
         raise ValueError("split_mode must be dev or reviewed")
     if balance_unit not in {"images", "crops"}:
         raise ValueError("balance_unit must be images or crops")
+    if split_policy not in {"legacy", "series-v2"}:
+        raise ValueError("split_policy must be legacy or series-v2")
+    if split_policy == "series-v2" and (split_mode != "reviewed" or balance_unit != "crops"):
+        raise ValueError("series-v2 requires split_mode=reviewed and balance_unit=crops")
     crop_geometry = _crop_geometry(crop_size, crop_stride)
     if previous_split and split_mode != "reviewed":
         raise ValueError("previous_split requires split_mode=reviewed; dev cannot extend a gold split")
@@ -265,6 +403,8 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
         previous = read_json(previous_path)
         if previous.get("mode") != "reviewed" or previous.get("development_only") is not False:
             raise ValueError("Previous split must be a reviewed train/val/test split")
+        if previous.get("split_policy", "legacy") != split_policy:
+            raise ValueError("Previous split policy must match; create a new split version instead of extending")
         if not all(key in previous for key in ("gold_cohort", "historical_cohort", "fractions", "provenance")):
             raise ValueError("Previous split lacks gold cohort provenance; recreate its initial split from the original reviewed manifest without previous_split")
         if previous.get("seed") != seed or previous["fractions"] != fractions:
@@ -280,7 +420,7 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
               "overrides_sha256": sha256(overrides) if overrides else None,
               "assets_config_path": str(Path(assets_config).resolve()) if assets_config else None,
               "assets_config_sha256": sha256(assets_config) if assets_config else None,
-              "split_mode": split_mode, "pair_policy": pair_policy, "seed": seed,
+              "split_mode": split_mode, "split_policy": split_policy, "pair_policy": pair_policy, "seed": seed,
               "val_fraction": val_fraction, "test_fraction": test_fraction,
               "balance_unit": balance_unit, "crop_geometry": crop_geometry,
               "previous_split_path": str(previous_path) if previous_path else None,
@@ -296,11 +436,6 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
             reasons = []
             if row.get("image_status") != "ready":
                 reasons.append("image_" + str(row.get("image_status", "unknown")))
-            if not row.get("view_id"):
-                reasons.append("unknown_view")
-            year = row.get("year")
-            if isinstance(year, bool) or not isinstance(year, int) or not 1800 <= year <= 2100:
-                reasons.append("unknown_or_invalid_year")
             if not row.get("sha256"):
                 reasons.append("missing_image_hash")
             if split_mode == "reviewed":
@@ -308,6 +443,16 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                     reasons.append("metadata_not_reviewed")
                 if not row.get("building_id"):
                     reasons.append("unknown_building")
+            temporal_reasons = list(reasons)
+            if not row.get("view_id"):
+                temporal_reasons.append("unknown_view")
+            if not _valid_year(row.get("year")):
+                temporal_reasons.append("unknown_or_invalid_year")
+            row.update(semantic_eligible=not reasons and row.get("metadata_status") == "reviewed"
+                       and bool(row.get("building_id")), temporal_eligible=not temporal_reasons,
+                       temporal_exclusion_reasons=temporal_reasons)
+            if split_policy == "legacy":
+                reasons = temporal_reasons
             row.update(split="excluded" if reasons else "dev", preparation_exclusion_reasons=reasons,
                        gold_member=False)
             if not reasons:
@@ -318,34 +463,48 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
         if split_mode == "reviewed":
             fixed = previous["building_assignments"] if previous else {}
             assignments, split_balance = split_reviewed_buildings(
-                eligible, val_fraction, test_fraction, seed, fixed, balance_unit, crop_size, crop_stride)
+                eligible, val_fraction, test_fraction, seed, fixed, balance_unit, crop_size, crop_stride, split_policy)
             for row in eligible:
                 row["split"] = assignments[row["building_id"]]
-            validate_partitions(images)
+            validate_partitions(images, allow_missing_views=split_policy == "series-v2")
             identity_fields = ("image_id", "file_name", "sha256", "view_id", "building_id", "year", "split")
             gold_cohort = copy.deepcopy(previous["gold_cohort"]) if previous else [
-                {key: row[key] for key in identity_fields} for row in eligible]
+                {key: row.get(key) for key in identity_fields} for row in eligible]
             historical_cohort = copy.deepcopy(previous["historical_cohort"]) if previous else copy.deepcopy(gold_cohort)
             for row in historical_cohort + gold_cohort:
-                if any(not row.get(key) for key in ("sha256", "file_name", "view_id", "building_id", "year", "split")):
+                required = ("sha256", "file_name", "building_id", "split")
+                if split_policy == "legacy":
+                    required += ("view_id", "year")
+                if any(not row.get(key) for key in required):
                     raise ValueError("Previous split has incomplete image ownership records")
                 if assignments.get(row["building_id"]) != row["split"]:
                     raise ValueError("Previous split image ownership contradicts building_assignments")
             known_hashes = {}
             known_names = defaultdict(set)
             name_variants = defaultdict(set)
+
+            def ownership_changed(old, current, allow_incomplete_record=False):
+                for key in ("building_id", "view_id", "year", "split"):
+                    if split_policy == "series-v2" and key in {"view_id", "year"}:
+                        if not old.get(key) or (allow_incomplete_record and not current.get(key)):
+                            continue  # Missing chronology can be completed; confirmed values stay frozen.
+                    if old.get(key) != current.get(key):
+                        return True
+                return False
+
             for row in historical_cohort + gold_cohort:
                 old = known_hashes.get(row["sha256"])
-                if old and any(old[key] != row[key] for key in ("building_id", "view_id", "year", "split")):
+                if old and ownership_changed(old, row, allow_incomplete_record=True):
                     raise ValueError("Split cohort has conflicting SHA-256 image ownership")
-                known_hashes[row["sha256"]] = row
+                known_hashes[row["sha256"]] = {**row, **{
+                    key: old[key] for key in ("view_id", "year") if old and old.get(key)}}
                 name = normalized_name(row["file_name"])
                 known_names[name].add(row["sha256"])
                 name_variants[name].add((row["file_name"], row["sha256"]))
             gold_hashes = {row["sha256"] for row in gold_cohort}
             for row in eligible:
                 old = known_hashes.get(row["sha256"])
-                if old and any(old[key] != row[key] for key in ("building_id", "view_id", "year", "split")):
+                if old and ownership_changed(old, row):
                     raise ValueError(f"Historical image ownership changed for SHA-256 {row['sha256']}; review building/view/year metadata before extending")
                 name = normalized_name(row["file_name"])
                 old_hashes = known_names.get(name)
@@ -353,19 +512,31 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                     raise ValueError(f"Original image bytes changed for {row['file_name']}; review the replacement explicitly before extending")
                 name_variants[name].add((row["file_name"], row["sha256"]))
                 row["gold_member"] = row["sha256"] in gold_hashes
-                snapshot = {key: row[key] for key in identity_fields}
+                snapshot = {key: row.get(key) for key in identity_fields}
                 extended_cohort.append({**snapshot, "gold_member": row["gold_member"]})
                 if old is None:
                     historical_cohort.append(snapshot)
                     known_hashes[row["sha256"]] = snapshot
+                elif split_policy == "series-v2":
+                    known_hashes[row["sha256"]] = snapshot
+            if split_policy == "series-v2":
+                # Preserve the initial gold snapshot. Later historical snapshots
+                # retain newly confirmed chronology so it cannot change unnoticed.
+                for row in historical_cohort:
+                    latest = known_hashes[row["sha256"]]
+                    for key in ("view_id", "year"):
+                        if not row.get(key) and latest.get(key):
+                            row[key] = latest[key]
             for name, variants in name_variants.items():
                 if len({raw for raw, _ in variants}) > 1 and len({digest for _, digest in variants}) > 1:
                     raise ValueError(f"Ambiguous normalized filename {name}; distinct originals must be reviewed explicitly")
-            validate_partitions([{**row, "metadata_status": "reviewed"} for row in historical_cohort] + eligible)
+            validate_partitions([{**row, "metadata_status": "reviewed"} for row in historical_cohort] + eligible,
+                                allow_missing_views=split_policy == "series-v2")
 
         by_view = defaultdict(list)
         for row in eligible:
-            by_view[row["view_id"]].append(row)
+            if row["temporal_eligible"]:
+                by_view[row["view_id"]].append(row)
         pairs, excluded_pairs = [], []
         for view, observations in sorted(by_view.items()):
             by_year = defaultdict(list)
@@ -418,6 +589,10 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                                "possible_overlapping_views": ";".join(overlaps.get(view, [])),
                                "review_note": "Confirm physical building across all views; filename overlap is only a warning"})
         summary = {"image_count": len(images), "eligible_image_count": len(eligible),
+                   "semantic_eligible_image_count": sum(row["semantic_eligible"] for row in images),
+                   "temporal_eligible_image_count": sum(row["temporal_eligible"] for row in images),
+                   "temporal_exclusion_reasons": dict(Counter(reason for row in images
+                                                               for reason in row["temporal_exclusion_reasons"])),
                    "eligible_crop_count": split_balance["eligible_crop_count"] if split_balance else None,
                    "pair_count": len(pairs), "excluded_pair_count": len(excluded_pairs),
                    "image_splits": dict(Counter(r["split"] for r in images)),
@@ -428,7 +603,7 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                    "gold_image_count": len(gold_cohort),
                    "current_gold_image_count": sum(r.get("gold_member", False) for r in eligible),
                    "missing_gold_sha256": sorted({r["sha256"] for r in gold_cohort} - {r["sha256"] for r in eligible}),
-                   "split_mode": split_mode,
+                   "split_mode": split_mode, "split_policy": split_policy,
                    "split_balance": split_balance,
                    "evaluation_ready": False, "source_images_revalidated": False,
                    "temporal_ground_truth": False}
@@ -452,6 +627,7 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                         "possible_overlapping_views", "review_note"]
         _write_csv(out / "group_review.csv", group_rows, group_fields)
         write_json(out / "split.json", {"schema_version": 2, "mode": split_mode, "seed": seed,
+                                        "split_policy": split_policy,
                                         "fractions": fractions, "building_assignments": assignments,
                                         "balance_unit": balance_unit, "crop_geometry": crop_geometry,
                                         "gold_cohort": gold_cohort, "extended_cohort": extended_cohort,
@@ -477,11 +653,20 @@ def prepare_dataset(manifest_path, out, overrides=None, split_mode="dev",
                                      f"({stats['crop_fraction']:.1%}); target {stats['target_crop_fraction']:.1%}; "
                                      f"deviation {100 * stats['crop_fraction_deviation']:+.2f} percentage points.\n")
             balance_text += split_balance["note"] + "\n"
+            if split_policy == "series-v2":
+                constraints = split_balance["series_constraints"]
+                balance_text += (f"Series constraints: {constraints['status']}; "
+                                 f"medium buildings: {constraints['medium_buildings_by_split']}; "
+                                 f"5–7-year buildings: {constraints['history_buildings_by_split']}.\n")
+                for issue in constraints["issues"]:
+                    balance_text += f"  {issue}\n"
             balance_text += (f"Frozen gold: {len(gold_cohort)} images; present: {summary['current_gold_image_count']}; "
                              f"missing source hashes: {len(summary['missing_gold_sha256'])}.\n")
         (out / "summary.txt").write_text(
             f"Images: {len(images)}; eligible: {len(eligible)}; temporal candidates: {len(pairs)}\n"
-            f"Split mode: {split_mode}; image splits: {summary['image_splits']}\n"
+            f"Split mode: {split_mode}; policy: {split_policy}; image splits: {summary['image_splits']}\n"
+            f"Semantic eligible: {summary['semantic_eligible_image_count']}; "
+            f"temporal eligible: {summary['temporal_eligible_image_count']}\n"
             f"Excluded observations: {summary['exclusion_reasons']}\n"
             f"Excluded pairs: {len(excluded_pairs)}; policy: {pair_policy}\n"
             "Reused inventory hashes; no source images opened or revalidated.\n"

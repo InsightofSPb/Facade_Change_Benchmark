@@ -11,6 +11,7 @@ from .io import load_rgb, new_directory, read_json, run_record, sha256, finish_r
 
 PREFIX = re.compile(r"^[0-9a-fA-F]{8}-")
 YEAR = re.compile(r"^(?P<view>.+)_(?P<year>(?:19|20)\d{2})$")
+VARIANT_YEAR = re.compile(r"^.+_(?P<year>(?:19|20)\d{2})_v\d+$", re.IGNORECASE)
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 REVIEW_FIELDS = ["image_id", "view_id", "building_id", "year", "reviewed", "notes"]
 DEFAULT_METADATA_RULES = Path(__file__).resolve().parents[1] / "configs/2026-10-03_metadata_rules.json"
@@ -68,11 +69,16 @@ def normalized_name(name: str) -> str:
 
 
 def filename_metadata(name: str) -> dict:
-    match = YEAR.fullmatch(Path(normalized_name(name)).stem)
+    stem = Path(normalized_name(name)).stem
+    match = YEAR.fullmatch(stem)
+    variant = VARIANT_YEAR.fullmatch(stem) if match is None else None
+    # A variant suffix may denote another view or another photo of the same view.
+    # Recover its year, but never merge v1/v2 or apply confirmed view rules to it.
+    year_match = match or variant
     return {"view_id": match["view"] if match else None,
-            "building_id": None, "year": int(match["year"]) if match else None,
-            "metadata_status": "inferred" if match else "unknown",
-            "metadata_source": "filename_suffix" if match else None}
+            "building_id": None, "year": int(year_match["year"]) if year_match else None,
+            "metadata_status": "inferred" if year_match else "unknown",
+            "metadata_source": "filename_suffix" if year_match else None}
 
 
 def _rename_name(value, path, line, field):
@@ -257,6 +263,11 @@ class ImageResolver:
 
 
 def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
+    """Read confirmed building identity, with optional reviewed temporal metadata.
+
+    Blank view/year values explicitly remain unknown. Semantic preparation can
+    use building-only rows; temporal preparation must still require both fields.
+    """
     if path is None:
         return {}
     with Path(path).open(encoding="utf-8", newline="") as handle:
@@ -273,12 +284,17 @@ def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
             raise ValueError(f"reviewed must be true/false for {key}")
         if reviewed != "true":
             continue
-        if not all(row.get(field, "").strip() for field in ("view_id", "building_id", "year")):
-            raise ValueError(f"Reviewed row {key} needs view_id, building_id and year")
-        year = int(row["year"])
-        if not 1800 <= year <= 2100:
+        building = (row.get("building_id") or "").strip()
+        if not building:
+            raise ValueError(f"Reviewed row {key} needs building_id")
+        year_text = (row.get("year") or "").strip()
+        try:
+            year = int(year_text) if year_text else None
+        except ValueError:
+            raise ValueError(f"Invalid year for {key}: {year_text}") from None
+        if year is not None and not 1800 <= year <= 2100:
             raise ValueError(f"Invalid year for {key}: {year}")
-        result[key] = {"view_id": row["view_id"].strip(), "building_id": row["building_id"].strip(),
+        result[key] = {"view_id": (row.get("view_id") or "").strip() or None, "building_id": building,
                        "year": year, "metadata_status": "reviewed", "metadata_source": "override_csv",
                        "metadata_notes": row.get("notes", "")}
     return result
@@ -440,7 +456,9 @@ def build_manifest(config_path: str | Path, out: str | Path, overrides=None,
                     row.update(width=w, height=h, sha256=before, opaque_fraction=opaque_fraction)
                     row["image_status"] = "ready" if (w, h) == (image["width"], image["height"]) else "dimension_mismatch"
                     if same_identity and row["image_status"] == "ready" and old.get("metadata_status") == "reviewed":
-                        row.update({key: old[key] for key in ("view_id", "building_id", "year", "metadata_notes") if key in old})
+                        row.update({key: old.get(key) for key in ("view_id", "building_id", "year")})
+                        if "metadata_notes" in old:
+                            row["metadata_notes"] = old["metadata_notes"]
                         row.update(metadata_status="reviewed", metadata_source="previous_manifest",
                                    metadata_inherited_from_image_id=old["image_id"])
                         inherited_count += 1

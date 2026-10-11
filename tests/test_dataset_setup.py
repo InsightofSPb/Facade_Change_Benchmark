@@ -56,6 +56,7 @@ class DatasetSetupTests(unittest.TestCase):
         return path
 
     def prepare(self, coco, name, **kwargs):
+        kwargs.setdefault("split_policy", "legacy")
         output = io.StringIO()
         with redirect_stdout(output):
             result = prepare_from_paths(coco, self.photos, out=self.runs / name,

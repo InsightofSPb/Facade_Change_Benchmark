@@ -1,4 +1,4 @@
-"""Two-path preparation using the existing inventory and frozen facade split."""
+"""Two-path inventory and versioned physical-building split preparation."""
 from __future__ import annotations
 
 import csv
@@ -24,6 +24,24 @@ def _cohort(split, key):
             for row in split.get(key, [])}
 
 
+def _merged_semantic_history(splits):
+    """Permit null chronology to be filled while keeping byte/group ownership fixed."""
+    history = {}
+    for split in splits:
+        for row in split["historical_cohort"]:
+            digest = row["sha256"]
+            current = {key: row.get(key) for key in ("building_id", "view_id", "year", "split")}
+            old = history.get(digest)
+            if old:
+                for key, value in current.items():
+                    if key in {"view_id", "year"} and (not value or not old[key]):
+                        current[key] = value or old[key]
+                    elif value != old[key]:
+                        raise ValueError("Conflicting reviewed image history; choose --previous-split explicitly")
+            history[digest] = current
+    return history
+
+
 def _validate_previous(path, split=None, record=None):
     split = split if split is not None else read_json(path)
     record = record if record is not None else read_json(path.with_name("run.json"))
@@ -38,6 +56,7 @@ def _validate_previous(path, split=None, record=None):
     if (not provenance.get("gold_manifest_sha256") or
             provenance.get("manifest_sha256") != config.get("manifest_sha256") or
             split.get("seed") != config.get("seed") or
+            split.get("split_policy", "legacy") != config.get("split_policy", "legacy") or
             split["fractions"].get("val") != config.get("val_fraction") or
             split["fractions"].get("test") != config.get("test_fraction")):
         raise ValueError(f"Split provenance disagrees with its preparation run: {path}")
@@ -48,7 +67,7 @@ def _validate_previous(path, split=None, record=None):
     return split
 
 
-def discover_previous_split(runs_root, image_names):
+def discover_previous_split(runs_root, image_names, split_policy=None):
     """Select a completed, compatible extension; never choose by directory mtime.
 
     Only actual preparation runs qualify, not benchmark copies of split.json.
@@ -66,6 +85,8 @@ def discover_previous_split(runs_root, image_names):
                 continue
             split = read_json(path)
             if split.get("mode") != "reviewed" or split.get("development_only") is not False:
+                continue
+            if split_policy is not None and split.get("split_policy", "legacy") != split_policy:
                 continue
             manifest = read_json(manifest_path)
             historical_images = manifest.get("images", []) + split.get("historical_cohort", []) + split.get("gold_cohort", [])
@@ -93,7 +114,9 @@ def discover_previous_split(runs_root, image_names):
         all_history.update(_cohort(split, "historical_cohort"))
     complete = [(path, split, stamp) for path, split, stamp in candidates
                 if split["building_assignments"] == all_owners and
-                _cohort(split, "historical_cohort") == all_history]
+                (_merged_semantic_history([split]) == _merged_semantic_history([item[1] for item in candidates])
+                 if first.get("split_policy", "legacy") == "series-v2" else
+                 _cohort(split, "historical_cohort") == all_history)]
     if not complete:
         raise ValueError("Reviewed split histories branched; choose --previous-split explicitly: " +
                          ", ".join(str(item[0]) for item in candidates))
@@ -109,9 +132,11 @@ def _csv(path, rows, fields):
 
 def _image_reports(out, images):
     fields = ["image_id", "file_name", "image_path", "image_status", "resolution_rule",
-              "view_id", "building_id", "year", "reviewed", "notes", "split", "exclusion_reasons"]
+              "view_id", "building_id", "year", "reviewed", "notes", "split", "exclusion_reasons",
+              "semantic_eligible", "temporal_eligible", "temporal_exclusion_reasons"]
     rows = [{**row, "reviewed": "true" if row.get("metadata_status") == "reviewed" else "false",
              "notes": row.get("metadata_notes", ""),
+             "temporal_exclusion_reasons": ";".join(row.get("temporal_exclusion_reasons", [])),
              "exclusion_reasons": ";".join(row.get("preparation_exclusion_reasons", []))}
             for row in images]
     _csv(out / "metadata_review_with_names.csv", rows, fields)
@@ -129,7 +154,7 @@ def _crop_index(out, images, crop_size, crop_stride):
                 crop = {"crop_id": f"{row['image_id']}:{x}:{y}:{crop_size}",
                         "image_id": row["image_id"], "file_name": row["file_name"],
                         "image_path": row["image_path"], "image_sha256": row["sha256"],
-                        "building_id": row["building_id"], "view_id": row["view_id"], "split": row["split"],
+                        "building_id": row["building_id"], "view_id": row.get("view_id"), "split": row["split"],
                         "x": x, "y": y, "width": width, "height": height,
                         "pad_right": crop_size - width, "pad_bottom": crop_size - height}
                 stream.write(json.dumps(crop, ensure_ascii=False, allow_nan=False) + "\n")
@@ -137,15 +162,69 @@ def _crop_index(out, images, crop_size, crop_stride):
     return {name: counts[name] for name in ("train", "val", "test")}
 
 
+def _class_coverage(out, prepared, coco):
+    """Report annotation presence, not pixel coverage or segmentation quality."""
+    images = {row["image_id"]: row for row in prepared["images"]
+              if row.get("split") in {"train", "val", "test"}}
+    counts, image_ids, buildings = Counter(), {}, {}
+    for annotation in coco["annotations"]:
+        row = images.get(annotation["image_id"])
+        if row is None:
+            continue
+        key = (row["split"], annotation["category_id"])
+        counts[key] += 1
+        image_ids.setdefault(key, set()).add(row["image_id"])
+        buildings.setdefault(key, set()).add(row["building_id"])
+    rows = [{"split": split, "category_id": category["id"], "category_name": category["name"],
+             "annotation_count": counts[(split, category["id"])],
+             "image_count": len(image_ids.get((split, category["id"]), set())),
+             "building_count": len(buildings.get((split, category["id"]), set()))}
+            for split in ("train", "val", "test") for category in coco["categories"]]
+    _csv(out / "class_coverage.csv", rows,
+         ["split", "category_id", "category_name", "annotation_count", "image_count", "building_count"])
+    missing = {split: [row["category_name"] for row in rows
+                      if row["split"] == split and not row["annotation_count"]]
+               for split in ("train", "val", "test")}
+    for split, names in missing.items():
+        if names:
+            print(f"Нет аннотаций классов в {split}: {', '.join(names)}", flush=True)
+    return {"path": str(out / "class_coverage.csv"), "missing_classes": missing,
+            "scope": "COCO annotation presence; no pixel rasterization; not used to optimize split"}
+
+
+def _split_transition(out, previous_path, previous, prepared):
+    current = read_json(out / "prepared/split.json")
+    before, after = previous["building_assignments"], current["building_assignments"]
+    changes = [{"building_id": building, "previous": before.get(building), "current": after.get(building)}
+               for building in sorted(before.keys() | after.keys()) if before.get(building) != after.get(building)]
+    report = {"previous_split": str(previous_path), "previous_split_sha256": sha256(previous_path),
+              "current_split": str(out / "prepared/split.json"),
+              "current_split_sha256": sha256(out / "prepared/split.json"),
+              "previous_policy": previous.get("split_policy", "legacy"),
+              "current_policy": current["split_policy"], "building_changes": changes,
+              "old_train_now_holdout": [row["building_id"] for row in changes
+                                        if row["previous"] == "train" and row["current"] in {"val", "test"}],
+              "absent_previous_gold_sha256": sorted({row["sha256"] for row in previous["gold_cohort"]} -
+                                                   {row.get("sha256") for row in prepared["images"]}),
+              "note": "New split version; previous outputs unchanged. Retrain any model exposed to new held-out buildings."}
+    write_json(out / "split_transition.json", report)
+    print(f"Новая версия split: изменено назначений/состава {len(changes)} зданий; "
+          f"из прежнего TRAIN в VAL/TEST: {len(report['old_train_now_holdout'])}. "
+          "См. split_transition.json; старые обученные модели не являются baseline нового split.", flush=True)
+    return report
+
+
 def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous_split=None,
                        metadata_rules=DEFAULT_METADATA_RULES, rename_maps=None,
-                       crop_size=512, crop_stride=448, metadata_csv=None):
+                       crop_size=512, crop_stride=448, metadata_csv=None, split_policy="series-v2"):
     """Audit current COCO, extend reviewed owners and index native semantic crops.
 
     Does not align temporal pairs, rasterize masks, train models or copy images.
     Extra files outside COCO are never added to the dataset.
     """
     coco_path, image_root = Path(coco_path).expanduser().resolve(), Path(image_root).expanduser().resolve()
+    if split_policy not in {"legacy", "series-v2"}:
+        raise ValueError("split_policy must be legacy or series-v2")
     if not coco_path.is_file() or not image_root.is_dir():
         raise ValueError("COCO must be an existing file and images must be an existing directory")
     semantic_crop_count(1, 1, crop_size, crop_stride)  # Validate geometry before creating a run.
@@ -171,11 +250,18 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
     previous = None
     try:
         previous_path = (Path(previous_split).expanduser().resolve() if previous_split else
-                         discover_previous_split(runs_root, image_names))
+                         discover_previous_split(runs_root, image_names, split_policy))
+        if previous_path is None and split_policy == "series-v2":
+            previous_path = discover_previous_split(runs_root, image_names, "legacy")
         previous = _validate_previous(previous_path) if previous_path else None
+        if previous and split_policy == "legacy" and previous.get("split_policy", "legacy") != "legacy":
+            raise ValueError("Use --split-policy series-v2 to extend a series-v2 split")
     except (ValueError, OSError) as exc:
         previous_path, split_error = None, str(exc)
     previous_manifest = previous_path.with_name("manifest.json") if previous_path else None
+    migration = bool(previous and previous.get("split_policy", "legacy") != split_policy)
+    inherited = previous if not migration else None
+    inherited_path = previous_path if not migration else None
     if previous_manifest and not previous_manifest.is_file():
         raise ValueError(f"Previous split requires its prepared manifest: {previous_manifest}")
     if previous_path:
@@ -188,6 +274,8 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
               "metadata_rules": str(metadata_rules) if metadata_rules else None,
               "metadata_csv": str(metadata_csv) if metadata_csv else None,
               "previous_split": str(previous_path) if previous_path else None,
+              "split_policy": split_policy, "new_split_version": migration,
+              "previous_split_use": "metadata_cache_and_transition_only" if migration else "frozen_extension",
               "balance_unit": "crops", "crop_size": crop_size, "crop_stride": crop_stride,
               "input_sha256": input_hashes, "image_selection": "current_coco_images_only"}
     record = run_record("dataset_setup", config)
@@ -195,6 +283,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
     print(f"Проверка COCO: {len(coco['images'])} изображений. Выход: {out}", flush=True)
     selection = str(previous_path) if previous_path else ('не выбрано' if split_error else 'не найдено; первое reviewed-разбиение')
     print(f"Предыдущее разбиение: {selection}", flush=True)
+    print(f"Политика split: {split_policy}" + ("; новая версия, старые назначения не переносятся" if migration else ""), flush=True)
     if split_error:
         print(f"Требуется выбор прежнего split: {split_error}", flush=True)
     print(f"Rename-map: {', '.join(str(p) for p in rename_maps) or 'не найден; используются точные имена и хеш-префиксы'}", flush=True)
@@ -218,6 +307,7 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                    "image_status": inventory["summary"]["image_status"],
                    "inventory": inventory["summary"], "annotation_preprocessing": preprocessing,
                    "previous_split": config["previous_split"], "split_selection_error": split_error,
+                   "split_policy": split_policy, "new_split_version": migration,
                    "crop_size": crop_size, "crop_stride": crop_stride, "crop_splits": {},
                    "crop_count": 0, "status": "needs_split_review" if split_error else "running"}
         annotation_issues = {key: inventory["summary"][key] for key in
@@ -227,19 +317,23 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
             if values:
                 print(f"{key}: {values}", flush=True)
         if not split_error:
-            fractions = previous["fractions"] if previous else {"train": .70, "val": .10, "test": .20}
+            fractions = inherited["fractions"] if inherited else (
+                {"train": .80, "val": .08, "test": .12} if split_policy == "series-v2" else
+                {"train": .70, "val": .10, "test": .20})
             reviewed = [row for row in images if row["image_status"] == "ready" and
-                        row.get("metadata_status") == "reviewed" and row.get("building_id") and row.get("view_id")
-                        and type(row.get("year")) is int and 1800 <= row["year"] <= 2100]
-            if not reviewed or (previous is None and len({row["building_id"] for row in reviewed}) <
+                        row.get("metadata_status") == "reviewed" and row.get("building_id") and row.get("sha256")
+                        and (split_policy == "series-v2" or (row.get("view_id") and
+                        type(row.get("year")) is int and 1800 <= row["year"] <= 2100))]
+            if not reviewed or (split_policy == "legacy" and inherited is None and len({row["building_id"] for row in reviewed}) <
                                 sum(fraction > 0 for fraction in fractions.values())):
                 summary["status"] = "needs_metadata_review"
                 print("Недостаточно подтверждённых фасадов для split; см. metadata_review_with_names.csv", flush=True)
             else:
                 prepared = prepare_dataset(out / "inventory/manifest.json", out / "prepared", split_mode="reviewed",
-                                           previous_split=previous_path, seed=previous["seed"] if previous else 42,
+                                           previous_split=inherited_path, seed=inherited["seed"] if inherited else 42,
                                            val_fraction=fractions["val"], test_fraction=fractions["test"],
-                                           balance_unit="crops", crop_size=crop_size, crop_stride=crop_stride)
+                                           balance_unit="crops", crop_size=crop_size, crop_stride=crop_stride,
+                                           split_policy=split_policy)
                 images = prepared["images"]
                 _image_reports(out, images)
                 counts = _crop_index(out, images, crop_size, crop_stride)
@@ -248,19 +342,41 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
                     raise ValueError("Crop index count differs from the split balancing count")
                 summary.update(preparation=prepared["summary"], balance=balance,
                                crop_count=sum(counts.values()), crop_splits=counts)
+                series = balance.get("series_constraints", {}).get("buildings", {})
+                if series:
+                    _csv(out / "building_series.csv", [
+                        {"building_id": building, **stats,
+                         "view_years": json.dumps(stats["view_years"], ensure_ascii=False)}
+                        for building, stats in sorted(series.items())],
+                        ["building_id", "split", "series_class", "max_distinct_years_per_view",
+                         "image_count", "crop_count", "observations_without_temporal_metadata",
+                         "historical_assignment", "view_years"])
+                summary["class_coverage"] = _class_coverage(out, prepared, read_json(preprocessing["coco_path"]))
+                if migration:
+                    summary["split_transition"] = _split_transition(out, previous_path, previous, prepared)
                 unreviewed = [row for row in images if row["image_status"] == "ready" and row["split"] == "excluded"]
                 summary["metadata_review_names"] = [row["file_name"] for row in unreviewed]
                 for row in unreviewed:
                     print(f"Нужны метаданные: {row['file_name']} — {', '.join(row['preparation_exclusion_reasons'])}", flush=True)
+                if unreviewed and split_policy == "series-v2":
+                    print("Доли кропов относятся к подтверждённой части. Добавление новых зданий может "
+                          "изменить их: существующие назначения этой версии останутся фиксированными. "
+                          "До обучения завершите проверку metadata_review_with_names.csv.", flush=True)
                 summary["status"] = ("needs_metadata_review" if unreviewed else "completed_with_issues"
                                      if issues or any(annotation_issues.values()) or
                                      prepared["summary"]["missing_gold_sha256"] else "completed")
+                constraints = balance.get("series_constraints", {})
+                if constraints.get("status") == "insufficient":
+                    summary["status"] = "needs_split_review"
+                    for issue in constraints.get("issues", []):
+                        print(f"Ограничение состава split: {issue}", flush=True)
                 write_json(out / "dataset.json", {
                     "schema_version": 1, "kind": "semantic_crop_index", "source_coco": preprocessing["coco_path"],
                     "source_coco_sha256": sha256(preprocessing["coco_path"]), "original_coco": str(coco_path),
                     "manifest": str(out / "prepared/manifest.json"), "split": str(out / "prepared/split.json"),
                     "crops": str(out / "semantic_crops.jsonl"), "crop_size": crop_size, "stride": crop_stride,
                     "crop_splits": counts, "categories": prepared["categories"],
+                    "split_policy": split_policy,
                     "coordinate_frame": "native_stored_RGB_no_EXIF_rotation",
                     "edge_policy": "anchor_last_crop_to_edge; small_images_pad_right_bottom",
                     "labels": "original COCO IDs and polygons; overlaps preserved; masks not rasterized",
@@ -278,7 +394,9 @@ def prepare_from_paths(coco_path, image_root, out=None, runs_root=None, previous
             lines.append(f"{name}: {stats['building_count']} фасадов; {stats['image_count']} фото "
                          f"({stats['image_fraction']:.2%}); {stats['crop_count']} кропов "
                          f"({stats['crop_fraction']:.2%}); цель {stats['target_crop_fraction']:.2%}")
-        lines.extend(["Старые фасады сохраняют split. Баланс приблизительный; кропы одного фасада не разделяются.",
+        lines.extend([("Создана новая версия split; старые результаты сохранены отдельно." if migration else
+                       "Внутри выбранной версии прежние назначения сохраняются."),
+                      "Баланс приблизительный; все виды и кропы одного здания остаются вместе.",
                       "Кропы записаны координатами; исходные фото и COCO не изменены.",
                       "Число кропов геометрическое: фильтрация по поддержке/разметке может изменить доли.",
                       f"Отчёт: {out / 'summary.json'}", f"Проверка имён: {out / 'metadata_review_with_names.csv'}"])
