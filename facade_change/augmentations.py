@@ -100,6 +100,76 @@ def render_state(rgb, support, state_id):
             "parameters": parameters}
 
 
+def render_history_states(rgb, support, final_event="growth", seed=42):
+    """Five persistent procedural states; illumination never enters event truth.
+
+    Existing damage in the real base is unknown and remains unchanged. The
+    masks describe only introduced proxies, not semantic COCO class labels.
+    Partial repair is an ideal restoration of original pixels, not a real
+    repair appearance model. Delamination is a textured polygon proxy.
+    """
+    import cv2
+    rgb, support = _inputs(rgb, support)
+    if final_event not in {"growth", "partial_repair", "delamination"}:
+        raise ValueError("final_event must be growth, partial_repair or delamination")
+    rng = np.random.default_rng(seed)
+    h, w = support.shape
+    crack = render_state(rgb, support, "crack")
+    initial = crack["edit_mask"].copy()
+    initial[int(round(h * .6)):] = False
+    if not initial.any():
+        raise ValueError("History crack onset has no visible supported RGB edit")
+    onset = rgb.copy()
+    onset[initial] = crack["rgb"][initial]
+    final = onset.copy()
+    repaired = np.zeros_like(support)
+    parameters = {"initial_crack": crack["parameters"], "final_event": final_event,
+                  "scope": "introduced procedural changes only; existing base state is unknown"}
+    if final_event == "growth":
+        final = crack["rgb"].copy()
+        parameters["proxy"] = "extension of the same persistent crack to its full polyline"
+    elif final_event == "partial_repair":
+        repaired = initial.copy()
+        repaired[int(round(h * .38)):] = False
+        final[repaired] = rgb[repaired]
+        parameters["proxy"] = "ideal local restoration of the upper crack to the original base RGB"
+    else:
+        points = np.array([[.68, .62], [.83, .59], [.91, .69], [.86, .86],
+                           [.70, .89], [.62, .77]])
+        points += rng.uniform(-.025, .025, points.shape)
+        region = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(region, [np.rint(points * [w - 1, h - 1]).astype(np.int32)], 1)
+        region = region.astype(bool) & support & ~initial
+        yy, xx = np.indices((h, w))
+        texture = (.08 * np.sin(xx * .65 + yy * .39) + rng.normal(0, .025, (h, w)))
+        blend = .58
+        mineral = np.clip(np.array([.52, .40, .27]) + texture[..., None], 0, 1)
+        candidate = _encoded((1 - blend) * _linear(onset) + blend * mineral)
+        # A narrow darker edge is a visual proxy for a lifted/plastered surface.
+        edge = _boundary(region)
+        candidate[edge] = _encoded(_linear(candidate[edge]) * .58)
+        final[region] = candidate[region]
+        parameters.update(proxy="textured irregular delamination-like polygon; not real delamination GT",
+                          vertices_normalized=points.tolist(), blend_alpha=blend)
+    if not np.any(final != onset):
+        raise ValueError("Final history event has no visible supported RGB edit")
+    states, previous, ever = [], rgb, np.zeros_like(support)
+    for index, current in enumerate((rgb, rgb, onset, onset, final)):
+        present = np.any(current != rgb, axis=2) & support
+        old_present = np.any(previous != rgb, axis=2) & support
+        event = np.any(current != previous, axis=2) & support
+        added = present & ~old_present
+        ever |= added
+        states.append({"rgb": current.copy(), "state_edit": present.copy(),
+                       "damage_present": present.copy(), "damage_ever": ever.copy(),
+                       "new_change": event, "new_damage": added,
+                       "repaired": repaired.copy() if index == 4 else np.zeros_like(support),
+                       "event": ("initial", "none", "crack_onset", "none", final_event)[index],
+                       "parameters": parameters})
+        previous = current
+    return states
+
+
 def _number(value, name, low, high, *, lower_open=False):
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)):
         raise ValueError(f"{name} must be a finite number")

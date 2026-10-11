@@ -1,4 +1,4 @@
-"""Semantic TRAIN inclusion and final checks for split leakage."""
+"""Semantic split checks and review candidates from aligned COCO observations."""
 from __future__ import annotations
 
 import copy
@@ -183,3 +183,328 @@ def include_auxiliary_training(prepared: dict, split: dict, enabled: bool):
         manifest["summary"]["semantic_eligible_image_count"] = sum(
             bool(row.get("semantic_eligible")) for row in manifest["images"])
     return manifest, report
+
+
+def _transition_windows(reference, source, common, class_pairs, window_sizes,
+                        min_support_fraction, min_transition_fraction,
+                        min_component_pixels):
+    """Strict directed bitset changes; other simultaneous labels survive.
+
+    A disappearing label and an appearing label must occur at the SAME pixel.
+    Windows are centered on connected change components, not arbitrary RGB
+    differences. These annotations suggest review candidates, never temporal GT.
+    """
+    import cv2
+    import numpy as np
+
+    h, w = common.shape
+    windows = []
+    for old, new in class_pairs:
+        old_bit, new_bit = np.uint16(1 << old["channel"]), np.uint16(1 << new["channel"])
+        changed = (common & ((reference & old_bit) != 0) & ((source & old_bit) == 0)
+                   & ((reference & new_bit) == 0) & ((source & new_bit) != 0))
+        number, components, stats, centers = cv2.connectedComponentsWithStats(
+            changed.astype(np.uint8), connectivity=8)
+        seen = set()
+        for component in range(1, number):
+            if int(stats[component, cv2.CC_STAT_AREA]) < min_component_pixels:
+                continue
+            cx, cy = centers[component]
+            for size in window_sizes:
+                if size > min(h, w):
+                    continue
+                x = min(max(0, int(round(cx - (size - 1) / 2))), w - size)
+                y = min(max(0, int(round(cy - (size - 1) / 2))), h - size)
+                if (x, y, size) in seen:
+                    continue
+                seen.add((x, y, size))
+                support = int(common[y:y+size, x:x+size].sum())
+                # Count only the contiguous component that proposed this window.
+                event = components[y:y+size, x:x+size] == component
+                count = int(event.sum())
+                if (support / size**2 < min_support_fraction
+                        or count / size**2 < min_transition_fraction):
+                    continue
+                windows.append({"from_class": old["name"], "to_class": new["name"],
+                                "from_category_id": old["id"], "to_category_id": new["id"],
+                                "bbox_canvas_xyxy": [x, y, x+size, y+size], "window_size": size,
+                                "common_annotated_pixels": support, "candidate_pixels": count,
+                                "component_pixels": int(stats[component, cv2.CC_STAT_AREA]),
+                                "support_fraction": support / size**2,
+                                "transition_fraction": count / size**2,
+                                "candidate_mask": event.copy()})
+    return sorted(windows, key=lambda row: (-row["transition_fraction"],
+                                           row["from_class"], row["to_class"],
+                                           row["window_size"], row["bbox_canvas_xyxy"]))
+
+
+def _transition_alignments(path, method):
+    """Read completed pair/batch provenance without touching image pixels."""
+    from pathlib import Path
+    from .io import read_json, sha256
+
+    path = Path(path).expanduser().resolve()
+    record = read_json(path / "run.json")
+    if not str(record.get("status", "")).startswith("completed"):
+        raise ValueError("Transition mining requires a completed alignment run")
+    if record.get("kind") == "pair_alignment":
+        inputs = [(path, record.get("config", {}).get("method", "unknown"))]
+    elif record.get("kind") == "alignment_and_data_batch":
+        results_path = path / "results.json"
+        if record.get("artifact_sha256", {}).get("results.json") != sha256(results_path):
+            raise ValueError("Alignment results hash mismatch or absent provenance")
+        inputs = []
+        for row in read_json(results_path):
+            if method is not None and row["method"] != method:
+                continue
+            child = (path / row["path"]).resolve()
+            if not child.is_relative_to(path):
+                raise ValueError("Alignment child path leaves its batch")
+            inputs.append((child, row["method"]))
+    else:
+        raise ValueError("Expected pair_alignment or alignment_and_data_batch")
+    found = defaultdict(list)
+    unreadable = []
+    for child, child_method in inputs:
+        if method is not None and child_method != method:
+            continue
+        if not (child / "run.json").is_file():
+            unreadable.append({"path": str(child), "reason": "missing_pair_run"})
+            continue
+        child_hash = sha256(child / "run.json")
+        item = read_json(child / "run.json")
+        if record.get("kind") == "alignment_and_data_batch":
+            relative = (child / "run.json").relative_to(path).as_posix()
+            if record.get("artifact_sha256", {}).get(relative) != child_hash:
+                raise ValueError(f"Alignment child provenance hash mismatch: {relative}")
+        observations = item.get("observations", {})
+        if not all(observations.get(role, {}).get("sha256") for role in ("reference", "source")):
+            unreadable.append({"path": str(child), "reason": "missing_observation_provenance"})
+            continue
+        key = tuple(observations[role]["sha256"] for role in ("reference", "source"))
+        found[key].append({"path": child, "record": item, "method": child_method,
+                           "record_sha256": child_hash})
+    return path, found, unreadable
+
+
+def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 100),
+                               splits=("train", "val"), min_support_fraction=.5,
+                               min_transition_fraction=.02, min_component_pixels=16,
+                               max_windows_per_pair=20, alignment_method=None,
+                               all_class_pairs=False):
+    """CPU-only review pack from existing first-anchor raw-RGB alignments.
+
+    Absence is meaningful only within the annotated union at BOTH dates. Even
+    there annotation completeness, occlusion and dense alignment remain unknown.
+    No segmentation model, matching, TEST pixels, temporal metrics or inferred GT.
+    """
+    import csv
+    import html
+    from pathlib import Path
+    import cv2
+    import numpy as np
+    from PIL import Image
+    from .geometry import Canvas, expanded_canvas, warp_pair
+    from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
+    from .segmentation.data import PreparedData
+
+    if (not window_sizes or any(isinstance(size, bool) or not isinstance(size, int) or size < 8
+                               for size in window_sizes) or len(set(window_sizes)) != len(window_sizes)):
+        raise ValueError("window_sizes must be distinct integers >=8")
+    if (not 0 < min_support_fraction <= 1 or not 0 < min_transition_fraction <= 1
+            or not isinstance(min_component_pixels, int) or min_component_pixels < 1
+            or not isinstance(max_windows_per_pair, int) or max_windows_per_pair < 1):
+        raise ValueError("Positive pixel/window limits and fractions in (0,1] are required")
+    data = dataset if isinstance(dataset, PreparedData) else PreparedData(dataset, splits=splits)
+    if tuple(data.splits) != tuple(splits):
+        raise ValueError("Requested splits differ from the prepared reader")
+    categories = [{**row, "channel": i} for i, row in enumerate(data.categories)]
+    by_name = {row["name"]: row for row in categories}
+    requested = ([(a["name"], b["name"]) for a in categories for b in categories if a != b]
+                 if all_class_pairs else [("DELAMINATION", "SPALLING"), ("SPALLING", "REPAIRS")])
+    class_pairs = [(by_name[a], by_name[b]) for a, b in requested if a in by_name and b in by_name]
+    if not class_pairs:
+        raise ValueError("No requested directed class pair exists in the COCO ontology")
+    alignment_path, alignments, unreadable = _transition_alignments(alignment_run, alignment_method)
+    pairs = [row for row in data.manifest.get("pairs", []) if row.get("split") in splits]
+    config = {"dataset": data.metadata, "alignment_run": str(alignment_path),
+              "alignment_run_sha256": sha256(alignment_path / "run.json"),
+              "splits": list(splits), "window_sizes": list(window_sizes),
+              "min_support_fraction": min_support_fraction,
+              "min_transition_fraction": min_transition_fraction,
+              "min_component_pixels": min_component_pixels,
+              "max_windows_per_pair": max_windows_per_pair, "alignment_method": alignment_method,
+              "class_pairs": [[a["name"], b["name"]] for a, b in class_pairs],
+              "unavailable_class_pairs": [list(pair) for pair in requested
+                                           if any(name not in by_name for name in pair)],
+              "candidate_rule": "same-pixel A disappears AND B appears; other labels preserved",
+              "window_selection": "component-centered windows; largest change fraction first; capped per pair",
+              "support": "common geometric opaque support AND annotated non-crowd union at both dates",
+              "pair_policy": "prepared earliest reference per view; never adjacent or future matching",
+              "interpretation": "semantic annotation transition candidates; human review required; not temporal ground truth"}
+    out = new_directory(out)
+    record = run_record("real_semantic_transition_candidates", config)
+    write_json(out / "run.json", record)
+    candidates, pair_rows, gallery, views = [], [], [], {}
+    try:
+        for image in data.images.values():
+            if image.get("metadata_status") == "reviewed" and image.get("view_id") and image.get("year") is not None:
+                key = (image["split"], image["building_id"], image["view_id"])
+                entry = views.setdefault(key, {"split": key[0], "building_id": key[1], "view_id": key[2],
+                                              "available_years": set(), "prepared_pairs": 0,
+                                              "usable_pairs": 0, "usable_source_years": set()})
+                entry["available_years"].add(int(image["year"]))
+        for pair_index, pair in enumerate(pairs, 1):
+            reference, source = [data.images[pair[key]] for key in ("reference_id", "source_id")]
+            key = (pair["split"], pair["building_id"], pair["view_id"])
+            view = views[key]
+            view["prepared_pairs"] += 1
+            pair_row = {**pair, "candidate_count": 0}
+            pair_rows.append(pair_row)
+            if (int(reference["year"]) >= int(source["year"])
+                    or int(reference["year"]) != min(view["available_years"])):
+                raise ValueError(f"Prepared pair violates first-anchor chronology: {pair.get('pair_id')}")
+            matches = alignments.get((reference["sha256"], source["sha256"]), [])
+            if not matches:
+                pair_row.update(status="missing_alignment", reason="No matching endpoint SHA-256 pair")
+                continue
+            # Reject old split assignments even when image IDs have been renumbered.
+            for match in matches:
+                for role, current in (("reference", reference), ("source", source)):
+                    previous = match["record"]["observations"][role]
+                    for field in ("split", "building_id", "view_id", "year", "width", "height"):
+                        if previous.get(field) != current.get(field):
+                            raise ValueError(f"Alignment/current dataset {field} mismatch for {role}: "
+                                             f"{previous.get(field)!r} != {current.get(field)!r}; "
+                                             "rerun alignment on the current prepared split")
+            accepted = [item for item in matches if
+                        str(item["record"].get("status", "")).startswith("completed")
+                        and item["record"].get("quality_gate", {}).get("passed") is True]
+            if not accepted:
+                pair_row.update(status="rejected_alignment", reason="No completed alignment passed its recorded gate",
+                                attempts=[{"path": str(item["path"]),
+                                           "status": item["record"].get("status"),
+                                           "quality_gate": item["record"].get("quality_gate")} for item in matches])
+                continue
+            accepted.sort(key=lambda item: ({"cascade": 0, "sift": 1, "loftr": 2}.get(item["method"], 3),
+                                             str(item["path"])))
+            selected = accepted[0]
+            child, child_record = selected["path"], selected["record"]
+            if sha256(child / "run.json") != selected["record_sha256"]:
+                raise ValueError("Alignment child provenance changed during mining")
+            geometry_path = child / "geometry.json"
+            if child_record.get("artifact_sha256", {}).get("geometry.json") != sha256(geometry_path):
+                raise ValueError(f"Alignment geometry hash mismatch: {child}")
+            geometry = read_json(geometry_path)
+            canvas = expanded_canvas((reference["height"], reference["width"]),
+                                     (source["height"], source["width"]), geometry["source_to_reference"])
+            if ((canvas.width, canvas.height) != (geometry["width"], geometry["height"])
+                    or not np.allclose(canvas.reference_to_canvas, geometry["reference_to_canvas"], atol=1e-10)
+                    or not np.allclose(canvas.reference_to_canvas @ canvas.source_to_reference,
+                                       geometry["source_to_canvas"], atol=1e-10)):
+                raise ValueError("Stored alignment canvas/direction differs from native-scale geometry")
+            print(f"Transition candidates {pair_index}/{len(pairs)}: {pair['view_id']} "
+                  f"{reference['year']} -> {source['year']}", flush=True)
+            arrays = [data.load_image(row["image_id"]) for row in (reference, source)]
+            matrices = [canvas.reference_to_canvas, canvas.reference_to_canvas @ canvas.source_to_reference]
+            packed, supports = [], []
+            for (_, labels, opaque), matrix in zip(arrays, matrices):
+                packed.append(cv2.warpPerspective(labels, matrix, (canvas.width, canvas.height),
+                                                   flags=cv2.INTER_NEAREST, borderValue=0))
+                supports.append(cv2.warpPerspective(opaque.astype(np.float32), matrix,
+                                                      (canvas.width, canvas.height), flags=cv2.INTER_LINEAR,
+                                                      borderValue=0) >= 1 - 1e-6)
+            common = supports[0] & supports[1] & (packed[0] != 0) & (packed[1] != 0)
+            windows = _transition_windows(*packed, common, class_pairs, window_sizes,
+                                          min_support_fraction, min_transition_fraction, min_component_pixels)
+            pair_row.update(status="mined_needs_review", alignment_run=str(child),
+                            alignment_run_sha256=selected["record_sha256"],
+                            geometry_sha256=sha256(geometry_path), alignment_method=selected["method"],
+                            alignment_quality_gate=child_record["quality_gate"],
+                            common_annotated_pixels=int(common.sum()), qualifying_windows=len(windows),
+                            truncated_windows=max(0, len(windows)-max_windows_per_pair),
+                            candidate_count=min(len(windows), max_windows_per_pair))
+            view["usable_pairs"] += 1
+            view["usable_source_years"].add(int(source["year"]))
+            for window in windows[:max_windows_per_pair]:
+                event = window.pop("candidate_mask")
+                x, y, x1, y1 = window["bbox_canvas_xyxy"]
+                offset = np.array([[1., 0, -x], [0, 1., -y], [0, 0, 1.]])
+                crop_canvas = Canvas(x1-x, y1-y, offset @ canvas.reference_to_canvas, canvas.source_to_reference)
+                warped = warp_pair(arrays[0][0], arrays[0][2], arrays[1][0], arrays[1][2], crop_canvas)
+                candidate_id = f"candidate-{len(candidates):05d}"
+                directory = new_directory(out / candidate_id)
+                for role in ("reference", "source"):
+                    Image.fromarray(warped[role]).save(directory / f"{role}.png")
+                    overlay = warped[role].copy()
+                    overlay[event] = (overlay[event].astype(np.float32)*.4 + np.array([255, 45, 10])*.6).astype(np.uint8)
+                    Image.fromarray(overlay).save(directory / f"{role}_candidate.png")
+                Image.fromarray(event.astype(np.uint8)*255).save(directory / "candidate_mask.png")
+                Image.fromarray(common[y:y1, x:x1].astype(np.uint8)*255).save(directory / "annotated_support.png")
+                # Packed labels retain all overlap channels and can be re-inspected.
+                np.savez_compressed(directory / "semantic_masks.npz",
+                                    reference=packed[0][y:y1, x:x1], source=packed[1][y:y1, x:x1])
+                result = {**window, "candidate_id": candidate_id, "path": candidate_id,
+                          "pair_id": pair.get("pair_id"), "split": pair["split"],
+                          "building_id": pair["building_id"], "view_id": pair["view_id"],
+                          "reference_id": reference["image_id"], "source_id": source["image_id"],
+                          "reference_year": reference["year"], "source_year": source["year"],
+                          "image_sha256": {"reference": reference["sha256"], "source": source["sha256"]},
+                          "reference_to_crop": crop_canvas.reference_to_canvas.tolist(),
+                          "source_to_crop": (crop_canvas.reference_to_canvas @ crop_canvas.source_to_reference).tolist(),
+                          "review_status": "needs_review", "is_temporal_ground_truth": False,
+                          "physical_visibility": "unknown; opaque geometric support does not remove occluders",
+                          "alignment_run": str(child), "alignment_quality_gate": child_record["quality_gate"],
+                          "limitations": ["dense/local alignment not certified", "annotation completeness not certified",
+                                          "category differences may be annotation disagreement, not physical change"]}
+                candidates.append(result)
+                title = html.escape(f"{pair['view_id']} {reference['year']} → {source['year']}: "
+                                    f"{window['from_class']} → {window['to_class']}")
+                gallery.append(f'<h2>{title}</h2><p>{candidate_id}; {window["window_size"]} px; needs review</p>'
+                               + "".join(f'<img src="{candidate_id}/{name}.png" alt="{name}">'
+                                         for name in ("reference", "source", "reference_candidate", "source_candidate")))
+            write_json(out / "pairs.json", pair_rows)
+            del arrays, packed, supports, common, windows
+        view_rows = []
+        for entry in views.values():
+            entry["available_years"] = sorted(entry["available_years"])
+            entry["usable_source_years"] = sorted(entry["usable_source_years"])
+            entry["usable_observations"] = len(entry["usable_source_years"]) + int(entry["usable_pairs"] > 0)
+            entry["history_of_at_least_3_observations"] = entry["usable_observations"] >= 3
+            view_rows.append(entry)
+        summary = {"status": "completed_needs_review", "out": str(out), "candidate_count": len(candidates),
+                   "prepared_pairs": len(pairs), "pair_status_counts": dict(Counter(row["status"] for row in pair_rows)),
+                   "alignment_inputs_without_observations": unreadable, "views": view_rows,
+                   "test_rgb_loaded": False, "test_annotations_rasterized": False,
+                   "quantitative_temporal_evaluation_allowed": False,
+                   "note": "A missing candidate does not establish an unchanged region; candidates are a biased review shortlist"}
+        write_json(out / "candidates.json", {"categories": categories, "candidates": candidates})
+        write_json(out / "pairs.json", pair_rows)
+        write_json(out / "summary.json", summary)
+        fields = ["candidate_id", "split", "building_id", "view_id", "reference_year", "source_year",
+                  "from_class", "to_class", "window_size", "candidate_pixels", "common_annotated_pixels",
+                  "transition_fraction", "support_fraction", "review_status", "path"]
+        with (out / "candidates.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(candidates)
+        (out / "gallery.html").write_text(
+            '<!doctype html><meta charset="utf-8"><title>Real semantic transition candidates</title>'
+            '<style>body{font:16px system-ui;margin:24px}img{width:200px;image-rendering:pixelated;margin:4px}</style>'
+            '<h1>Real semantic transition candidates — review required</h1>'
+            '<p>Original earlier/later RGB, then annotation candidate overlays. Red is an annotation-derived '
+            'candidate, not confirmed change. Review alignment, occlusion, class consistency and missing labels. '
+            'No temporal metrics or automatically accepted ground truth.</p>' + "".join(gallery), encoding="utf-8")
+        if sha256(alignment_path / "run.json") != config["alignment_run_sha256"]:
+            raise ValueError("Alignment run changed during mining")
+        for row in pair_rows:
+            if row["status"] == "mined_needs_review" and (
+                    sha256(Path(row["alignment_run"]) / "run.json") != row["alignment_run_sha256"]
+                    or sha256(Path(row["alignment_run"]) / "geometry.json") != row["geometry_sha256"]):
+                raise ValueError("Used alignment provenance or geometry changed during mining")
+        finish_record(out, record, "completed_needs_review")
+        return summary
+    except Exception as exc:
+        write_json(out / "pairs.json", pair_rows)
+        finish_record(out, record, "failed", f"{type(exc).__name__}: {exc}")
+        raise

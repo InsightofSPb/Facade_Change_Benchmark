@@ -1,10 +1,12 @@
 """CPU training integration and native-pixel validation ownership contracts."""
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -299,6 +301,72 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(record["status"], "completed_exploratory")
         self.assertEqual(record["artifact_sha256"]["best.pth"], sha256(out / "best.pth"))
 
+    def test_frozen_robustness_export_parity_and_checkpoint_guards(self):
+        from facade_change.methods.dinov2 import _source_provenance
+        from facade_change.segmentation.evaluate import evaluate_checkpoint
+
+        def fixture(source, checkpoint, num_classes, device, trust):
+            # Recreate identical frozen weights on each load; only saved head changes.
+            with torch.random.fork_rng():
+                torch.manual_seed(93)
+                model = FrozenDinoSegmenter(TinyBackbone(), num_classes).to(device)
+            return model, {"sources": _source_provenance(source),
+                           "checkpoint": {"sha256": sha256(checkpoint)}, "backbone_frozen": True}
+
+        augmentations = self.root / "robustness-augmentations"
+        prepare_augmentations(self.dataset, augmentations)
+        trained = self.root / "robustness-training"
+        with patch("facade_change.segmentation.train.load_model", side_effect=fixture):
+            train(self.dataset, trained, augmentations=augmentations, source_root=self.source,
+                  checkpoint=self.weights, device="cpu", epochs=1, batch_size=2)
+        out = self.root / "robustness-report"
+        with patch("facade_change.segmentation.evaluate.load_model", side_effect=fixture), \
+                patch.object(segmentation_data.PreparedData, "load_image",
+                             side_effect=AssertionError("evaluator must reuse cached originals")):
+            result = evaluate_checkpoint(trained, out, device="cpu", batch_size=2,
+                                         export_probabilities=True)
+        original = read_json(out / "original" / "metrics.json")
+        trained_metrics = read_json(trained / "metrics.json")
+        self.assertEqual(original["primary"], trained_metrics["primary"])
+        self.assertEqual(original["image_records"], trained_metrics["image_records"])
+        self.assertFalse(result["test_evaluated"])
+        self.assertEqual(len(result["conditions"]), 7)
+        self.assertEqual(result["exported_crops"], 14)
+        exported = [json.loads(line) for line in (out / "probabilities.jsonl").read_text().splitlines()]
+        self.assertEqual({row["image_id"] for row in exported}, {3})
+        for row in exported:
+            with np.load(out / row["path"], allow_pickle=False) as arrays:
+                self.assertEqual(arrays["probabilities"].shape, (3, 32, 32))
+                self.assertEqual(arrays["targets"].dtype, bool)
+                self.assertEqual(arrays["valid"].dtype, bool)
+                self.assertTrue(np.isfinite(arrays["mean_bernoulli_entropy"]).all())
+                self.assertTrue((arrays["mean_bernoulli_entropy"] >= 0).all())
+                self.assertTrue((arrays["mean_bernoulli_entropy"] <= 1).all())
+        shift = read_json(out / "translation" / "metrics.json")["image_records"][0]
+        reference = read_json(out / "translation_reference" / "metrics.json")["image_records"][0]
+        self.assertEqual(shift["loss_stats"]["valid_pixels"], reference["loss_stats"]["valid_pixels"])
+        np.testing.assert_array_equal(np.array(shift["counts"])[:, [0, 2]].sum(1),
+                                      np.array(reference["counts"])[:, [0, 2]].sum(1))
+        comparisons = read_json(out / "comparisons.json")
+        self.assertEqual(comparisons["translation"]["baseline"], "translation_reference")
+        self.assertEqual(comparisons["original"]["primary"]["miou"], 0)
+        self.assertIsNotNone(comparisons["original"]["per_class"][0]["iou"])
+        record_path = trained / "run.json"
+        original_record = read_json(record_path)
+        record = dict(original_record, status="running")
+        write_json(record_path, record)
+        with patch("facade_change.segmentation.evaluate.gpu_preflight") as gpu:
+            with self.assertRaisesRegex(ValueError, "completed semantic training"):
+                evaluate_checkpoint(trained, self.root / "invalid-active", device="cpu")
+            gpu.assert_not_called()
+        write_json(record_path, original_record)
+        with (trained / "best.pth").open("ab") as stream:
+            stream.write(b"changed")
+        with patch("facade_change.segmentation.evaluate.gpu_preflight") as gpu:
+            with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+                evaluate_checkpoint(trained, self.root / "invalid-hash", device="cpu")
+            gpu.assert_not_called()
+
     def test_prepare_only_cli_needs_no_model_and_legacy_crop_budget_is_rejected(self):
         out = self.root / "cli-augmentations"
         command = [sys.executable, "-m", "facade_change.segmentation", "--dataset", str(self.dataset)]
@@ -319,6 +387,84 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("unrecognized arguments", rejected.stderr)
         self.assertIn("--crops-per-image", rejected.stderr)
+
+
+@unittest.skipUnless(HAS_TORCH, "optional torch dependency unavailable")
+class RobustnessTransformTests(unittest.TestCase):
+    def test_evaluation_cli_rejects_explicit_training_options_and_accepts_only_runtime_overrides(self):
+        from facade_change.segmentation.__main__ import main
+        base = ["facade_change.segmentation", "--evaluate-run", "completed-training"]
+        forbidden = {"--dataset": "dataset", "--prepare-only": None,
+                     "--reuse-augmentations": "cache", "--class-groups": "groups.json",
+                     "--methods-config": "methods.json", "--source-root": "dino",
+                     "--checkpoint": "weights.pth", "--trust-checkpoint": None,
+                     "--epochs": "20", "--learning-rate": "0.001", "--seed": "42",
+                     "--cutmix-prob": "0.25", "--cutout-prob": "0.125"}
+        with patch("facade_change.segmentation.evaluate.evaluate_checkpoint",
+                   return_value={"out": "report"}) as evaluate:
+            for option, value in forbidden.items():
+                spellings = [[option]] if value is None else [[option, value], [f"{option}={value}"]]
+                for suffix in spellings:
+                    with self.subTest(suffix=suffix), patch.object(sys, "argv", base + suffix):
+                        error = io.StringIO()
+                        with redirect_stderr(error), self.assertRaises(SystemExit) as stopped:
+                            main()
+                        self.assertEqual(stopped.exception.code, 2)
+                        self.assertIn("incompatible options", error.getvalue())
+                        self.assertIn(option, error.getvalue())
+                        evaluate.assert_not_called()
+            with patch.object(sys, "argv", base + ["--check=weights.pth"]):
+                error = io.StringIO()
+                with redirect_stderr(error), self.assertRaises(SystemExit) as stopped:
+                    main()
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn("unrecognized arguments", error.getvalue())
+                evaluate.assert_not_called()
+            # Default training values must not prevent evaluation, and all
+            # supported execution/cache overrides must reach the evaluator.
+            for suffix, expected in [([], {"augmentations": None, "device": "cuda:0", "batch_size": 4,
+                                          "export_probabilities": False, "smoke": False, "no_amp": False}),
+                                     (["--augmentations=cache", "--device=cpu", "--batch-size=2", "--smoke",
+                                       "--no-amp", "--export-probabilities"],
+                                      {"augmentations": "cache", "device": "cpu", "batch_size": 2,
+                                       "export_probabilities": True, "smoke": True, "no_amp": True})]:
+                with self.subTest(suffix=suffix), patch.object(sys, "argv", base + ["--out=report"] + suffix):
+                    with redirect_stdout(io.StringIO()):
+                        main()
+                    evaluate.assert_called_once_with("completed-training", "report", **expected)
+                    evaluate.reset_mock()
+
+    def test_photometry_is_label_independent_and_translation_pairs_masks(self):
+        from types import SimpleNamespace
+        from facade_change.segmentation.evaluate import CONDITIONS, ConditionCrops, _shift, bernoulli_entropy
+        rows = make_grid(16, 16, 16, [0], [0])
+        row = rows[0]
+        rgb = np.full((16, 16, 3), 128, np.uint8)
+        target = np.zeros((2, 16, 16), bool)
+        target[0, 2:8, 3:9] = True
+        target[1, 4:10, 5:11] = True
+        valid = target.any(axis=0)
+        data = SimpleNamespace(crop_size=16, crops_by_image={1: rows},
+                               images={1: {"split": "val", "width": 16, "height": 16}})
+        prepared = SimpleNamespace(original_crop=lambda image_id, crop: (rgb, target, valid))
+        for condition in CONDITIONS[1:5]:
+            wrapper = ConditionCrops(prepared, data, condition)
+            first = wrapper.original_crop(1, row)
+            second = wrapper.original_crop(1, row)
+            for a, b in zip(first, second):
+                np.testing.assert_array_equal(a, b)
+            np.testing.assert_array_equal(first[1], target)
+            np.testing.assert_array_equal(first[2], valid)
+            # Unannotated pixels also receive the photometric transform.
+            self.assertTrue(np.any(first[0][~valid] != rgb[~valid]))
+        reference = ConditionCrops(prepared, data, CONDITIONS[-2]).original_crop(1, row)
+        translated = ConditionCrops(prepared, data, CONDITIONS[-1]).original_crop(1, row)
+        np.testing.assert_array_equal(_shift(reference[2], 1, -1), translated[2])
+        np.testing.assert_array_equal(_shift(target.transpose(1, 2, 0), 1, -1).transpose(2, 0, 1), translated[1])
+        self.assertEqual(int(reference[2].sum()), int(translated[2].sum()))
+        self.assertTrue((translated[1][0] & translated[1][1]).any())
+        np.testing.assert_array_equal(bernoulli_entropy(np.array([[[0., .5, 1.]], [[1., .5, 0.]]])),
+                                      [[0., 1., 0.]])
 
 
 if __name__ == "__main__":

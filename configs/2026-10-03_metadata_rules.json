@@ -491,5 +491,42 @@
     "view_id": "Kamenoostrovskii_prospect_25_2",
     "building_id": "Kamenoostrovskii_prospect_25_2",
     "notes": "Owner-requested named-series inclusion, 2026-10-11; years from filename suffixes"
+  },
+  {
+    "view_id": "Pushkinskaya_5",
+    "building_id": "Pushkinskaya_5",
+    "notes": "Owner-requested named building inclusion, 2026-10-11; year from filename suffix"
+  },
+  {
+    "file_name": "Marata_8.jpg",
+    "view_id": "Marata_8",
+    "building_id": "Marata_8",
+    "year": null,
+    "notes": "Owner-requested named building inclusion, 2026-10-11; acquisition year unknown, semantic TRAIN only"
+  },
+  {
+    "view_id": "Poltavskaya_14",
+    "building_id": "Poltavskaya_14",
+    "notes": "Owner-requested named-series inclusion, 2026-10-11; years from filename suffixes"
+  },
+  {
+    "view_id": "Chkalovskii_prospect_58",
+    "building_id": "Chkalovskii_prospect_58",
+    "notes": "Owner-requested named building inclusion, 2026-10-11; year from filename suffix"
+  },
+  {
+    "view_id": "Chkalovskii_prospect_54",
+    "building_id": "Chkalovskii_prospect_54",
+    "notes": "Owner-requested named building inclusion, 2026-10-11; year from filename suffix"
+  },
+  {
+    "view_id": "Bolshaya_Monetnay_11",
+    "building_id": "Bolshaya_Monetnay_11",
+    "notes": "Owner-requested named building inclusion, 2026-10-11; observed spelling retained without alias inference"
+  },
+  {
+    "view_id": "Kamenoostrovskii_prospect_26_28",
+    "building_id": "Kamenoostrovskii_prospect_26_28",
+    "notes": "Owner-requested named building inclusion, 2026-10-11; year from filename suffix"
   }
 ]

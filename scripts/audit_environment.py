@@ -7,6 +7,7 @@ a broken native extension does not prevent the rest of the report being saved.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import importlib.metadata
 import json
@@ -113,13 +114,344 @@ def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+
+# Cleanup is deliberately a read-only inventory. Metadata contains dependencies,
+# not a proof that an unreferenced artifact has no scientific value.
+PATH_SUFFIXES = {".json", ".jsonl", ".csv", ".npz", ".npy", ".pth", ".pt", ".ckpt",
+                 ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".py", ".html", ".gz", ".zip", ".tar"}
+
+
+def _path_strings(value, key=""):
+    if isinstance(value, dict):
+        for name, child in value.items():
+            # Artifact/source hashes often use the file path as the dictionary key.
+            if isinstance(name, str) and ("/" in name or Path(name).suffix.lower() in PATH_SUFFIXES):
+                yield name, "dictionary_key"
+            yield from _path_strings(child, str(name))
+    elif isinstance(value, list):
+        for child in value:
+            yield from _path_strings(child, key)
+    elif isinstance(value, str) and value and len(value) < 4096:
+        if "://" in value or "\n" in value or value in {"auto", "none", "null"}:
+            return
+        if (value.startswith(("/", "./", "../", "~/")) or "/" in value
+                or Path(value).suffix.lower() in PATH_SUFFIXES):
+            yield value, key
+
+
+def _lexical(path):
+    """Make paths absolute without dereferencing symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _symlink_component(path):
+    return next((p for p in (path, *path.parents) if p.is_symlink()), None)
+
+
+def _metadata_files(directory):
+    """Do not enter symlink directories or read symlink metadata files."""
+    files, links, logical_bytes = [], [], 0
+    def failed(error):
+        raise error
+    for base, dirs, names in os.walk(directory, followlinks=False, onerror=failed):
+        for name in list(dirs):
+            path = Path(base) / name
+            if path.is_symlink():
+                links.append(path)
+                dirs.remove(name)
+        dirs[:] = [name for name in dirs if name not in {".git", "__pycache__"}]
+        for name in names:
+            path = Path(base) / name
+            if path.is_symlink():
+                links.append(path)
+                continue
+            logical_bytes += path.stat().st_size
+            if path.suffix.lower() in {".json", ".jsonl"}:
+                files.append(path)
+    return files, links, logical_bytes
+
+
+def _active_run_paths(runs):
+    """Best-effort Linux process inspection; no processes are changed."""
+    result, available = set(), Path("/proc").is_dir()
+    if available:
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdigit() or int(proc.name) == os.getpid():
+                continue
+            try:
+                command = (proc / "cmdline").read_bytes().decode("utf-8", "replace").split("\0")
+                cwd = Path(os.readlink(proc / "cwd"))
+            except (OSError, PermissionError):
+                continue
+            for arg in [str(cwd), *command]:
+                # Match full paths and cwd-relative CLI path arguments, including --out=...
+                arg = arg.split("=", 1)[-1] if arg.startswith("--") else arg
+                if not arg or "\n" in arg:
+                    continue
+                path = _lexical(cwd / arg)
+                if path.is_relative_to(runs):
+                    result.add(path)
+    return sorted(result), available
+
+
+def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
+    """Retain transitive dependencies of selected, configured and unfinished runs.
+
+    All existing interpretations of a relative metadata path are kept when the
+    origin is ambiguous. External paths are reported, never recursively scanned.
+    There is intentionally no delete/apply counterpart to this advisory report.
+    """
+    repository = Path(repository).resolve()
+    runs = repository / "runs"
+    if not runs.is_dir() or runs.is_symlink():
+        raise ValueError("Cleanup audit needs a real, non-symlink repository/runs directory")
+    entries = {_lexical(p): {"path": str(_lexical(p)), "reasons": [], "references": [],
+                            "logical_bytes": None, "run_status": None}
+               for p in runs.iterdir() if not p.name.startswith(".")}
+    if not keep_runs:
+        raise ValueError("Provide at least one --keep-run; no implicit newest-run selection")
+
+    def owner(path):
+        try:
+            parts = path.relative_to(runs).parts
+            return runs / parts[0] if parts else None
+        except ValueError:
+            return None
+
+    seeds, edges, unresolved, metadata_hashes = set(), {}, [], {}
+    external_references, warnings = [], []
+
+    def retain(path, reason):
+        target = owner(path)
+        if target in entries:
+            seeds.add(target)
+            if reason not in entries[target]["reasons"]:
+                entries[target]["reasons"].append(reason)
+
+    for raw in keep_runs:
+        path = _lexical(repository / Path(raw).expanduser())
+        if owner(path) not in entries or not path.exists():
+            raise ValueError(f"--keep-run is missing or outside repository/runs: {raw}")
+        retain(path, "explicit_keep")
+    if active_paths is None:
+        active_paths, available = _active_run_paths(runs)
+    else:
+        available = True
+    if not available:
+        warnings.append("Process inspection unavailable; unfinished runs remain protected")
+    for path in active_paths:
+        retain(_lexical(path), "active_process_reference")
+
+    def record_reference(source, origin, raw, key):
+        candidate = Path(raw).expanduser()
+        bases = [origin.parent, owner(origin), repository, runs]
+        candidates = {candidate} if candidate.is_absolute() else {
+            base / candidate for base in bases if base is not None}
+        paths = sorted({_lexical(p) for p in candidates})
+        found = [p for p in paths if p.exists() or _symlink_component(p)]
+        if not found:
+            found = [p for p in paths if owner(p) in entries]
+        if not found:
+            unresolved.append({"source": str(origin), "value": raw, "key": key})
+            return
+        for path in found:
+            target = owner(path)
+            ref = {"source": str(origin), "value": raw, "resolved": str(path), "key": key}
+            if target in entries:
+                if not path.exists() and not _symlink_component(path):
+                    unresolved.append({"source": str(origin), "value": raw, "key": key,
+                                       "resolved": str(path), "error": "referenced artifact is missing; owning run retained"})
+                edges.setdefault(source, set()).add(target)
+                entries[target]["references"].append(ref)
+                link = _symlink_component(path)
+                if link:
+                    retain(target, "symlink_reference_needs_review")
+                    # Read the link destination only; never open or traverse it.
+                    resolved = path.resolve(strict=False)
+                    linked_owner = owner(resolved)
+                    if linked_owner in entries:
+                        edges.setdefault(source, set()).add(linked_owner)
+                        retain(linked_owner, "symlink_target_needs_review")
+                    else:
+                        external_references.append({**ref, "resolved": str(resolved), "via_symlink": True})
+            elif not path.is_relative_to(repository):
+                external_references.append(ref)
+
+    def inspect_metadata(source, path):
+        try:
+            # Large prediction files are not metadata; never consume unbounded RAM.
+            if path.stat().st_size > 64 * 1024 * 1024:
+                raise ValueError("metadata exceeds 64 MiB audit bound")
+            payload = path.read_bytes()
+            metadata_hashes[str(path)] = hashlib.sha256(payload).hexdigest()
+            if path.suffix.lower() == ".jsonl":
+                documents = (json.loads(line) for line in payload.decode("utf-8").splitlines() if line.strip())
+            else:
+                documents = [json.loads(payload)]
+            for document in documents:
+                for raw, key in _path_strings(document):
+                    record_reference(source, path, raw, key)
+        except (OSError, ValueError, UnicodeError) as exc:
+            unresolved.append({"source": str(path), "error": str(exc)})
+            if source in entries:
+                retain(source, "unreadable_metadata")
+
+    for path, entry in entries.items():
+        if path.is_symlink():
+            retain(path, "symlink_entry_needs_review")
+            target = path.resolve(strict=False)
+            retain(target, "symlink_target_needs_review")
+            continue
+        if not path.is_dir():
+            entry["logical_bytes"] = path.stat().st_size
+            if path.suffix.lower() in {".gz", ".zip", ".tar"}:
+                entry["run_status"] = "archive_not_inspected"
+            else:
+                retain(path, "non_run_artifact_needs_review")
+            continue
+        try:
+            files, links, logical_bytes = _metadata_files(path)
+            entry["logical_bytes"] = logical_bytes
+            for link in links:
+                retain(path, "contains_symlink_needs_review")
+                retain(link.resolve(strict=False), "symlink_target_needs_review")
+            marker = path / "run.json"
+            if not marker.is_file():
+                marker = path / "summary.json"
+            state = json.loads(marker.read_text()) if marker.is_file() and not marker.is_symlink() else {}
+            status = state.get("status") if isinstance(state, dict) else None
+            entry["run_status"] = status
+            if not isinstance(status, str) or not status.startswith("completed"):
+                retain(path, "unfinished_or_unknown_status")
+            for metadata in files:
+                inspect_metadata(path, metadata)
+        except (OSError, ValueError, UnicodeError) as exc:
+            retain(path, "unreadable_run")
+            unresolved.append({"source": str(path), "error": str(exc)})
+    configs = repository / "configs"
+    if configs.is_dir() and not configs.is_symlink():
+        config_files, links, _ = _metadata_files(configs)
+        for path in config_files:
+            # Example configs do not express active local dependencies.
+            if ".example." not in path.name:
+                inspect_metadata("configs", path)
+        if links:
+            warnings.append("Symlink config files were not opened; review their dependencies manually")
+    for target in edges.get("configs", ()):
+        retain(target, "repository_config_dependency")
+    retained = set(seeds)
+    pending = list(seeds)
+    while pending:
+        parent = pending.pop()
+        for child in edges.get(parent, ()):
+            if child != parent:
+                reason = "dependency_of:" + parent.name
+                if reason not in entries[child]["reasons"]:
+                    entries[child]["reasons"].append(reason)
+            if child not in retained:
+                retained.add(child)
+                pending.append(child)
+    rows = []
+    for path, entry in sorted(entries.items()):
+        entry["decision"] = "retained" if path in retained else "review_candidate"
+        entry["dependencies"] = sorted(str(p) for p in edges.get(path, ()) if p != path)
+        rows.append(entry)
+    external = []
+    for raw in scan_roots:
+        directory = _lexical(raw)
+        if _symlink_component(directory) or not directory.is_dir():
+            warnings.append(f"External inventory root unavailable or symlink; skipped: {directory}")
+            continue
+        for item in sorted(directory.iterdir()):
+            if item.name.startswith(".") or item == repository:
+                continue
+            refs = [r for r in external_references
+                    if Path(r["resolved"]) == item or Path(r["resolved"]).is_relative_to(item)]
+            external.append({"path": str(item), "kind": "symlink" if item.is_symlink() else
+                             "directory" if item.is_dir() else "file",
+                             "decision": "referenced_keep" if refs else "unverified_not_for_deletion",
+                             "references": refs})
+    local_candidates = []
+    for relative in ("scripts/analyze_method_complementarity.py", "scripts/evaluate_frozen_geoscd_fusion.py",
+                     "tests/test_method_complementarity.py", "tests/test_frozen_geoscd_fusion.py"):
+        item = repository / relative
+        if not item.is_file() or item.is_symlink():
+            continue
+        try:
+            tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "--", relative],
+                                     cwd=repository, capture_output=True, timeout=5).returncode
+        except (OSError, subprocess.TimeoutExpired):
+            tracked = None
+        if tracked == 1:
+            local_candidates.append({"path": str(item), "decision": "review_candidate",
+                                     "reason": "untracked_legacy_copy_superseded_by_data_analysis",
+                                     "logical_bytes": item.stat().st_size})
+    for folder in ("facade_change", "data_analysis", "scripts", "tests"):
+        directory = repository / folder
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        for base, dirs, _ in os.walk(directory, followlinks=False):
+            dirs[:] = [name for name in dirs if not (Path(base) / name).is_symlink()]
+            if "__pycache__" in dirs:
+                local_candidates.append({"path": str(Path(base) / "__pycache__"),
+                                         "decision": "regenerable_cache", "reason": "Python bytecode cache",
+                                         "logical_bytes": None})
+                dirs.remove("__pycache__")
+    return {"schema_version": 1, "kind": "cleanup_audit", "status": "completed_advisory",
+            "repository": str(repository), "created_utc": datetime.now(timezone.utc).isoformat(),
+            "read_only": True, "process_inspection_available": available,
+            "runs": rows, "local_candidates": local_candidates, "external_inventory": external,
+            "external_references": external_references, "unresolved": unresolved,
+            "metadata_sha256": metadata_hashes, "warnings": warnings,
+            "scope": "Dependency closure from metadata/configs and best-effort live process paths. "
+                     "Candidates require review; no assertion that unreferenced scientific evidence is disposable. "
+                     "External sources, weights and scripts are never deletion candidates; symlinks are not traversed."}
+
+
+def write_cleanup_report(out, report):
+    write_json(out / "cleanup.json", report)
+    with (out / "cleanup.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["decision", "path", "run_status", "logical_bytes", "reasons"])
+        writer.writeheader()
+        for row in report["runs"]:
+            writer.writerow({key: "; ".join(row[key]) if key == "reasons" else row[key]
+                             for key in writer.fieldnames})
+        for row in report["local_candidates"]:
+            writer.writerow({"decision": row["decision"], "path": row["path"], "run_status": "",
+                             "logical_bytes": row["logical_bytes"], "reasons": row["reason"]})
+    lines = ["Read-only cleanup dependency audit; nothing was moved or deleted."]
+    for row in report["runs"]:
+        lines.append(f"{row['decision']}: {row['path']} | {', '.join(row['reasons']) or 'no retained metadata reference'}")
+    for row in report["local_candidates"]:
+        lines.append(f"{row['decision']}: {row['path']} | {row['reason']}")
+    candidates = [row for row in report["runs"] if row["decision"] == "review_candidate"]
+    lines += [f"Review candidates: {len(candidates)}; logical bytes: "
+              f"{sum(row['logical_bytes'] or 0 for row in candidates)}",
+              f"Unresolved metadata references/errors: {len(report['unresolved'])}",
+              f"External items: {len(report['external_inventory'])}; unverified items are not deletion candidates.",
+              report["scope"], *report["warnings"], f"Report: {out / 'cleanup.json'}"]
+    text = "\n".join(lines) + "\n"
+    (out / "summary.txt").write_text(text, encoding="utf-8")
+    print(text)
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, help="New report directory; never overwritten")
     parser.add_argument("--run-tests", action="store_true", help="Run the small CPU suite with this interpreter")
+    parser.add_argument("--cleanup-plan", action="store_true", help="Read-only run dependency/cleanup inventory; no environment probes")
+    parser.add_argument("--keep-run", action="append", default=[], help="Retain this run and all dependencies; repeatable")
+    parser.add_argument("--scan-root", action="append", default=[], help="Shallow external inventory, e.g. $HOME; never deletion candidates")
     args = parser.parse_args(argv)
+    if not args.cleanup_plan and (args.keep_run or args.scan_root):
+        parser.error("--keep-run/--scan-root require --cleanup-plan")
+    if args.cleanup_plan and (args.run_tests or not args.keep_run):
+        parser.error("--cleanup-plan needs --keep-run and cannot be combined with --run-tests")
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=False)
+    if args.cleanup_plan:
+        report = cleanup_plan(ROOT, args.keep_run, args.scan_root)
+        write_cleanup_report(out, report)
+        return 0
     packages = {}
     for name in ("numpy", "Pillow", "opencv-python", "opencv-python-headless",
                  "opencv-contrib-python", "opencv-contrib-python-headless", "torch", "kornia"):

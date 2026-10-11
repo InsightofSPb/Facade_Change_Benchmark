@@ -1,5 +1,6 @@
 import csv
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,8 +9,137 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from facade_change.hypothesis_dataset import prepare_hypothesis_dataset
+from facade_change.hypothesis_dataset import prepare_history_dataset, prepare_hypothesis_dataset
 from facade_change.io import finish_record, read_json, run_record, sha256, write_json
+
+
+@unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required for procedural state rendering")
+class HistoryDatasetTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.dataset = self.root / "dataset"
+        self.dataset.mkdir()
+        categories = [{"id": 1, "name": "CRACK"}]
+        coco_images, images, crops = [], [], []
+        for identifier, split in enumerate(("train", "train", "val", "train", "test"), 1):
+            yy, xx = np.indices((64, 64))
+            rgb = np.stack([(xx * 2 + 50 + identifier) % 255, (yy * 2 + 90) % 255,
+                            np.full_like(xx, 130 + identifier), np.full_like(xx, 255)], axis=-1).astype(np.uint8)
+            rgb[:2, :, 3] = 0
+            path = self.dataset / f"photo-{identifier}.png"
+            Image.fromarray(rgb).save(path)
+            building = None if identifier == 4 else f"building-{identifier}"
+            view = None if identifier == 4 else f"view-{identifier}"
+            image = {"image_id": identifier, "file_name": path.name, "image_path": str(path),
+                     "sha256": sha256(path), "width": 64, "height": 64, "building_id": building,
+                     "view_id": view, "metadata_status": "unknown" if identifier == 4 else "reviewed",
+                     "split": split}
+            images.append(image)
+            coco_images.append({"id": identifier, "file_name": path.name, "width": 64, "height": 64})
+            crops.append({"crop_id": f"{identifier}-crop", "image_id": identifier, "image_sha256": image["sha256"],
+                          "building_id": building, "view_id": view, "split": split, "x": 0, "y": 0,
+                          "width": 64, "height": 64, "pad_right": 0, "pad_bottom": 0})
+        self.images, self.crops = images, crops
+        write_json(self.dataset / "coco.json", {"images": coco_images, "categories": categories,
+                                               "annotations": [{"id": 99, "image_id": 5, "category_id": 999,
+                                                                "segmentation": None}]})
+        write_json(self.dataset / "manifest.json", {"images": images, "categories": categories})
+        write_json(self.dataset / "split.json", {"building_assignments": {
+            row["building_id"]: row["split"] for row in images if row["building_id"]}})
+        (self.dataset / "crops.jsonl").write_text("".join(json.dumps(crop) + "\n" for crop in crops))
+        write_json(self.dataset / "dataset.json", {"kind": "semantic_crop_index", "crop_size": 64,
+                                                  "source_coco": "coco.json", "manifest": "manifest.json",
+                                                  "crops": "crops.jsonl", "split": "split.json",
+                                                  "source_coco_sha256": sha256(self.dataset / "coco.json"),
+                                                  "categories": categories})
+
+    def prepare(self, name="history", **kwargs):
+        out = self.root / name
+        # Neither TEST nor unidentified TRAIN may be decoded by selection.
+        (self.dataset / "photo-4.png").unlink(missing_ok=True)
+        (self.dataset / "photo-5.png").unlink(missing_ok=True)
+        with patch("facade_change.segmentation.data.PreparedData._rasterize", side_effect=AssertionError("labels decoded")):
+            summary = prepare_history_dataset(self.dataset, out, **kwargs)
+        return out, summary, read_json(out / "manifest.json")
+
+    @staticmethod
+    def array(out, frame, name):
+        with Image.open(out / frame["paths"][name]) as image:
+            return np.array(image)
+
+    def test_clean_controls_persistence_contexts_and_native_support(self):
+        out, summary, manifest = self.prepare()
+        self.assertEqual(summary["sequences"], 6)
+        self.assertEqual(summary["event_types"], {"growth": 1, "partial_repair": 1, "delamination": 1})
+        self.assertEqual(summary["buildings_by_split"], {"train": 2, "val": 1})
+        self.assertFalse(summary["test_rgb_loaded"])
+        self.assertFalse(summary["semantic_annotations_rasterized"])
+        for base in manifest["bases"]:
+            clean, event = [sequence for sequence in manifest["sequences"] if sequence["base_id"] == base["base_id"]]
+            for index, (control_frame, frame) in enumerate(zip(clean["frames"], event["frames"])):
+                self.assertEqual(control_frame["nuisance"], frame["nuisance"])
+                np.testing.assert_array_equal(self.array(out, control_frame, "visibility"),
+                                              self.array(out, frame, "visibility"))
+                self.assertEqual(control_frame["event_pixels"], 0)
+                self.assertNotEqual(frame["nuisance"]["kind"], "blur")
+                if index in (0, 1, 3):
+                    self.assertEqual(frame["event_pixels"], 0)
+                else:
+                    self.assertGreater(frame["event_pixels"], 0)
+                if index:
+                    self.assertEqual(frame["contexts"], {"earliest": [1], "previous": [index],
+                                                         "history": list(range(1, index + 1))})
+                    self.assertTrue(all(value < frame["frame"] for value in frame["contexts"]["history"]))
+                    comparable = self.array(out, frame, "comparable") > 0
+                    labels = self.array(out, frame, "event_labels")
+                    change = self.array(out, frame, "new_change") > 0
+                    self.assertTrue(np.all(labels[~comparable] == 255))
+                    np.testing.assert_array_equal(labels[comparable], change[comparable].astype(np.uint8))
+                    self.assertFalse(comparable[:2].any())
+            np.testing.assert_array_equal(self.array(out, event["frames"][2], "latent_rgb"),
+                                          self.array(out, event["frames"][3], "latent_rgb"))
+        record = read_json(out / "run.json")
+        self.assertEqual(record["status"], "completed_exploratory")
+        for path, expected in record["artifact_sha256"].items():
+            self.assertEqual(sha256(out / path), expected)
+        self.assertTrue((out / "gallery.html").is_file())
+
+    def test_reproducible_without_test_access_and_without_overwrite(self):
+        _, _, first = self.prepare("first")
+        self.crops.reverse()
+        (self.dataset / "crops.jsonl").write_text("".join(json.dumps(row) + "\n" for row in self.crops))
+        _, _, second = self.prepare("second")
+        self.assertEqual(first["sequences"], second["sequences"])
+        with self.assertRaises(FileExistsError):
+            self.prepare("second")
+
+    def test_hidden_event_is_preserved_in_state_truth_but_ignored_in_labels(self):
+        from facade_change.augmentations import apply_nuisance
+
+        def occlude_onset(rgb, support, spec):
+            if spec["id"] == "frame_3":
+                spec = {"id": spec["id"], "kind": "occlusion", "rectangle": [0., 0., 1., 1.]}
+            return apply_nuisance(rgb, support, spec)
+
+        with patch("facade_change.augmentations.apply_nuisance", side_effect=occlude_onset):
+            out, _, manifest = self.prepare()
+        for sequence in manifest["sequences"]:
+            if sequence["arm"] == "event":
+                onset = sequence["frames"][2]
+                self.assertGreater(onset["event_pixels"], 0)
+                self.assertEqual(onset["visible_event_pixels"], 0)
+                self.assertTrue(np.all(self.array(out, onset, "event_labels") == 255))
+                self.assertTrue(np.all(self.array(out, sequence["frames"][3], "event_labels") == 255))
+
+    def test_explicit_test_and_tampered_selected_image_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "train/val"):
+            self.prepare(splits=("test",))
+        (self.dataset / "photo-1.png").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "source image hash"):
+            self.prepare("changed")
+        self.assertEqual(read_json(self.root / "changed/run.json")["status"], "failed")
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required for procedural state rendering")

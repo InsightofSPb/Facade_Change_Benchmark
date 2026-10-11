@@ -151,6 +151,211 @@ def _save(path, array):
     Image.fromarray(array).save(path)
 
 
+def prepare_history_dataset(dataset, out, seed=42, crops_per_building=1,
+                            max_buildings_per_split=0, splits=("train", "val"), final_event="mixed"):
+    """Prepare paired five-frame histories on reviewed native TRAIN/VAL crops.
+
+    This is data preparation only. The base may contain real damage; only the
+    additional procedural events are labelled. Semantic annotations are not
+    rasterized or used for crop ranking, state generation or nuisance choices.
+    """
+    from .augmentations import apply_nuisance, render_history_states
+    from .segmentation.data import PreparedData
+
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
+    if type(crops_per_building) is not int or crops_per_building < 1:
+        raise ValueError("crops_per_building must be a positive integer")
+    if type(max_buildings_per_split) is not int or max_buildings_per_split < 0:
+        raise ValueError("max_buildings_per_split must be a nonnegative integer")
+    event_types = ("growth", "partial_repair", "delamination")
+    if final_event not in (*event_types, "mixed"):
+        raise ValueError("final_event must be mixed, growth, partial_repair or delamination")
+    data = PreparedData(dataset, splits=splits)
+    groups, excluded = {}, []
+    for image_id, image in data.images.items():
+        if not image.get("building_id") or image.get("metadata_status") != "reviewed":
+            excluded.append({"image_id": image_id, "reason": "unreviewed_building"})
+            continue
+        for crop in data.crops_by_image[image_id]:
+            if min(crop["width"], crop["height"]) < 8:
+                excluded.append({"crop_id": crop["crop_id"], "reason": "native_crop_smaller_than_8"})
+                continue
+            groups.setdefault((image["split"], image["building_id"]), []).append(crop)
+    selected = []
+    for part in sorted(data.splits):
+        buildings = sorted((building for split, building in groups if split == part),
+                           key=lambda value: _digest([seed, value]))
+        if max_buildings_per_split:
+            buildings = buildings[:max_buildings_per_split]
+        for building in buildings:
+            candidates = sorted(groups[part, building], key=lambda row: _digest(
+                [seed, building, row["image_sha256"], row["x"], row["y"], row["width"], row["height"]]))
+            seen, unique = set(), []
+            for crop in candidates:
+                key = (crop["image_sha256"], crop["x"], crop["y"], crop["width"], crop["height"])
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(crop)
+            selected.extend(unique[:crops_per_building])
+    if not selected:
+        raise ValueError("No reviewed native TRAIN/VAL crops available for histories")
+    config = {"dataset": str(data.dataset_path), "input_sha256": data.metadata["sha256"],
+              "seed": seed, "crops_per_building": crops_per_building,
+              "max_buildings_per_split": max_buildings_per_split, "splits": list(data.splits),
+              "final_event": final_event, "frames_per_history": 5,
+              "selection": "stable SHA ranking on reviewed building and native crop identity; no labels",
+              "label_scope": LABEL_SCOPE, "geometry": "identity on native RGB crop; no rescaling",
+              "observation_policy": "independent timewise nuisance draws shared by clean/event arms; no blur",
+              "evaluation_target": "step event since preceding latent state, not difference from earliest image",
+              "context_policy": "earliest, previous, all past frames on identical target frames 2–5"}
+    out = new_directory(out)
+    record = run_record("history_dataset", config)
+    write_json(out / "run.json", record)
+    try:
+        write_json(out / "config.json", config)
+        write_json(out / "selection.json", {"selected": selected, "excluded_images_or_small_crops": excluded,
+                                            "policy": config["selection"]})
+        split_path = Path(data.metadata["paths"]["split"])
+        shutil.copyfile(split_path, out / "split.json")
+        sequences, bases, source_hashes = [], [], {}
+        page = ['<!doctype html><meta charset="utf-8"><title>Persistent facade histories</title>',
+                '<style>body{font:15px system-ui;margin:24px}table{border-collapse:collapse}',
+                'td,th{padding:8px;border:1px solid #ddd;vertical-align:top}img{width:150px}</style>',
+                '<h1>Persistent facade histories</h1><p>Exploratory synthetic events, not real damage ground truth. ',
+                'Each cell shows observed RGB and the newly changed region before nuisance. ',
+                'Frame 4 preserves damage without a new event. Clean arms share identical observation conditions.</p>']
+        for base_index, crop in enumerate(selected):
+            image = data.images[crop["image_id"]]
+            image_path = Path(image["image_path"])
+            source_hashes[str(image_path)] = sha256(image_path)
+            if source_hashes[str(image_path)] != image["sha256"]:
+                raise ValueError(f"History source image hash mismatch: {image_path}")
+            full_rgb, full_support = load_rgb(image_path)
+            if full_rgb.shape[:2] != (image["height"], image["width"]):
+                raise ValueError("History image dimensions disagree with prepared manifest")
+            x, y, w, h = (crop[key] for key in ("x", "y", "width", "height"))
+            # No semantic support and no edge padding become model-visible RGB.
+            rgb, support = full_rgb[y:y+h, x:x+w].copy(), full_support[y:y+h, x:x+w].copy()
+            del full_rgb, full_support
+            base_id = _digest([image["building_id"], image["sha256"], x, y, w, h])[:24]
+            relative = Path("bases") / base_id
+            directory = new_directory(out / relative)
+            (directory / "artifacts").mkdir()
+            saved = {}
+
+            def save_array(name, value):
+                array = value.astype(np.uint8) * 255 if value.dtype == bool else value
+                digest = hashlib.sha256(str(array.shape).encode() + array.tobytes()).hexdigest()
+                if digest not in saved:
+                    path = relative / "artifacts" / f"{name}-{digest[:16]}.png"
+                    _save(out / path, array)
+                    saved[digest] = path.as_posix()
+                return saved[digest]
+
+            event_kind = event_types[base_index % len(event_types)] if final_event == "mixed" else final_event
+            state_seed = int(_digest([seed, base_id, "state"])[:16], 16)
+            states = render_history_states(rgb, support, event_kind, state_seed)
+            rng = np.random.default_rng(int(_digest([seed, base_id, "observation"])[:16], 16))
+            observations = []
+            for frame in range(5):
+                kind = str(rng.choice(["identity", "exposure", "white_balance", "shadow", "occlusion"],
+                                      p=[.15, .25, .25, .25, .10]))
+                spec = {"id": f"frame_{frame + 1}", "kind": kind}
+                if kind == "exposure":
+                    spec["gain"] = float(2 ** rng.uniform(-.5, .5))
+                elif kind == "white_balance":
+                    spec["gains"] = rng.uniform(.85, 1.15, 3).tolist()
+                elif kind == "shadow":
+                    spec.update(template=str(rng.choice(["diagonal", "band"])),
+                                strength=float(rng.uniform(.2, .5)), edge_width=.04)
+                elif kind == "occlusion":
+                    left, top = rng.uniform(.15, .6, 2)
+                    spec.update(rectangle=[float(left), float(top), float(left + .25), float(top + .3)],
+                                color=[62, 68, 58])
+                observations.append(spec)
+            base = {"base_id": base_id, "image_id": image["image_id"], "file_name": image["file_name"],
+                    "image_sha256": image["sha256"], "building_id": image["building_id"],
+                    "view_id": image.get("view_id"), "split": image["split"], "crop": crop,
+                    "reference_rgb": save_array("base_rgb", rgb), "support": save_array("support", support),
+                    "state_seed": state_seed, "observation_specs": observations, "final_event": event_kind,
+                    "state_parameters": states[-1]["parameters"], "source_to_reference": IDENTITY}
+            bases.append(base)
+            empty = np.zeros_like(support)
+            for arm in ("clean", "event"):
+                sequence_id = base_id + "-" + arm
+                frames, previous_visibility = [], support
+                page.append('<h2>' + html.escape(f"{image['split']} / {image['building_id']} / {arm} / {event_kind}") + '</h2><table><tr>')
+                for frame, (state, spec) in enumerate(zip(states, observations)):
+                    latent = state["rgb"] if arm == "event" else rgb
+                    nuisance = apply_nuisance(latent, support, spec)
+                    visibility = nuisance["true_visibility"]
+                    comparable = support & previous_visibility & visibility
+                    event = state["new_change"] if arm == "event" else empty
+                    labels = np.full(support.shape, 255, np.uint8)
+                    if frame:
+                        labels[comparable] = event[comparable].astype(np.uint8)
+                    arrays = {"rgb": nuisance["rgb"], "latent_rgb": latent, "visibility": visibility,
+                              "support": nuisance["support"], "comparable": comparable,
+                              "nuisance_mask": nuisance["nuisance_mask"], "event_labels": labels}
+                    for key in ("state_edit", "damage_present", "damage_ever", "new_change", "new_damage", "repaired"):
+                        arrays[key] = state[key] if arm == "event" else empty
+                    paths = {name: save_array(name, array) for name, array in arrays.items()}
+                    item = {"frame": frame + 1, "event": state["event"] if arm == "event" else ("initial" if frame == 0 else "none"),
+                            "nuisance": spec, "paths": paths,
+                            "event_pixels": int(event.sum()), "visible_event_pixels": int((event & comparable).sum()),
+                            "target": frame > 0,
+                            "contexts": ({"earliest": [1], "previous": [frame], "history": list(range(1, frame + 1))}
+                                         if frame else {}),
+                            "artifact_sha256": {name: sha256(out / path) for name, path in paths.items()}}
+                    frames.append(item)
+                    page.append(f'<td>Frame {frame + 1}: {html.escape(item["event"])}<br>' + ''.join(
+                        f'<img loading="lazy" src="{html.escape(paths[key], quote=True)}" alt="{key}"><br>'
+                        for key in ("rgb", "new_change")) + '</td>')
+                    previous_visibility = visibility
+                page.append('</tr></table>')
+                sequences.append({"sequence_id": sequence_id, "base_id": base_id, "arm": arm,
+                                  "building_id": image["building_id"], "split": image["split"],
+                                  "independent_photo_sample": False, "frames": frames})
+        for path, expected in source_hashes.items():
+            if sha256(path) != expected:
+                raise ValueError(f"Source image changed during history preparation: {path}")
+        for name, path in data.metadata["paths"].items():
+            if sha256(path) != data.metadata["sha256"][name]:
+                raise ValueError(f"Dataset metadata changed during history preparation: {name}")
+        manifest = {"schema_version": 1, "kind": "persistent_procedural_histories", "config": config,
+                    "label_scope": LABEL_SCOPE, "bases": bases, "sequences": sequences,
+                    "mask_semantics": {"state_edit": "current latent RGB difference from original base",
+                                       "damage_present": "current introduced crack/delamination proxy",
+                                       "damage_ever": "union of all introduced proxy damage through this time",
+                                       "new_change": "latent RGB change since previous frame, including repair",
+                                       "new_damage": "newly damaged pixels outside previous damage",
+                                       "repaired": "proxy damage restored to original base at this step",
+                                       "event_labels": "0=no step change, 1=step change, 255=unobserved in either adjacent frame"},
+                    "known_visibility_scope": "alpha support and procedural occlusion only; real occluders unknown",
+                    "aggregation": "cases within building, then equal buildings; clean and event arms are paired",
+                    "ground_truth_policy": "event and latent masks are evaluation-only, never scorer inputs",
+                    "test_rgb_loaded": False, "semantic_annotations_rasterized": False}
+        write_json(out / "manifest.json", manifest)
+        (out / "gallery.html").write_text("\n".join(page), encoding="utf-8")
+        summary = {"status": "completed_exploratory", "out": str(out), "selected_crops": len(bases),
+                   "sequences": len(sequences), "frames": len(sequences) * 5,
+                   "target_frames": len(sequences) * 4, "clean_sequences": len(bases),
+                   "event_sequences": len(bases), "bases_by_split": dict(Counter(base["split"] for base in bases)),
+                   "buildings_by_split": {part: len({base["building_id"] for base in bases if base["split"] == part})
+                                          for part in data.splits},
+                   "event_types": dict(Counter(base["final_event"] for base in bases)),
+                   "test_rgb_loaded": False, "semantic_annotations_rasterized": False,
+                   "manifest": "manifest.json", "gallery": "gallery.html", "label_scope": LABEL_SCOPE}
+        write_json(out / "summary.json", summary)
+        record["summary"] = summary
+        finish_record(out, record, summary["status"])
+        return summary
+    except (Exception, KeyboardInterrupt) as exc:
+        finish_record(out, record, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", str(exc))
+        raise
+
+
 def prepare_hypothesis_dataset(crop_run, config_path, out):
     """Build same-reference H0/H1 controls, never labels from the real later photo."""
     from .augmentations import apply_nuisance, render_state, validate_scenarios

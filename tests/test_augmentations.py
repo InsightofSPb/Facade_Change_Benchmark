@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from facade_change.augmentations import apply_nuisance, render_state, validate_scenarios
+from facade_change.augmentations import apply_nuisance, render_history_states, render_state, validate_scenarios
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required")
@@ -32,6 +32,32 @@ class AugmentationTests(unittest.TestCase):
         np.testing.assert_array_equal(identity["support"], self.support)
         np.testing.assert_array_equal(identity["true_visibility"], self.support)
         self.assertFalse(identity["nuisance_mask"].any())
+
+    def test_persistent_history_separates_state_growth_and_repair(self):
+        for event in ("growth", "partial_repair", "delamination"):
+            with self.subTest(event=event):
+                states = render_history_states(self.rgb, self.support, event, seed=19)
+                self.assertEqual(len(states), 5)
+                for index, state in enumerate(states):
+                    previous = self.rgb if index == 0 else states[index - 1]["rgb"]
+                    np.testing.assert_array_equal(state["new_change"], np.any(previous != state["rgb"], axis=2))
+                    np.testing.assert_array_equal(state["state_edit"], np.any(self.rgb != state["rgb"], axis=2))
+                    np.testing.assert_array_equal(state["rgb"][~self.support], self.rgb[~self.support])
+                self.assertFalse(states[1]["new_change"].any())
+                self.assertTrue(states[2]["new_change"].any())
+                self.assertFalse(states[3]["new_change"].any())
+                np.testing.assert_array_equal(states[2]["rgb"], states[3]["rgb"])
+                self.assertTrue(states[4]["new_change"].any())
+                if event == "partial_repair":
+                    self.assertTrue(states[4]["repaired"].any())
+                    self.assertFalse(states[4]["new_damage"].any())
+                    self.assertLess(states[4]["damage_present"].sum(), states[3]["damage_present"].sum())
+                    np.testing.assert_array_equal(states[4]["damage_ever"], states[3]["damage_present"])
+                else:
+                    self.assertGreater(states[4]["damage_present"].sum(), states[3]["damage_present"].sum())
+                    self.assertFalse(states[4]["repaired"].any())
+                second = render_history_states(self.rgb, self.support, event, seed=19)
+                np.testing.assert_array_equal(second[-1]["rgb"], states[-1]["rgb"])
 
     def test_h1_is_local_actual_rgb_edit_and_preserves_unsupported_pixels(self):
         for state in ("crack", "paint_patch"):

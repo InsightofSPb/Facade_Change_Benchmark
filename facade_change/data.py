@@ -301,7 +301,12 @@ def read_overrides(path: str | Path | None, ids: set[str]) -> dict:
 
 
 def read_filename_rules(path, images, resolver=None) -> dict:
-    """Apply confirmed views, then filename exceptions, to current image IDs."""
+    """Apply confirmed views, then filename exceptions, to current image IDs.
+
+    Filename exceptions may confirm a building without a date. An omitted year
+    uses a terminal filename year if present; explicit null keeps it unknown.
+    Unknown years remain ineligible for temporal pairs.
+    """
     if path is None:
         return {}
     rules = read_json(path)
@@ -330,15 +335,16 @@ def read_filename_rules(path, images, resolver=None) -> dict:
             continue
         if not isinstance(rule["file_name"], str) or not rule["file_name"].strip():
             raise ValueError("Filename metadata rules need a nonempty file_name")
-        year = rule.get("year")
-        if isinstance(year, bool) or not isinstance(year, int) or not 1800 <= year <= 2100:
-            raise ValueError("Each metadata rule needs a valid integer year")
         name = normalized_name(resolver.canonical_name(rule["file_name"]) if resolver
                                else Path(rule["file_name"]).name)
+        year = rule.get("year") if "year" in rule else filename_metadata(name)["year"]
+        if year is not None and (isinstance(year, bool) or not isinstance(year, int)
+                                 or not 1800 <= year <= 2100):
+            raise ValueError("Each metadata rule needs a valid integer year or unknown year")
         if name in seen or len(by_name[name]) > 1:
             raise ValueError(f"Duplicate or ambiguous metadata rule: {name}")
         seen.add(name)
-        filename_rules.append((name, rule))
+        filename_rules.append((name, {**rule, "year": year}))
     result = {}
     for view, rule in view_rules.items():
         for image, year in by_view[view]:

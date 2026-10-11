@@ -95,6 +95,26 @@ def parser():
     hypotheses.add_argument("--crop-run", required=True)
     hypotheses.add_argument("--config", required=True, dest="config_path")
     hypotheses.add_argument("--out", required=True)
+    history = sub.add_parser("prepare-history", help="CPU five-frame synthetic histories with matched no-event controls")
+    history.add_argument("--dataset", required=True)
+    history.add_argument("--out", required=True)
+    history.add_argument("--seed", type=int, default=42)
+    history.add_argument("--crops-per-building", type=int, default=1)
+    history.add_argument("--max-buildings-per-split", type=int, default=0)
+    history.add_argument("--splits", nargs="+", choices=["train", "val"], default=["train", "val"])
+    history.add_argument("--final-event", choices=["mixed", "growth", "partial_repair", "delamination"], default="mixed")
+    transitions = sub.add_parser("mine-transitions", help="Review candidates from aligned real COCO class transitions; not event ground truth")
+    transitions.add_argument("--dataset", required=True)
+    transitions.add_argument("--alignment-run", required=True)
+    transitions.add_argument("--out", required=True)
+    transitions.add_argument("--window-sizes", nargs="+", type=int, default=[50, 100])
+    transitions.add_argument("--splits", nargs="+", choices=["train", "val"], default=["train", "val"])
+    transitions.add_argument("--min-support-fraction", type=float, default=.5)
+    transitions.add_argument("--min-transition-fraction", type=float, default=.02)
+    transitions.add_argument("--min-component-pixels", type=int, default=16)
+    transitions.add_argument("--max-windows-per-pair", type=int, default=20)
+    transitions.add_argument("--alignment-method", choices=["sift", "loftr", "cascade"])
+    transitions.add_argument("--all-class-pairs", action="store_true")
     trial = sub.add_parser("h0h1-benchmark", help="Change scorers on frozen procedural H0/H1 cases")
     from .methods.registry import ALL_METHODS
     trial.add_argument("--config", dest="benchmark_config", help="Common benchmark JSON; explicit flags override it")
@@ -257,6 +277,12 @@ def main(argv=None):
         elif command == "h0h1":
             from .hypothesis_dataset import prepare_hypothesis_dataset
             result = prepare_hypothesis_dataset(**args)
+        elif command == "prepare-history":
+            from .hypothesis_dataset import prepare_history_dataset
+            result = prepare_history_dataset(**args)
+        elif command == "mine-transitions":
+            from .semantic_training import mine_transition_candidates
+            result = mine_transition_candidates(**args)
         elif command == "h0h1-benchmark":
             from .hypothesis_benchmark import run_hypothesis_benchmark
             from .benchmark_config import benchmark_arguments

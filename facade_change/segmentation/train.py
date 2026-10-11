@@ -169,7 +169,7 @@ def _gallery(out, previews):
 
 
 def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, gallery_out=None,
-             split="val", groups=None, prepared=None):
+             split="val", groups=None, prepared=None, prediction_callback=None):
     model.eval()
     groups = groups if groups is not None else resolve_groups(data.categories)
     if split not in {"train", "val"} or any(data.images[key]["split"] != split for key in ids):
@@ -198,6 +198,9 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
                 counts[:] += confusion_counts(prediction, crop[1], valid)
                 group_counts[:] += group_confusion_counts(prediction, crop[1], valid, groups)
                 losses.append(loss_statistics(probability, crop[1], valid, logits=values))
+                if prediction_callback is not None:
+                    prediction_callback(image_id=image_id, row=row, crop=crop, valid=valid,
+                                        probability=probability, logits=values)
                 building = image["building_id"]
                 if gallery_out is not None and building not in shown:
                     previews.append(_save_gallery_crop(gallery_out, len(previews), data, image_id, row, crop, prediction))
