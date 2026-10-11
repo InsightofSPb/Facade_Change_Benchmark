@@ -208,6 +208,92 @@ class CleanupAuditTests(unittest.TestCase):
             tracked_report = self.plan(latest)
         self.assertNotIn(str(old), [row["path"] for row in tracked_report["local_candidates"]])
 
+    def test_path_extraction_ignores_prose_aliases_and_coco_rle(self):
+        latest = self.run_dir("latest")
+        source = self.run_dir("source")
+        self.json(latest / "manifest.json", {
+            "file_name": "hash-prefix-facade.jpg", "resolved_file_name": "facade.jpg",
+            "notes": "TRAIN/VAL use annotated support only", "statistic": "F1/IoU",
+            "description": "/not a real path; see results.json",
+            "segmentation": {"size": [512, 512], "counts": "a" * 500 + "/b" * 50},
+            "counts": "x/y" * 500, "source_run": str(source),
+        })
+        report = self.plan(latest)
+        self.assertEqual(report["unresolved_statistics"]["occurrences"], 0)
+        self.assertEqual(self.decisions(report)["source"], "retained")
+        self.assertTrue(report["dependency_scan_complete"])
+
+    def test_repeated_crop_references_have_bounded_grouped_evidence(self):
+        parent = self.run_dir("parent")
+        (parent / "weights.pth").write_bytes(b"do not load")
+        latest = self.run_dir("latest")
+        external = Path(self.temp.name) / "images"
+        external.mkdir()
+        image = external / "facade.png"
+        image.write_bytes(b"do not decode")
+        count = 3000
+        with (latest / "index.jsonl").open("w") as stream:
+            for i in range(count):
+                stream.write(json.dumps({"source_run": str(parent), "image_path": str(image),
+                                         "rgb": f"samples/missing-{i}.png",
+                                         "file_name": "facade.png"}) + "\n")
+        report = self.plan(latest, scan_roots=[Path(self.temp.name)])
+        self.assertLess(len(json.dumps(report).encode()), 30_000)
+        self.assertEqual(self.decisions(report)["parent"], "retained")
+        self.assertEqual(report["unresolved_statistics"]["occurrences"], count)
+        self.assertEqual(len(report["unresolved"]), 1)
+        self.assertEqual(report["unresolved"][0]["count"], count)
+        self.assertEqual(len(report["unresolved"][0]["examples"]), 2)
+        reference = next(row for row in report["runs"] if Path(row["path"]) == parent)
+        self.assertEqual(reference["reference_statistics"]["occurrences"], count)
+        self.assertEqual(len(reference["references"]), 1)
+        inventory = next(row for row in report["external_inventory"] if Path(row["path"]) == external)
+        self.assertEqual(inventory["decision"], "referenced_keep")
+        self.assertEqual(inventory["reference_statistics"]["occurrences"], count)
+
+    def test_previous_and_current_audit_outputs_never_become_dependencies(self):
+        latest = self.run_dir("latest")
+        unused = self.run_dir("unused")
+        previous = self.root / "runs" / "previous-cleanup"
+        self.json(previous / "cleanup.json", {"kind": "cleanup_audit", "runs": [{"path": str(unused)}]})
+        current = self.root / "runs" / "current-cleanup"
+        current.mkdir()
+        original = Path.read_bytes
+        def guarded(path):
+            if path.name == "cleanup.json":
+                raise AssertionError("Previous cleanup reports must not be parsed")
+            return original(path)
+        with patch.object(Path, "read_bytes", guarded):
+            report = self.plan(latest, output_directory=current)
+        self.assertEqual(self.decisions(report)["unused"], "review_candidate")
+        self.assertEqual(self.decisions(report)["previous-cleanup"], "retained")
+        self.assertEqual(self.decisions(report)["current-cleanup"], "retained")
+        self.assertNotIn(str(previous / "cleanup.json"), report["metadata_sha256"])
+
+    def test_jsonl_total_size_can_exceed_bound_without_loading_whole_file(self):
+        latest = self.run_dir("latest")
+        index = latest / "index.jsonl"
+        index.write_text((json.dumps({"image_id": 1, "file_name": "photo.png"}) + "\n") * 100)
+        with patch.dict(AUDIT["cleanup_plan"].__globals__, {"MAX_METADATA_BYTES": 256}):
+            report = self.plan(latest)
+        self.assertTrue(report["dependency_scan_complete"])
+        self.assertIn(str(index), report["metadata_sha256"])
+
+    def test_parse_failure_blocks_deletion_recommendations_and_diagnostics_are_capped(self):
+        latest = self.run_dir("latest")
+        unused = self.run_dir("unused")
+        self.json(latest / "too-large.json", {"notes": "x" * 500})
+        with patch.dict(AUDIT["cleanup_plan"].__globals__, {"MAX_METADATA_BYTES": 256}):
+            report = self.plan(latest)
+        self.assertFalse(report["dependency_scan_complete"])
+        self.assertEqual(self.decisions(report)["unused"], "unverified_scan_incomplete")
+        evidence = AUDIT["_Evidence"](limit=2)
+        for i in range(100):
+            evidence.add(str(i), {"source": "file.json", "value": "x" * 10000})
+        self.assertEqual(len(evidence.rows()), 2)
+        self.assertEqual(evidence.statistics()["omitted_occurrences"], 98)
+        self.assertLess(len(json.dumps(evidence.rows())), 3000)
+
     def test_cli_cleanup_does_not_probe_environment_or_load_models(self):
         latest = self.run_dir("latest")
         out = Path(self.temp.name) / "report"

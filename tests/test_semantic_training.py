@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from facade_change.semantic_training import include_auxiliary_training, _transition_windows, mine_transition_candidates
+from facade_change.semantic_training import (include_auxiliary_training, _transition_windows,
+                                             _select_transition_windows, mine_transition_candidates)
 from facade_change.io import finish_record, read_json, sha256, write_json
 
 
@@ -149,8 +150,11 @@ class RealTransitionCandidateTests(unittest.TestCase):
         finish_record(self.alignment, self.pair_record, "completed_needs_review")
 
     def run_mining(self, **kwargs):
+        options = {"window_sizes": (8, 12), "min_component_pixels": 2, "all_class_pairs": False,
+                   "event_types": ("replacement",), "boundary_tolerance_pixels": 0}
+        options.update(kwargs)
         return mine_transition_candidates(self.dataset, self.alignment, self.root / "result",
-                                           window_sizes=(8, 12), min_component_pixels=2, **kwargs)
+                                           **options)
 
     def test_warp_direction_multilabel_masks_missing_pairs_and_no_test_access(self):
         result = self.run_mining()
@@ -185,10 +189,12 @@ class RealTransitionCandidateTests(unittest.TestCase):
         source[:, 8:12] = 3
         # B already present at reference is not a B appearance.
         reference[:, 12:] = 3
-        windows = _transition_windows(reference, source, common, [tuple(categories)], (8,), .1, .01, 1)
+        windows = _transition_windows(reference, source, common, [tuple(categories)], (8,), .1, .01, 1,
+                                      boundary_tolerance_pixels=0)
         self.assertFalse(windows)
         source[4:12, 8:12] = 2
-        windows = _transition_windows(reference, source, common, [tuple(categories)], (8,), .1, .01, 1)
+        windows = _transition_windows(reference, source, common, [tuple(categories)], (8,), .1, .01, 1,
+                                      boundary_tolerance_pixels=0)
         self.assertTrue(windows)
         self.assertTrue(all(row["candidate_pixels"] <= 32 for row in windows))
 
@@ -265,6 +271,154 @@ class RealTransitionCandidateTests(unittest.TestCase):
         common = np.ones((8, 8), bool)
         self.assertEqual(len(_transition_windows(spall, repair, common, [pair], (8,), .5, .5, 1)), 1)
         self.assertFalse(_transition_windows(repair, spall, common, [pair], (8,), .5, .5, 1))
+
+    def test_all_events_export_raw_robust_masks_nullable_classes_and_cap_counts(self):
+        result = self.run_mining(event_types=("replacement", "appearance", "disappearance"),
+                                 all_class_pairs=True, max_windows_per_pair=3)
+        rows = read_json(self.root / "result/candidates.json")["candidates"]
+        self.assertEqual({row["event_type"] for row in rows}, {"replacement", "appearance", "disappearance"})
+        self.assertEqual(result["candidate_version"], 2)
+        self.assertEqual(result["qualifying_windows"] - result["omitted_windows"], 3)
+        gallery = (self.root / "result/gallery.html").read_text(encoding="utf-8")
+        self.assertIn("Area fractions are not confidence scores", gallery)
+        for row in rows:
+            self.assertIn(f'candidate pixels: {row["candidate_pixels"]}/{row["window_size"]**2}', gallery)
+            root = self.root / "result" / row["path"]
+            self.assertTrue((root / "raw_candidate_mask.png").is_file())
+            self.assertTrue((root / "ignored_boundary_mask.png").is_file())
+            self.assertEqual(row["raw_candidate_pixels"], row["candidate_pixels"]
+                             + row["ignored_boundary_pixels"] + row["other_robust_component_pixels"])
+            if row["event_type"] == "appearance":
+                self.assertIsNone(row["from_class"])
+                self.assertIsNone(row["from_category_id"])
+            if row["event_type"] == "disappearance":
+                self.assertIsNone(row["to_class"])
+
+    def test_boolean_pixel_parameters_are_invalid(self):
+        for name in ("boundary_tolerance_pixels", "min_component_pixels", "max_windows_per_pair"):
+            with self.assertRaises(ValueError):
+                self.run_mining(**{name: True})
+
+
+@unittest.skipUnless(importlib.util.find_spec("cv2"), "alignment extra required")
+class RobustTransitionWindowTests(unittest.TestCase):
+    categories = [{"id": 1, "name": "ORNAMENT_INTACT", "channel": 0},
+                  {"id": 2, "name": "WATER_STAIN", "channel": 1},
+                  {"id": 3, "name": "CRACK", "channel": 2}]
+
+    def windows(self, reference, source, common=None, **kwargs):
+        options = {"event_types": ("replacement", "appearance", "disappearance"),
+                   "boundary_tolerance_pixels": 2, "categories": self.categories}
+        options.update(kwargs)
+        pairs = [(a, b) for a in self.categories for b in self.categories if a != b]
+        if common is None:
+            common = (reference != 0) & (source != 0)
+        return _transition_windows(reference, source, common, pairs, (50, 100), .5, .02, 25, **options)
+
+    def test_arbitrary_replacement_and_independent_multilabel_appearance_disappearance(self):
+        earlier = np.ones((100, 100), np.uint16)
+        later = earlier.copy()
+        later[25:45, 25:45] |= 2  # Stain appears while ornament remains.
+        rows = self.windows(earlier, later)
+        self.assertTrue(rows)
+        self.assertEqual({(row["event_type"], row["from_class"], row["to_class"]) for row in rows},
+                         {("appearance", None, "WATER_STAIN")})
+        reverse = self.windows(later, earlier)
+        self.assertEqual({row["event_type"] for row in reverse}, {"disappearance"})
+        # A class switch outside the legacy pair whitelist is discovered too.
+        earlier[25:45, 25:45] = 2
+        later[25:45, 25:45] = 4
+        pairs = [row for row in self.windows(earlier, later) if row["event_type"] == "replacement"]
+        self.assertEqual({(row["from_class"], row["to_class"]) for row in pairs}, {("WATER_STAIN", "CRACK")})
+
+    def test_unknown_pixels_do_not_become_appearance_or_disappearance(self):
+        earlier = np.ones((100, 100), np.uint16)
+        later = earlier.copy()
+        earlier[25:45, 25:45] = 0
+        later[25:45, 25:45] = 2
+        self.assertFalse(self.windows(earlier, later))
+        self.assertFalse(self.windows(later, earlier))
+
+    def test_five_ten_and_scattered_mislabelled_pixels_fail_component_gates(self):
+        earlier = np.ones((100, 100), np.uint16)
+        for count in (5, 10):
+            later = earlier.copy()
+            later[20, 20:20+count] |= 2
+            self.assertFalse(self.windows(earlier, later))
+        later = earlier.copy()
+        later[::5, ::5] |= 2  # 400 pixels, but no qualifying connected component.
+        self.assertFalse(self.windows(earlier, later))
+
+    def test_small_contour_jitter_is_suppressed_without_morphological_erosion(self):
+        earlier = np.ones((100, 100), np.uint16)
+        earlier[20:70, 20:70] |= 2
+        for shift in (1, 2):
+            later = np.ones_like(earlier)
+            later[20:70, 20+shift:70+shift] |= 2
+            self.assertFalse(self.windows(earlier, later))
+            self.assertTrue(self.windows(earlier, later, boundary_tolerance_pixels=0))
+
+    def test_entirely_new_one_pixel_crack_survives_if_window_area_is_sufficient(self):
+        earlier = np.ones((100, 100), np.uint16)
+        later = earlier.copy()
+        later[:, 49] |= 4
+        rows = self.windows(earlier, later)
+        self.assertTrue(rows)
+        self.assertEqual({row["window_size"] for row in rows}, {50})  # 50px meets2%; 100px does not meet200.
+        for row in rows:
+            self.assertEqual(row["event_type"], "appearance")
+            self.assertEqual(row["to_class"], "CRACK")
+            self.assertEqual(row["candidate_pixels"], 50)
+            self.assertEqual(row["ignored_boundary_pixels"], 0)
+            self.assertEqual(int(row["candidate_mask"].any(axis=0).sum()), 1)
+
+    def test_strong_patch_preserves_raw_boundary_exclusion_and_full_window_fraction(self):
+        earlier = np.ones((100, 100), np.uint16)
+        later = earlier.copy()
+        earlier[20:60, 20:50] |= 2
+        later[20:60, 20:70] |= 2
+        rows = [row for row in self.windows(earlier, later) if row["event_type"] == "appearance"]
+        self.assertTrue(any(row["window_size"] == 100 for row in rows))
+        for row in rows:
+            self.assertGreater(row["ignored_boundary_pixels"], 0)
+            self.assertGreaterEqual(row["candidate_pixels"], 25)
+            self.assertGreaterEqual(row["candidate_pixels"] / row["window_size"]**2, .02)
+            self.assertEqual(row["raw_candidate_pixels"], row["candidate_pixels"]
+                             + row["ignored_boundary_pixels"] + row["other_robust_component_pixels"])
+            self.assertLess(row["candidate_pixels"], row["window_size"]**2)
+
+    def test_cap_round_robin_retains_rare_event_class_groups_and_reports_omissions(self):
+        rows = [{"event_type": "appearance", "from_class": None, "to_class": "WATER_STAIN", "rank": i}
+                for i in range(12)]
+        rows += [{"event_type": "replacement", "from_class": "WATER_STAIN", "to_class": "CRACK", "rank": 0},
+                 {"event_type": "disappearance", "from_class": "CRACK", "to_class": None, "rank": 0}]
+        selected, counts = _select_transition_windows(rows, 3)
+        self.assertEqual({row["event_type"] for row in selected}, {"appearance", "replacement", "disappearance"})
+        self.assertEqual(sum(row["omitted_windows"] for row in counts), 11)
+        self.assertTrue(all(row["selected_windows"] == 1 for row in counts))
+        rows = []
+        for i in range(11):
+            rows.extend([{"event_type": "appearance", "from_class": None, "to_class": f"C{i}"},
+                         {"event_type": "disappearance", "from_class": f"C{i}", "to_class": None},
+                         {"event_type": "replacement", "from_class": f"C{i}", "to_class": f"C{i+1}"}])
+        selected, counts = _select_transition_windows(rows, 20)
+        self.assertEqual({row["event_type"] for row in selected}, {"appearance", "replacement", "disappearance"})
+        self.assertTrue(all(sum(row["event_type"] == kind for row in selected) >= 6
+                            for kind in ("replacement", "appearance", "disappearance")))
+        self.assertEqual(sum(row["omitted_windows"] for row in counts), 13)
+
+    def test_cli_defaults_and_explicit_legacy_protocol(self):
+        from facade_change.cli import parser
+        base = ["mine-transitions", "--dataset", "dataset", "--alignment-run", "alignment", "--out", "out"]
+        default = parser().parse_args(base)
+        self.assertTrue(default.all_class_pairs)
+        self.assertEqual(default.event_types, ["replacement", "appearance", "disappearance"])
+        self.assertEqual((default.boundary_tolerance_pixels, default.min_component_pixels), (2, 25))
+        legacy = parser().parse_args(base + ["--no-all-class-pairs", "--event-types", "replacement",
+                                             "--boundary-tolerance-pixels", "0", "--min-component-pixels", "16"])
+        self.assertFalse(legacy.all_class_pairs)
+        self.assertEqual(legacy.event_types, ["replacement"])
+        self.assertEqual((legacy.boundary_tolerance_pixels, legacy.min_component_pixels), (0, 16))
 
 
 if __name__ == "__main__":

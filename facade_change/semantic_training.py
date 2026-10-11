@@ -187,24 +187,68 @@ def include_auxiliary_training(prepared: dict, split: dict, enabled: bool):
 
 def _transition_windows(reference, source, common, class_pairs, window_sizes,
                         min_support_fraction, min_transition_fraction,
-                        min_component_pixels):
-    """Strict directed bitset changes; other simultaneous labels survive.
+                        min_component_pixels, *, event_types=("replacement",),
+                        boundary_tolerance_pixels=2, categories=None):
+    """Component-supported multilabel changes with same-class contour tolerance.
 
-    A disappearing label and an appearing label must occur at the SAME pixel.
-    Windows are centered on connected change components, not arbitrary RGB
-    differences. These annotations suggest review candidates, never temporal GT.
+    Dilating the OLD same-class mask suppresses contour jitter without eroding a
+    wholly new thin defect. Unknown pixels remain unknown at both dates. Raw
+    context belongs to the ancestor raw component of the selected robust one;
+    its other surviving subcomponents are counted separately, never pooled to
+    make a candidate pass the area thresholds.
     """
     import cv2
     import numpy as np
 
     h, w = common.shape
+    if categories is None:
+        categories = list({row["channel"]: row for pair in class_pairs for row in pair}.values())
+    raw_gain = source & ~reference
+    raw_loss = reference & ~source
+    raw_gain[~common] = 0
+    raw_loss[~common] = 0
+    gain, loss = np.zeros_like(reference), np.zeros_like(reference)
+    gain_channels, loss_channels = set(), set()
+    kernel = np.ones((2 * boundary_tolerance_pixels + 1,) * 2, np.uint8)
+    for category in categories:
+        bit = np.uint16(1 << category["channel"])
+        old_mask, new_mask = (reference & bit) != 0, (source & bit) != 0
+        old_near = cv2.dilate(old_mask.astype(np.uint8), kernel).astype(bool)
+        new_near = cv2.dilate(new_mask.astype(np.uint8), kernel).astype(bool)
+        gained, lost = common & new_mask & ~old_near, common & old_mask & ~new_near
+        gain[gained] |= bit
+        loss[lost] |= bit
+        if gained.any():
+            gain_channels.add(category["channel"])
+        if lost.any():
+            loss_channels.add(category["channel"])
+    specs = []
+    if "replacement" in event_types:
+        specs.extend(("replacement", old, new) for old, new in class_pairs)
+    if "appearance" in event_types:
+        specs.extend(("appearance", None, new) for new in categories)
+    if "disappearance" in event_types:
+        specs.extend(("disappearance", old, None) for old in categories)
     windows = []
-    for old, new in class_pairs:
-        old_bit, new_bit = np.uint16(1 << old["channel"]), np.uint16(1 << new["channel"])
-        changed = (common & ((reference & old_bit) != 0) & ((source & old_bit) == 0)
-                   & ((reference & new_bit) == 0) & ((source & new_bit) != 0))
+    for event_type, old, new in specs:
+        if ((old is not None and old["channel"] not in loss_channels)
+                or (new is not None and new["channel"] not in gain_channels)):
+            continue
+        if old is None:
+            bit = np.uint16(1 << new["channel"])
+            changed, raw_changed = (gain & bit) != 0, (raw_gain & bit) != 0
+        elif new is None:
+            bit = np.uint16(1 << old["channel"])
+            changed, raw_changed = (loss & bit) != 0, (raw_loss & bit) != 0
+        else:
+            old_bit, new_bit = np.uint16(1 << old["channel"]), np.uint16(1 << new["channel"])
+            changed = ((loss & old_bit) != 0) & ((gain & new_bit) != 0)
+            raw_changed = ((raw_loss & old_bit) != 0) & ((raw_gain & new_bit) != 0)
+        if not changed.any():
+            continue
         number, components, stats, centers = cv2.connectedComponentsWithStats(
             changed.astype(np.uint8), connectivity=8)
+        _, raw_components = cv2.connectedComponents(raw_changed.astype(np.uint8), connectivity=8)
         seen = set()
         for component in range(1, number):
             if int(stats[component, cv2.CC_STAT_AREA]) < min_component_pixels:
@@ -217,25 +261,67 @@ def _transition_windows(reference, source, common, class_pairs, window_sizes,
                 y = min(max(0, int(round(cy - (size - 1) / 2))), h - size)
                 if (x, y, size) in seen:
                     continue
-                seen.add((x, y, size))
                 support = int(common[y:y+size, x:x+size].sum())
                 # Count only the contiguous component that proposed this window.
                 event = components[y:y+size, x:x+size] == component
                 count = int(event.sum())
-                if (support / size**2 < min_support_fraction
+                if (count < min_component_pixels or support / size**2 < min_support_fraction
                         or count / size**2 < min_transition_fraction):
                     continue
-                windows.append({"from_class": old["name"], "to_class": new["name"],
-                                "from_category_id": old["id"], "to_category_id": new["id"],
+                seen.add((x, y, size))
+                raw_local = raw_components[y:y+size, x:x+size]
+                ancestor = int(raw_local[event][0])
+                raw_event = raw_local == ancestor
+                ignored = raw_event & ~changed[y:y+size, x:x+size]
+                windows.append({"event_type": event_type,
+                                "from_class": old["name"] if old else None,
+                                "to_class": new["name"] if new else None,
+                                "from_category_id": old["id"] if old else None,
+                                "to_category_id": new["id"] if new else None,
                                 "bbox_canvas_xyxy": [x, y, x+size, y+size], "window_size": size,
                                 "common_annotated_pixels": support, "candidate_pixels": count,
+                                "raw_candidate_pixels": int(raw_event.sum()),
+                                "ignored_boundary_pixels": int(ignored.sum()),
+                                "other_robust_component_pixels": int((raw_event & ~ignored & ~event).sum()),
                                 "component_pixels": int(stats[component, cv2.CC_STAT_AREA]),
+                                "boundary_tolerance_pixels": boundary_tolerance_pixels,
                                 "support_fraction": support / size**2,
                                 "transition_fraction": count / size**2,
-                                "candidate_mask": event.copy()})
+                                "candidate_mask": event.copy(), "raw_candidate_mask": raw_event.copy(),
+                                "ignored_boundary_mask": ignored.copy()})
     return sorted(windows, key=lambda row: (-row["transition_fraction"],
-                                           row["from_class"], row["to_class"],
+                                           row["event_type"], row["from_class"] or "", row["to_class"] or "",
                                            row["window_size"], row["bbox_canvas_xyxy"]))
+
+
+def _select_transition_windows(windows, limit):
+    """Round-robin event/class groups, retaining strongest windows within groups."""
+    groups = defaultdict(list)
+    for row in windows:
+        groups[(row["event_type"], row["from_class"] or "", row["to_class"] or "")].append(row)
+    by_type = {kind: sorted(key for key in groups if key[0] == kind)
+               for kind in ("replacement", "appearance", "disappearance")}
+    # Interleave event types before class groups: numerous appearances must not
+    # consume the entire review cap before any replacement is shown.
+    keys = [by_type[kind][index]
+            for index in range(max((len(rows) for rows in by_type.values()), default=0))
+            for kind in by_type if index < len(by_type[kind])]
+    selected, counts = [], Counter()
+    depth = 0
+    while len(selected) < limit:
+        added = False
+        for key in keys:
+            if depth < len(groups[key]) and len(selected) < limit:
+                selected.append(groups[key][depth])
+                counts[key] += 1
+                added = True
+        if not added:
+            break
+        depth += 1
+    report = [{"event_type": key[0], "from_class": key[1] or None, "to_class": key[2] or None,
+               "qualifying_windows": len(groups[key]), "selected_windows": counts[key],
+               "omitted_windows": len(groups[key]) - counts[key]} for key in keys]
+    return selected, report
 
 
 def _transition_alignments(path, method):
@@ -289,9 +375,11 @@ def _transition_alignments(path, method):
 
 def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 100),
                                splits=("train", "val"), min_support_fraction=.5,
-                               min_transition_fraction=.02, min_component_pixels=16,
+                               min_transition_fraction=.02, min_component_pixels=25,
                                max_windows_per_pair=20, alignment_method=None,
-                               all_class_pairs=False):
+                               all_class_pairs=True,
+                               event_types=("replacement", "appearance", "disappearance"),
+                               boundary_tolerance_pixels=2):
     """CPU-only review pack from existing first-anchor raw-RGB alignments.
 
     Absence is meaningful only within the annotated union at BOTH dates. Even
@@ -312,9 +400,16 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                                for size in window_sizes) or len(set(window_sizes)) != len(window_sizes)):
         raise ValueError("window_sizes must be distinct integers >=8")
     if (not 0 < min_support_fraction <= 1 or not 0 < min_transition_fraction <= 1
-            or not isinstance(min_component_pixels, int) or min_component_pixels < 1
+            or isinstance(min_component_pixels, bool) or not isinstance(min_component_pixels, int)
+            or min_component_pixels < 1 or isinstance(max_windows_per_pair, bool)
             or not isinstance(max_windows_per_pair, int) or max_windows_per_pair < 1):
         raise ValueError("Positive pixel/window limits and fractions in (0,1] are required")
+    if (isinstance(boundary_tolerance_pixels, bool) or not isinstance(boundary_tolerance_pixels, int)
+            or boundary_tolerance_pixels < 0):
+        raise ValueError("boundary_tolerance_pixels must be an integer >=0")
+    if (not event_types or len(set(event_types)) != len(event_types)
+            or not set(event_types) <= {"replacement", "appearance", "disappearance"}):
+        raise ValueError("event_types must contain distinct replacement/appearance/disappearance choices")
     data = dataset if isinstance(dataset, PreparedData) else PreparedData(dataset, splits=splits)
     if tuple(data.splits) != tuple(splits):
         raise ValueError("Requested splits differ from the prepared reader")
@@ -323,22 +418,27 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
     requested = ([(a["name"], b["name"]) for a in categories for b in categories if a != b]
                  if all_class_pairs else [("DELAMINATION", "SPALLING"), ("SPALLING", "REPAIRS")])
     class_pairs = [(by_name[a], by_name[b]) for a, b in requested if a in by_name and b in by_name]
-    if not class_pairs:
+    if not class_pairs and set(event_types) == {"replacement"}:
         raise ValueError("No requested directed class pair exists in the COCO ontology")
     alignment_path, alignments, unreadable = _transition_alignments(alignment_run, alignment_method)
     pairs = [row for row in data.manifest.get("pairs", []) if row.get("split") in splits]
-    config = {"dataset": data.metadata, "alignment_run": str(alignment_path),
+    config = {"candidate_version": 2, "dataset": data.metadata, "alignment_run": str(alignment_path),
               "alignment_run_sha256": sha256(alignment_path / "run.json"),
               "splits": list(splits), "window_sizes": list(window_sizes),
               "min_support_fraction": min_support_fraction,
               "min_transition_fraction": min_transition_fraction,
               "min_component_pixels": min_component_pixels,
+              "boundary_tolerance_pixels": boundary_tolerance_pixels,
+              "boundary_distance": "Chebyshev radius in native reference-grid pixels; square same-class dilation",
+              "event_types": list(event_types), "all_class_pairs": all_class_pairs,
               "max_windows_per_pair": max_windows_per_pair, "alignment_method": alignment_method,
               "class_pairs": [[a["name"], b["name"]] for a, b in class_pairs],
               "unavailable_class_pairs": [list(pair) for pair in requested
                                            if any(name not in by_name for name in pair)],
-              "candidate_rule": "same-pixel A disappears AND B appears; other labels preserved",
-              "window_selection": "component-centered windows; largest change fraction first; capped per pair",
+              "candidate_rule": "appearance/loss outside dilated same-class mask at the other date; replacement intersects robust loss(A) and gain(B)",
+              "raw_mask_scope": "ancestor raw component of the selected robust component; any other robust subcomponents counted separately",
+              "window_selection": "component-centered; strongest fraction within event/class groups; deterministic round-robin capped per pair",
+              "window_counting": "same robust connected component must meet absolute and full-window area thresholds; window is not labelled entirely positive",
               "support": "common geometric opaque support AND annotated non-crowd union at both dates",
               "pair_policy": "prepared earliest reference per view; never adjacent or future matching",
               "interpretation": "semantic annotation transition candidates; human review required; not temporal ground truth"}
@@ -416,18 +516,23 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                                                       borderValue=0) >= 1 - 1e-6)
             common = supports[0] & supports[1] & (packed[0] != 0) & (packed[1] != 0)
             windows = _transition_windows(*packed, common, class_pairs, window_sizes,
-                                          min_support_fraction, min_transition_fraction, min_component_pixels)
+                                          min_support_fraction, min_transition_fraction, min_component_pixels,
+                                          event_types=event_types, boundary_tolerance_pixels=boundary_tolerance_pixels,
+                                          categories=categories)
+            selected_windows, group_counts = _select_transition_windows(windows, max_windows_per_pair)
             pair_row.update(status="mined_needs_review", alignment_run=str(child),
                             alignment_run_sha256=selected["record_sha256"],
                             geometry_sha256=sha256(geometry_path), alignment_method=selected["method"],
                             alignment_quality_gate=child_record["quality_gate"],
                             common_annotated_pixels=int(common.sum()), qualifying_windows=len(windows),
                             truncated_windows=max(0, len(windows)-max_windows_per_pair),
-                            candidate_count=min(len(windows), max_windows_per_pair))
+                            candidate_count=len(selected_windows), window_counts_by_event_and_class=group_counts)
             view["usable_pairs"] += 1
             view["usable_source_years"].add(int(source["year"]))
-            for window in windows[:max_windows_per_pair]:
+            for window in selected_windows:
                 event = window.pop("candidate_mask")
+                raw_event = window.pop("raw_candidate_mask")
+                ignored = window.pop("ignored_boundary_mask")
                 x, y, x1, y1 = window["bbox_canvas_xyxy"]
                 offset = np.array([[1., 0, -x], [0, 1., -y], [0, 0, 1.]])
                 crop_canvas = Canvas(x1-x, y1-y, offset @ canvas.reference_to_canvas, canvas.source_to_reference)
@@ -440,11 +545,13 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                     overlay[event] = (overlay[event].astype(np.float32)*.4 + np.array([255, 45, 10])*.6).astype(np.uint8)
                     Image.fromarray(overlay).save(directory / f"{role}_candidate.png")
                 Image.fromarray(event.astype(np.uint8)*255).save(directory / "candidate_mask.png")
+                Image.fromarray(raw_event.astype(np.uint8)*255).save(directory / "raw_candidate_mask.png")
+                Image.fromarray(ignored.astype(np.uint8)*255).save(directory / "ignored_boundary_mask.png")
                 Image.fromarray(common[y:y1, x:x1].astype(np.uint8)*255).save(directory / "annotated_support.png")
                 # Packed labels retain all overlap channels and can be re-inspected.
                 np.savez_compressed(directory / "semantic_masks.npz",
                                     reference=packed[0][y:y1, x:x1], source=packed[1][y:y1, x:x1])
-                result = {**window, "candidate_id": candidate_id, "path": candidate_id,
+                result = {**window, "candidate_version": 2, "candidate_id": candidate_id, "path": candidate_id,
                           "pair_id": pair.get("pair_id"), "split": pair["split"],
                           "building_id": pair["building_id"], "view_id": pair["view_id"],
                           "reference_id": reference["image_id"], "source_id": source["image_id"],
@@ -459,12 +566,19 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                                           "category differences may be annotation disagreement, not physical change"]}
                 candidates.append(result)
                 title = html.escape(f"{pair['view_id']} {reference['year']} → {source['year']}: "
-                                    f"{window['from_class']} → {window['to_class']}")
-                gallery.append(f'<h2>{title}</h2><p>{candidate_id}; {window["window_size"]} px; needs review</p>'
+                                    f"{window['event_type']}: {window['from_class'] or '∅'} → {window['to_class'] or '∅'}")
+                gallery.append(f'<h2>{title}</h2><p>{candidate_id}; {window["window_size"]} px window; '
+                               f'candidate pixels: {window["candidate_pixels"]}/{window["window_size"]**2} '
+                               f'({window["transition_fraction"]:.2%} of window area); '
+                               f'raw component pixels: {window["raw_candidate_pixels"]}; '
+                               f'boundary-excluded pixels: {window["ignored_boundary_pixels"]}; '
+                               f'other retained subcomponent pixels: {window["other_robust_component_pixels"]}. '
+                               'Area fractions are not confidence scores. Needs review.</p>'
                                + "".join(f'<img src="{candidate_id}/{name}.png" alt="{name}">'
-                                         for name in ("reference", "source", "reference_candidate", "source_candidate")))
+                                         for name in ("reference", "source", "reference_candidate", "source_candidate",
+                                                      "raw_candidate_mask", "candidate_mask", "ignored_boundary_mask")))
             write_json(out / "pairs.json", pair_rows)
-            del arrays, packed, supports, common, windows
+            del arrays, packed, supports, common, windows, selected_windows
         view_rows = []
         for entry in views.values():
             entry["available_years"] = sorted(entry["available_years"])
@@ -472,17 +586,31 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
             entry["usable_observations"] = len(entry["usable_source_years"]) + int(entry["usable_pairs"] > 0)
             entry["history_of_at_least_3_observations"] = entry["usable_observations"] >= 3
             view_rows.append(entry)
-        summary = {"status": "completed_needs_review", "out": str(out), "candidate_count": len(candidates),
+        all_group_counts = {}
+        for pair_row in pair_rows:
+            for group in pair_row.get("window_counts_by_event_and_class", []):
+                key = (group["event_type"], group["from_class"] or "", group["to_class"] or "")
+                aggregate = all_group_counts.setdefault(key, {**group, "qualifying_windows": 0,
+                                                              "selected_windows": 0, "omitted_windows": 0})
+                for field in ("qualifying_windows", "selected_windows", "omitted_windows"):
+                    aggregate[field] += group[field]
+        summary = {"status": "completed_needs_review", "candidate_version": 2,
+                   "out": str(out), "candidate_count": len(candidates),
+                   "qualifying_windows": sum(row.get("qualifying_windows", 0) for row in pair_rows),
+                   "omitted_windows": sum(row.get("truncated_windows", 0) for row in pair_rows),
+                   "window_counts_by_event_and_class": [all_group_counts[key] for key in sorted(all_group_counts)],
                    "prepared_pairs": len(pairs), "pair_status_counts": dict(Counter(row["status"] for row in pair_rows)),
                    "alignment_inputs_without_observations": unreadable, "views": view_rows,
                    "test_rgb_loaded": False, "test_annotations_rasterized": False,
                    "quantitative_temporal_evaluation_allowed": False,
-                   "note": "A missing candidate does not establish an unchanged region; candidates are a biased review shortlist"}
-        write_json(out / "candidates.json", {"categories": categories, "candidates": candidates})
+                   "note": "A missing candidate does not establish an unchanged region; candidates are a biased review shortlist. Window counts are not event counts: sizes, classes and event types can overlap."}
+        write_json(out / "candidates.json", {"candidate_version": 2, "categories": categories, "candidates": candidates})
         write_json(out / "pairs.json", pair_rows)
         write_json(out / "summary.json", summary)
         fields = ["candidate_id", "split", "building_id", "view_id", "reference_year", "source_year",
-                  "from_class", "to_class", "window_size", "candidate_pixels", "common_annotated_pixels",
+                  "event_type", "from_class", "to_class", "window_size", "candidate_pixels",
+                  "raw_candidate_pixels", "ignored_boundary_pixels", "other_robust_component_pixels",
+                  "common_annotated_pixels",
                   "transition_fraction", "support_fraction", "review_status", "path"]
         with (out / "candidates.csv").open("w", encoding="utf-8", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
@@ -494,7 +622,10 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
             '<h1>Real semantic transition candidates — review required</h1>'
             '<p>Original earlier/later RGB, then annotation candidate overlays. Red is an annotation-derived '
             'candidate, not confirmed change. Review alignment, occlusion, class consistency and missing labels. '
-            'No temporal metrics or automatically accepted ground truth.</p>' + "".join(gallery), encoding="utf-8")
+            'Then raw component, selected robust component and boundary-excluded pixels. '
+            '∅ means this category is absent within common annotated support, not an unlabelled or healthy state. '
+            'Candidate windows are not distinct physical events. No temporal metrics or automatically accepted ground truth.</p>'
+            + "".join(gallery), encoding="utf-8")
         if sha256(alignment_path / "run.json") != config["alignment_run_sha256"]:
             raise ValueError("Alignment run changed during mining")
         for row in pair_rows:

@@ -121,22 +121,75 @@ PATH_SUFFIXES = {".json", ".jsonl", ".csv", ".npz", ".npy", ".pth", ".pt", ".ckp
                  ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".py", ".html", ".gz", ".zip", ".tar"}
 
 
+MAX_DIAGNOSTIC_GROUPS = 80
+MAX_METADATA_HASHES = 128
+MAX_METADATA_BYTES = 64 * 1024 * 1024
+PATH_KEYS = {"path", "paths", "root", "roots", "source", "reference", "out", "output", "input",
+             "checkpoint", "weights", "python", "encoder", "decoder", "reuse", "parent", "dataset",
+             "manifest", "split", "config", "rgb", "labels", "valid", "support", "mask", "index",
+             "archive", "cache", "scores", "probabilities", "ref", "target", "run", "runs",
+             "parents", "sources", "checkpoints", "image", "images"}
+PATH_KEY_SUFFIXES = ("_path", "_paths", "_root", "_roots", "_run", "_runs", "_dir", "_directory",
+                     "_file", "_files", "_checkpoint", "_json", "_csv", "_mask", "_rgb")
+NAME_KEYS = {"file_name", "resolved_file_name", "old_name", "new_name"}
+TEXT_KEYS = {"notes", "metadata_notes", "note", "description", "scope", "message", "error"}
+
+
 def _path_strings(value, key=""):
+    """Extract path fields, not image aliases, prose, metric names or COCO RLE."""
+    if key in {"segmentation", "counts"}:
+        return
     if isinstance(value, dict):
         for name, child in value.items():
-            # Artifact/source hashes often use the file path as the dictionary key.
-            if isinstance(name, str) and ("/" in name or Path(name).suffix.lower() in PATH_SUFFIXES):
+            # Only actual hash maps or qualified path keys are path evidence.
+            hashed = isinstance(child, str) and len(child) == 64 and all(c in "0123456789abcdef" for c in child.lower())
+            if (isinstance(name, str) and ((hashed and Path(name).suffix.lower() in PATH_SUFFIXES)
+                    or name.startswith(("/", "../", "./", "~/")))):
                 yield name, "dictionary_key"
             yield from _path_strings(child, str(name))
     elif isinstance(value, list):
         for child in value:
             yield from _path_strings(child, key)
     elif isinstance(value, str) and value and len(value) < 4096:
-        if "://" in value or "\n" in value or value in {"auto", "none", "null"}:
+        if (key in TEXT_KEYS or "://" in value or "\n" in value or "\x00" in value
+                or value in {"auto", "none", "null"}):
             return
-        if (value.startswith(("/", "./", "../", "~/")) or "/" in value
-                or Path(value).suffix.lower() in PATH_SUFFIXES):
+        qualified = value.startswith(("/", "./", "../", "~/"))
+        if key in NAME_KEYS and not qualified:
+            return
+        hinted = key in PATH_KEYS or key.endswith(PATH_KEY_SUFFIXES)
+        explicit_repo_path = value.startswith(("runs/", "configs/", "weights/", "third_party/", "data/"))
+        relative_file = "/" in value and not any(c.isspace() for c in value) and Path(value).suffix.lower() in PATH_SUFFIXES
+        if qualified or explicit_repo_path or relative_file or (hinted and ("/" in value or Path(value).suffix.lower() in PATH_SUFFIXES)):
             yield value, key
+
+
+class _Evidence:
+    """Bound examples while counting every occurrence; never bound graph edges."""
+    def __init__(self, limit=MAX_DIAGNOSTIC_GROUPS):
+        self.limit, self.groups, self.total, self.omitted = limit, {}, 0, 0
+
+    def add(self, group, row):
+        self.total += 1
+        if group not in self.groups:
+            if len(self.groups) >= self.limit:
+                self.omitted += 1
+                return
+            first = {key: value[:512] + "..." if isinstance(value, str) and len(value) > 512 else value
+                     for key, value in row.items()}
+            self.groups[group] = {**first, "count": 0, "examples": []}
+        entry = self.groups[group]
+        entry["count"] += 1
+        example = {key: str(row[key])[:512] for key in ("value", "resolved", "error") if key in row}
+        if example and example not in entry["examples"] and len(entry["examples"]) < 2:
+            entry["examples"].append(example)
+
+    def rows(self):
+        return list(self.groups.values())
+
+    def statistics(self):
+        return {"occurrences": self.total, "reported_groups": len(self.groups),
+                "omitted_occurrences": self.omitted, "max_groups": self.limit, "max_examples_per_group": 2}
 
 
 def _lexical(path):
@@ -194,7 +247,7 @@ def _active_run_paths(runs):
     return sorted(result), available
 
 
-def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
+def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None, output_directory=None):
     """Retain transitive dependencies of selected, configured and unfinished runs.
 
     All existing interpretations of a relative metadata path are kept when the
@@ -205,7 +258,7 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
     runs = repository / "runs"
     if not runs.is_dir() or runs.is_symlink():
         raise ValueError("Cleanup audit needs a real, non-symlink repository/runs directory")
-    entries = {_lexical(p): {"path": str(_lexical(p)), "reasons": [], "references": [],
+    entries = {_lexical(p): {"path": str(_lexical(p)), "reasons": [], "references": _Evidence(3),
                             "logical_bytes": None, "run_status": None}
                for p in runs.iterdir() if not p.name.startswith(".")}
     if not keep_runs:
@@ -218,8 +271,34 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
         except ValueError:
             return None
 
-    seeds, edges, unresolved, metadata_hashes = set(), {}, [], {}
-    external_references, warnings = [], []
+    seeds, edges, unresolved, metadata_hashes = set(), {}, _Evidence(), {}
+    external_references, warnings = _Evidence(), []
+    metadata_digest, metadata_files_scanned = hashlib.sha256(), 0
+    scan_incomplete = False
+    external = {}
+    for raw in scan_roots:
+        directory = _lexical(raw)
+        if _symlink_component(directory) or not directory.is_dir():
+            warnings.append(f"External inventory root unavailable or symlink; skipped: {directory}")
+            continue
+        for item in sorted(directory.iterdir()):
+            if item.name.startswith(".") or item == repository:
+                continue
+            external[item] = {"path": str(item), "kind": "symlink" if item.is_symlink() else
+                              "directory" if item.is_dir() else "file", "references": _Evidence(3)}
+
+    def external_reference(ref):
+        path = Path(ref["resolved"])
+        inventory_matches = [item for item in external if path == item or path.is_relative_to(item)]
+        anchor = inventory_matches[0] if inventory_matches else path.parent
+        external_references.add(str(anchor), {**ref, "dependency_root": str(anchor)})
+        for item in inventory_matches:
+            external[item]["references"].add(str(owner(Path(ref["source"]))), ref)
+
+    def problem(origin, error, *, raw=None, key=None, resolved=None):
+        row = {"source": str(origin), "error": error}
+        row.update({k: v for k, v in (("value", raw), ("key", key), ("resolved", resolved)) if v is not None})
+        unresolved.add((str(origin), key, error), row)
 
     def retain(path, reason):
         target = owner(path)
@@ -252,17 +331,18 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
         if not found:
             found = [p for p in paths if owner(p) in entries]
         if not found:
-            unresolved.append({"source": str(origin), "value": raw, "key": key})
+            problem(origin, "reference_not_found", raw=raw, key=key)
             return
         for path in found:
             target = owner(path)
             ref = {"source": str(origin), "value": raw, "resolved": str(path), "key": key}
             if target in entries:
                 if not path.exists() and not _symlink_component(path):
-                    unresolved.append({"source": str(origin), "value": raw, "key": key,
-                                       "resolved": str(path), "error": "referenced artifact is missing; owning run retained"})
-                edges.setdefault(source, set()).add(target)
-                entries[target]["references"].append(ref)
+                    problem(origin, "referenced_artifact_missing_owning_run_retained",
+                            raw=raw, key=key, resolved=str(path))
+                if source != target:
+                    edges.setdefault(source, set()).add(target)
+                    entries[target]["references"].add(str(source), ref)
                 link = _symlink_component(path)
                 if link:
                     retain(target, "symlink_reference_needs_review")
@@ -273,30 +353,58 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
                         edges.setdefault(source, set()).add(linked_owner)
                         retain(linked_owner, "symlink_target_needs_review")
                     else:
-                        external_references.append({**ref, "resolved": str(resolved), "via_symlink": True})
+                        external_reference({**ref, "resolved": str(resolved), "via_symlink": True})
             elif not path.is_relative_to(repository):
-                external_references.append(ref)
+                external_reference(ref)
 
     def inspect_metadata(source, path):
+        nonlocal metadata_files_scanned, scan_incomplete
+        # Audit output describes every inspected file: ingesting it would turn the
+        # previous inventory into fake dependencies and recursively grow the report.
+        if path.name == "cleanup.json":
+            return
         try:
-            # Large prediction files are not metadata; never consume unbounded RAM.
-            if path.stat().st_size > 64 * 1024 * 1024:
-                raise ValueError("metadata exceeds 64 MiB audit bound")
-            payload = path.read_bytes()
-            metadata_hashes[str(path)] = hashlib.sha256(payload).hexdigest()
-            if path.suffix.lower() == ".jsonl":
-                documents = (json.loads(line) for line in payload.decode("utf-8").splitlines() if line.strip())
-            else:
-                documents = [json.loads(payload)]
-            for document in documents:
+            digest = hashlib.sha256()
+            def consume(document):
+                nonlocal scan_incomplete
                 for raw, key in _path_strings(document):
-                    record_reference(source, path, raw, key)
+                    try:
+                        record_reference(source, path, raw, key)
+                    except OSError:
+                        scan_incomplete = True
+                        problem(path, "invalid_path_reference", raw=raw, key=key)
+                        if source in entries:
+                            retain(source, "invalid_reference_needs_review")
+            if path.suffix.lower() == ".jsonl":
+                with path.open("rb") as stream:
+                    for line in iter(lambda: stream.readline(MAX_METADATA_BYTES + 1), b""):
+                        digest.update(line)
+                        if len(line) > MAX_METADATA_BYTES:
+                            raise ValueError("JSONL record exceeds audit bound")
+                        if line.strip():
+                            consume(json.loads(line))
+            else:
+                if path.stat().st_size > MAX_METADATA_BYTES:
+                    raise ValueError("JSON metadata exceeds audit bound")
+                payload = path.read_bytes()
+                digest.update(payload)
+                consume(json.loads(payload))
+            metadata_files_scanned += 1
+            file_hash = digest.hexdigest()
+            metadata_digest.update(str(path).encode("utf-8") + b"\0" + file_hash.encode("ascii") + b"\n")
+            if len(metadata_hashes) < MAX_METADATA_HASHES:
+                metadata_hashes[str(path)] = file_hash
         except (OSError, ValueError, UnicodeError) as exc:
-            unresolved.append({"source": str(path), "error": str(exc)})
+            scan_incomplete = True
+            problem(path, "metadata_not_parsed:" + str(exc)[:160])
             if source in entries:
                 retain(source, "unreadable_metadata")
 
-    for path, entry in entries.items():
+    for path, entry in sorted(entries.items()):
+        if output_directory is not None and path == _lexical(output_directory):
+            retain(path, "current_cleanup_output")
+            entry["run_status"] = "cleanup_output_not_scanned"
+            continue
         if path.is_symlink():
             retain(path, "symlink_entry_needs_review")
             target = path.resolve(strict=False)
@@ -315,27 +423,37 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
             for link in links:
                 retain(path, "contains_symlink_needs_review")
                 retain(link.resolve(strict=False), "symlink_target_needs_review")
+            # Old audits have no experiment run record. Their inventory is not
+            # an experiment dependency declaration, even if cleanup.json is huge.
+            if ((path / "cleanup.json").is_file() and not (path / "run.json").exists()):
+                entry["run_status"] = "previous_cleanup_audit_not_scanned"
+                retain(path, "previous_cleanup_audit_needs_review")
+                continue
             marker = path / "run.json"
             if not marker.is_file():
                 marker = path / "summary.json"
+            if marker.is_file() and not marker.is_symlink() and marker.stat().st_size > MAX_METADATA_BYTES:
+                raise ValueError("run marker exceeds audit bound")
             state = json.loads(marker.read_text()) if marker.is_file() and not marker.is_symlink() else {}
             status = state.get("status") if isinstance(state, dict) else None
             entry["run_status"] = status
             if not isinstance(status, str) or not status.startswith("completed"):
                 retain(path, "unfinished_or_unknown_status")
-            for metadata in files:
+            for metadata in sorted(files):
                 inspect_metadata(path, metadata)
         except (OSError, ValueError, UnicodeError) as exc:
             retain(path, "unreadable_run")
-            unresolved.append({"source": str(path), "error": str(exc)})
+            scan_incomplete = True
+            problem(path, "run_not_parsed:" + str(exc)[:160])
     configs = repository / "configs"
     if configs.is_dir() and not configs.is_symlink():
         config_files, links, _ = _metadata_files(configs)
-        for path in config_files:
+        for path in sorted(config_files):
             # Example configs do not express active local dependencies.
             if ".example." not in path.name:
                 inspect_metadata("configs", path)
         if links:
+            scan_incomplete = True
             warnings.append("Symlink config files were not opened; review their dependencies manually")
     for target in edges.get("configs", ()):
         retain(target, "repository_config_dependency")
@@ -353,24 +471,18 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
                 pending.append(child)
     rows = []
     for path, entry in sorted(entries.items()):
-        entry["decision"] = "retained" if path in retained else "review_candidate"
+        entry["decision"] = "retained" if path in retained else (
+            "unverified_scan_incomplete" if scan_incomplete else "review_candidate")
+        evidence = entry["references"]
+        entry["references"] = evidence.rows()
+        entry["reference_statistics"] = evidence.statistics()
         entry["dependencies"] = sorted(str(p) for p in edges.get(path, ()) if p != path)
         rows.append(entry)
-    external = []
-    for raw in scan_roots:
-        directory = _lexical(raw)
-        if _symlink_component(directory) or not directory.is_dir():
-            warnings.append(f"External inventory root unavailable or symlink; skipped: {directory}")
-            continue
-        for item in sorted(directory.iterdir()):
-            if item.name.startswith(".") or item == repository:
-                continue
-            refs = [r for r in external_references
-                    if Path(r["resolved"]) == item or Path(r["resolved"]).is_relative_to(item)]
-            external.append({"path": str(item), "kind": "symlink" if item.is_symlink() else
-                             "directory" if item.is_dir() else "file",
-                             "decision": "referenced_keep" if refs else "unverified_not_for_deletion",
-                             "references": refs})
+    for entry in external.values():
+        evidence = entry["references"]
+        entry["decision"] = "referenced_keep" if evidence.total else "unverified_not_for_deletion"
+        entry["references"] = evidence.rows()
+        entry["reference_statistics"] = evidence.statistics()
     local_candidates = []
     for relative in ("scripts/analyze_method_complementarity.py", "scripts/evaluate_frozen_geoscd_fusion.py",
                      "tests/test_method_complementarity.py", "tests/test_frozen_geoscd_fusion.py"):
@@ -397,15 +509,22 @@ def cleanup_plan(repository, keep_runs, scan_roots=(), active_paths=None):
                                          "decision": "regenerable_cache", "reason": "Python bytecode cache",
                                          "logical_bytes": None})
                 dirs.remove("__pycache__")
-    return {"schema_version": 1, "kind": "cleanup_audit", "status": "completed_advisory",
+    return {"schema_version": 2, "kind": "cleanup_audit", "status": "completed_advisory",
             "repository": str(repository), "created_utc": datetime.now(timezone.utc).isoformat(),
             "read_only": True, "process_inspection_available": available,
-            "runs": rows, "local_candidates": local_candidates, "external_inventory": external,
-            "external_references": external_references, "unresolved": unresolved,
-            "metadata_sha256": metadata_hashes, "warnings": warnings,
+            "runs": rows, "local_candidates": local_candidates, "external_inventory": list(external.values()),
+            "external_references": external_references.rows(),
+            "external_reference_statistics": external_references.statistics(),
+            "unresolved": unresolved.rows(), "unresolved_statistics": unresolved.statistics(),
+            "dependency_scan_complete": not scan_incomplete,
+            "metadata_sha256": metadata_hashes, "metadata_files_scanned": metadata_files_scanned,
+            "metadata_hashes_omitted": metadata_files_scanned - len(metadata_hashes),
+            "metadata_inventory_sha256": metadata_digest.hexdigest(), "warnings": warnings,
             "scope": "Dependency closure from metadata/configs and best-effort live process paths. "
                      "Candidates require review; no assertion that unreferenced scientific evidence is disposable. "
-                     "External sources, weights and scripts are never deletion candidates; symlinks are not traversed."}
+                     "External sources, weights and scripts are never deletion candidates; symlinks are not traversed. "
+                     "Evidence is grouped and sampled; dependency edges are not sampled. "
+                     "Previous cleanup reports are excluded. Incomplete parsing blocks run cleanup recommendations."}
 
 
 def write_cleanup_report(out, report):
@@ -427,7 +546,11 @@ def write_cleanup_report(out, report):
     candidates = [row for row in report["runs"] if row["decision"] == "review_candidate"]
     lines += [f"Review candidates: {len(candidates)}; logical bytes: "
               f"{sum(row['logical_bytes'] or 0 for row in candidates)}",
-              f"Unresolved metadata references/errors: {len(report['unresolved'])}",
+              f"Unresolved reference/error occurrences: {report['unresolved_statistics']['occurrences']}; "
+              f"shown diagnostic groups: {report['unresolved_statistics']['reported_groups']} "
+              f"(at most 2 examples/group; omitted occurrences: {report['unresolved_statistics']['omitted_occurrences']})",
+              f"Dependency scan complete: {report['dependency_scan_complete']}; "
+              f"metadata files scanned: {report['metadata_files_scanned']}",
               f"External items: {len(report['external_inventory'])}; unverified items are not deletion candidates.",
               report["scope"], *report["warnings"], f"Report: {out / 'cleanup.json'}"]
     text = "\n".join(lines) + "\n"
@@ -449,7 +572,7 @@ def main(argv=None):
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=False)
     if args.cleanup_plan:
-        report = cleanup_plan(ROOT, args.keep_run, args.scan_root)
+        report = cleanup_plan(ROOT, args.keep_run, args.scan_root, output_directory=out)
         write_cleanup_report(out, report)
         return 0
     packages = {}

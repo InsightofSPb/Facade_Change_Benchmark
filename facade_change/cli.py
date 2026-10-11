@@ -111,10 +111,16 @@ def parser():
     transitions.add_argument("--splits", nargs="+", choices=["train", "val"], default=["train", "val"])
     transitions.add_argument("--min-support-fraction", type=float, default=.5)
     transitions.add_argument("--min-transition-fraction", type=float, default=.02)
-    transitions.add_argument("--min-component-pixels", type=int, default=16)
+    transitions.add_argument("--min-component-pixels", type=int, default=25,
+                             help="Minimum connected candidate area, including inside each exported window")
+    transitions.add_argument("--boundary-tolerance-pixels", type=int, default=2,
+                             help="Ignore same-class contour displacement within this native reference-grid radius")
+    transitions.add_argument("--event-types", nargs="+", default=["replacement", "appearance", "disappearance"],
+                             choices=["replacement", "appearance", "disappearance"])
     transitions.add_argument("--max-windows-per-pair", type=int, default=20)
     transitions.add_argument("--alignment-method", choices=["sift", "loftr", "cascade"])
-    transitions.add_argument("--all-class-pairs", action="store_true")
+    transitions.add_argument("--all-class-pairs", action=argparse.BooleanOptionalAction, default=True,
+                             help="All directed COCO class replacements by default; --no-all-class-pairs restores the two original replacement pairs")
     trial = sub.add_parser("h0h1-benchmark", help="Change scorers on frozen procedural H0/H1 cases")
     from .methods.registry import ALL_METHODS
     trial.add_argument("--config", dest="benchmark_config", help="Common benchmark JSON; explicit flags override it")
