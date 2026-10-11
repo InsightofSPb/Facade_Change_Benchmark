@@ -78,10 +78,12 @@ elif args[0] == 'run':
         if python_args[1:] and python_args[1].endswith('.so'):
             assert Path(python_args[1]).read_bytes() == b'synthetic built coder'
         else:
-            result = subprocess.run([sys.executable, '-s', *python_args], input=script, text=True)
+            # Only the synthetic environment's PYTHONPATH modules are visible;
+            # host site-packages must not fill in deliberately removed helpers.
+            result = subprocess.run([sys.executable, '-s', '-S', *python_args], input=script, text=True)
             raise SystemExit(result.returncode)
     else:
-        raise SystemExit(subprocess.run([sys.executable, '-s', *python_args]).returncode)
+        raise SystemExit(subprocess.run([sys.executable, '-s', '-S', *python_args]).returncode)
 ''')
         self._executable("git", r'''import json, os, shutil, sys
 from pathlib import Path
