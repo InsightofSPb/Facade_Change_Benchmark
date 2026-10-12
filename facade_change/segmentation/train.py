@@ -134,11 +134,11 @@ def fixed_batches(prepared, records, batch_size, rng):
 
 def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, gallery_out=None,
              split="val", groups=None, prepared=None, prediction_callback=None,
-             preview_buffer=None):
+             preview_buffer=None, image_prediction_callback=None):
     model.eval()
     groups = groups if groups is not None else resolve_groups(data.categories)
-    if split not in {"train", "val"} or any(data.images[key]["split"] != split for key in ids):
-        raise ValueError("Evaluation IDs must belong to the named TRAIN or VAL split")
+    if split not in {"train", "val", "test"} or any(data.images[key]["split"] != split for key in ids):
+        raise ValueError("Evaluation IDs must belong to the named split")
     records, previews, shown = [], [], set()
     collect_previews = gallery_out is not None or preview_buffer is not None
     for image_id in tqdm(ids, desc=f"DINO {split.upper()} оценка", unit="фото"):
@@ -150,6 +150,19 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
         group_counts = np.zeros((len(groups), 3), dtype=np.int64)
         losses = []
         candidates = []
+        # Visualisation uses native-grid bitsets rather than C-channel full-image
+        # tensors. This preserves multilabel overlaps and bounds memory for large
+        # photographs. Every crop runs once, including unannotated image regions.
+        full = None
+        if image_prediction_callback is not None:
+            if not 1 <= len(data.categories) <= 16:
+                raise ValueError("Native full-image bit masks require 1–16 category channels")
+            shape = (image["height"], image["width"])
+            full = {"rgb": np.zeros((*shape, 3), dtype=np.uint8),
+                    "target": np.zeros(shape, dtype=np.uint16),
+                    "prediction": np.zeros(shape, dtype=np.uint16),
+                    "valid": np.zeros(shape, dtype=bool),
+                    "coverage": np.zeros(shape, dtype=bool)}
 
         def process_batch(items):
             rgb, _, _ = _tensor_batch([item[1] for item in items], device)
@@ -164,6 +177,16 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
                 counts[:] += confusion_counts(prediction, crop[1], valid)
                 group_counts[:] += group_confusion_counts(prediction, crop[1], valid, groups)
                 losses.append(loss_statistics(probability, crop[1], valid, logits=values))
+                if full is not None:
+                    x, y, width, height = (row[key] for key in ("x", "y", "width", "height"))
+                    owner = ownership[row["crop_id"]][:height, :width]
+                    bits = (np.uint16(1) << np.arange(len(data.categories), dtype=np.uint16))[:, None, None]
+                    arrays = {"rgb": crop[0], "valid": crop[2],
+                              "target": np.sum(crop[1].astype(np.uint16) * bits, axis=0, dtype=np.uint16),
+                              "prediction": np.sum(prediction.astype(np.uint16) * bits, axis=0, dtype=np.uint16)}
+                    for name, array in arrays.items():
+                        full[name][y:y + height, x:x + width][owner] = array[:height, :width][owner]
+                    full["coverage"][y:y + height, x:x + width][owner] = True
                 if prediction_callback is not None:
                     prediction_callback(image_id=image_id, row=row, crop=crop, valid=valid,
                                         probability=probability, logits=values)
@@ -180,7 +203,7 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
         for row in rows:
             crop = prepared.original_crop(image_id, row) if prepared is not None else data.crop(image_id, row)
             valid = crop[2] & ownership[row["crop_id"]]
-            if not valid.any():
+            if not valid.any() and full is None:
                 continue
             supervised_crops += 1
             candidates.append((row, crop, valid))
@@ -191,6 +214,11 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
                 break
         if candidates:
             process_batch(candidates)
+        if full is not None:
+            if not full["coverage"].all():
+                raise ValueError("Full-image gallery requires all native grid crops; disable crop-limited smoke")
+            full.pop("coverage")
+            image_prediction_callback(image_id=image_id, image=image, **full)
         if not losses:
             empty = np.zeros((len(data.categories), 0, 0), dtype=np.float32)
             losses.append(loss_statistics(empty, empty.astype(bool), np.zeros((0, 0), dtype=bool)))
@@ -198,7 +226,7 @@ def evaluate(model, data, ids, device, batch_size, amp=False, smoke=False, galle
                         "group_counts": group_counts.tolist(),
                         "loss_stats": merge_loss_statistics(losses)})
     report = aggregate_metrics(records, data.categories, groups=groups, allow_unknown_buildings=split == "train")
-    report.update(smoke=smoke, threshold=.5, split=split, test_evaluated=False,
+    report.update(smoke=smoke, threshold=.5, split=split, test_evaluated=split == "test",
                   prediction_source="original unaugmented crops, model.eval() after epoch",
                   crop_overlap_accounting="each native pixel once; fixed midpoint ownership",
                   evaluation_scope="annotated opaque non-crowd union only; not full-image background evaluation",

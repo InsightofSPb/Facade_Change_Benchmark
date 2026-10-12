@@ -15,6 +15,9 @@ from facade_change.segmentation.metrics import (
     merge_loss_statistics,
     resolve_groups,
     write_gallery,
+    write_full_image_panels,
+    write_full_image_gallery,
+    semantic_legend,
     write_reports,
 )
 
@@ -238,6 +241,143 @@ class SegmentationMetricsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "one target/prediction channel"):
                 write_gallery(out, [preview], self.categories)
             self.assertFalse(out.exists())
+
+
+    def test_full_photo_panels_preserve_native_pixels_and_multilabel_bits(self):
+        categories = [{"id": 8, "name": "CRACK", "color": "#ff0000"},
+                      {"id": 2, "name": "REPAIRS", "color": "#00ff00"},
+                      {"id": 42, "name": "ABSENT", "color": "#0000ff"}]
+        # Cross the rendering block boundary. Pixel values and full dimensions
+        # must survive export, including unknown GT and overlapping classes.
+        rgb = (np.arange(270 * 25 * 3).reshape(270, 25, 3) % 256).astype(np.uint8)
+        target = np.zeros((270, 25), np.uint16)
+        target[3:267, 2:23] = 3
+        prediction = target.copy()
+        prediction[:2, :] = 2  # Full-photo inference is visible outside GT.
+        valid = target != 0
+        before = [array.copy() for array in (rgb, target, prediction, valid)]
+        with tempfile.TemporaryDirectory() as directory:
+            section = write_full_image_panels(
+                directory, rgb=rgb, target=target, prediction=prediction, valid=valid,
+                categories=categories, image_id="../../unsafe?<id>",
+                building_id="facade <test>", split="test", source_name="source.jpg")
+            self.assertEqual(len(section["panels"]), 5)
+            folder = Path(directory) / Path(section["panels"][0]["src"]).parent
+            self.assertTrue(folder.resolve().is_relative_to(Path(directory).resolve()))
+            self.assertNotIn("unsafe", folder.name)
+            for panel in section["panels"]:
+                self.assertEqual(panel["src"], panel["href"])
+                with Image.open(Path(directory) / panel["href"]) as image:
+                    self.assertEqual(image.size, (25, 270))
+            with Image.open(folder / "original.png") as image:
+                np.testing.assert_array_equal(np.asarray(image), rgb)
+            with Image.open(folder / "gt-masks.png") as image:
+                rendered = np.asarray(image)
+                region = rendered[3:267, 2:23]
+                self.assertEqual(set(map(tuple, region.reshape(-1, 3))), {(255, 0, 0), (0, 255, 0)})
+                self.assertTrue(np.all(rendered[:2, :, 0] == rendered[:2, :, 1]))
+            with Image.open(folder / "gt-overlay.png") as image:
+                np.testing.assert_array_equal(np.asarray(image)[:2], rgb[:2])
+            with Image.open(folder / "predicted-masks.png") as image:
+                np.testing.assert_array_equal(np.asarray(image)[:2], np.broadcast_to([0, 255, 0], (2, 25, 3)))
+            with np.load(folder / "masks.npz", allow_pickle=False) as masks:
+                np.testing.assert_array_equal(masks["target_bits"], target)
+                np.testing.assert_array_equal(masks["prediction_bits"], prediction)
+                np.testing.assert_array_equal(masks["valid"], valid)
+                np.testing.assert_array_equal(masks["category_ids"], [8, 2, 42])
+                self.assertEqual(masks["target_bits"].dtype, np.uint16)
+            # Repeat identities must not silently overwrite a previous export.
+            with self.assertRaises(FileExistsError):
+                write_full_image_panels(directory, rgb=rgb, target=target, prediction=prediction,
+                                        valid=valid, categories=categories,
+                                        image_id="../../unsafe?<id>", split="test")
+        for actual, expected in zip((rgb, target, prediction, valid), before):
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_large_photo_previews_bound_browser_decode_but_link_native_pixels(self):
+        rgb = np.full((37, 3201, 3), 123, np.uint8)
+        bits = np.ones((37, 3201), np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            section = write_full_image_panels(
+                directory, rgb=rgb, target=bits, prediction=bits,
+                valid=np.ones(bits.shape, bool), categories=self.categories,
+                image_id=99, building_id="large", split="test")
+            for panel in section["panels"]:
+                self.assertNotEqual(panel["src"], panel["href"])
+                self.assertTrue(panel["src"].endswith("-preview.jpg"))
+                with Image.open(Path(directory) / panel["src"]) as preview:
+                    self.assertEqual(preview.width, 1600)
+                    self.assertLessEqual(max(preview.size), 1600)
+                with Image.open(Path(directory) / panel["href"]) as native:
+                    self.assertEqual(native.size, (3201, 37))
+            with Image.open(Path(directory) / section["panels"][0]["href"]) as native:
+                np.testing.assert_array_equal(np.asarray(native), rgb)
+            page = write_full_image_gallery(directory, [section], self.categories,
+                                            split="test").read_text(encoding="utf-8")
+            for panel in section["panels"]:
+                self.assertIn(panel["src"], page)
+                self.assertIn(panel["href"], page)
+
+    def test_full_photo_invalid_channel_bits_fail_before_writing(self):
+        rgb = np.zeros((3, 3, 3), np.uint8)
+        target = np.zeros((3, 3), np.uint16)
+        prediction = target.copy()
+        prediction[0, 0] = 4  # Only two category channels exist.
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "gallery"
+            with self.assertRaisesRegex(ValueError, "outside the category channels"):
+                write_full_image_panels(out, rgb=rgb, target=target, prediction=prediction,
+                                        valid=np.ones((3, 3), bool), categories=self.categories,
+                                        image_id=1)
+            self.assertFalse(out.exists())
+            with self.assertRaisesRegex(ValueError, "uint16 bit masks"):
+                write_full_image_panels(out, rgb=rgb, target=target.astype(bool), prediction=target,
+                                        valid=np.ones((3, 3), bool), categories=self.categories,
+                                        image_id=1)
+            self.assertFalse(out.exists())
+
+    def test_full_photo_gallery_is_static_with_complete_legend(self):
+        categories = [{"id": 8, "name": "CRACK", "color": "#ff0000"},
+                      {"id": 2, "name": "REPAIRS", "color": "#00ff00"},
+                      {"id": 42, "name": "ABSENT", "color": "#0000ff"}]
+        with tempfile.TemporaryDirectory() as directory:
+            section = write_full_image_panels(
+                directory, rgb=np.zeros((10, 17, 3), np.uint8),
+                target=np.zeros((10, 17), np.uint16), prediction=np.zeros((10, 17), np.uint16),
+                valid=np.zeros((10, 17), bool), categories=categories,
+                image_id=5, building_id="facade <unsafe>", split="test")
+            page = write_full_image_gallery(directory, [section], categories, split="test",
+                                            checkpoint_name="best.pth").read_text(encoding="utf-8")
+            for text in ("facade &lt;unsafe&gt;", "ABSENT", "#0000ff", "best.pth", "GT MASKS",
+                         "PREDICTED MASKS", "не оценён", "не здоровый фон", "masks.npz"):
+                self.assertIn(text, page)
+            for forbidden in ("<details", "<select", "<script", "facade <unsafe>"):
+                self.assertNotIn(forbidden, page)
+            for panel in section["panels"]:
+                self.assertIn(panel["src"], page)
+            self.assertEqual(len(semantic_legend(categories)), 3)
+            self.assertEqual(semantic_legend(categories)[0]["color"], "#ff0000")
+
+    def test_shared_gallery_escapes_labels_and_rejects_external_assets(self):
+        from facade_change.visualization import write_static_gallery
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = root / 'frame & 1.png'
+            Image.new("RGB", (4, 3)).save(asset)
+            section = {"title": '<script>bad</script>', "caption": '<img src=x>',
+                       "panels": [{"label": '<unsafe>', "src": asset.name}]}
+            page = write_static_gallery(root, '<title>', [section]).read_text()
+            self.assertIn('frame%20%26%201.png', page)
+            self.assertIn('&lt;script&gt;bad&lt;/script&gt;', page)
+            self.assertNotIn('<script>', page)
+            for source in ('../outside.png', str(asset.resolve())):
+                with self.assertRaisesRegex(ValueError, 'within the output'):
+                    write_static_gallery(root, 'Bad source', [
+                        {"title": 'external', "panels": [{"label": 'external', "src": source}]}])
+            with self.assertRaisesRegex(ValueError, '#RRGGBB'):
+                write_static_gallery(root, 'Bad color', [], legend=[
+                    {"name": 'class', "color": '#fff; background:url(x)'}])
 
 
 if __name__ == "__main__":

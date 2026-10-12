@@ -121,6 +121,13 @@ def parser():
     transitions.add_argument("--alignment-method", choices=["sift", "loftr", "cascade"])
     transitions.add_argument("--all-class-pairs", action=argparse.BooleanOptionalAction, default=True,
                              help="All directed COCO class replacements by default; --no-all-class-pairs restores the two original replacement pairs")
+    review = sub.add_parser("review-transitions", help="Static landing page of all cached synthetic and real histories; no inference")
+    review.add_argument("--candidate-runs", nargs="+", required=True,
+                        help="Completed mine-transitions directories for TRAIN/VAL")
+    review.add_argument("--out", required=True)
+    review.add_argument("--synthetic-run", help="Completed prepare-history run from the same dataset")
+    review.add_argument("--preview-max-side", type=int, default=0,
+                        help="Display-only JPEG maximum side; 0 preserves native dimensions (default)")
     trial = sub.add_parser("h0h1-benchmark", help="Change scorers on frozen procedural H0/H1 cases")
     from .methods.registry import ALL_METHODS
     trial.add_argument("--config", dest="benchmark_config", help="Common benchmark JSON; explicit flags override it")
@@ -289,6 +296,9 @@ def main(argv=None):
         elif command == "mine-transitions":
             from .semantic_training import mine_transition_candidates
             result = mine_transition_candidates(**args)
+        elif command == "review-transitions":
+            from .semantic_training import prepare_transition_review
+            result = prepare_transition_review(**args)
         elif command == "h0h1-benchmark":
             from .hypothesis_benchmark import run_hypothesis_benchmark
             from .benchmark_config import benchmark_arguments

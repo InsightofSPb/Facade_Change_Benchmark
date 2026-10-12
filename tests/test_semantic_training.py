@@ -10,7 +10,7 @@ from PIL import Image
 
 from facade_change.semantic_training import (include_auxiliary_training, _transition_windows,
                                              _select_transition_windows, mine_transition_candidates)
-from facade_change.io import finish_record, read_json, sha256, write_json
+from facade_change.io import finish_record, read_json, sha256, write_json, run_record
 
 
 class AuxiliarySemanticTrainingTests(unittest.TestCase):
@@ -419,6 +419,208 @@ class RobustTransitionWindowTests(unittest.TestCase):
         self.assertFalse(legacy.all_class_pairs)
         self.assertEqual(legacy.event_types, ["replacement"])
         self.assertEqual((legacy.boundary_tolerance_pixels, legacy.min_component_pixels), (0, 16))
+
+
+class StaticHistoryReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        images, self.raw_images = [], {}
+        for split_index, split in enumerate(("val", "train", "test")):
+            for offset, year in enumerate((2010, 2020, 2015, 2025), 1):
+                image_id = split_index * 10 + offset
+                path = self.root / f"raw-{split}-{image_id}.png"
+                Image.new("RGB", (30, 18), (20+image_id, 50, 80)).save(path)
+                row = {"image_id": image_id, "image_path": str(path), "sha256": sha256(path),
+                       "width": 30, "height": 18, "year": year, "split": split,
+                       "building_id": split + "-B", "view_id": split + "-B-front"}
+                images.append(row)
+                self.raw_images[split, offset] = row
+                if split == "test":
+                    path.unlink()  # The metadata may be read; TEST pixels must never be loaded.
+        manifest = self.root / "manifest.json"
+        write_json(manifest, {"images": images})
+        self.identity = {"paths": {"dataset": "/unopened/dataset.json", "manifest": str(manifest)},
+                         "sha256": {"dataset": "a"*64, "manifest": sha256(manifest)}}
+
+    def source(self, name="source", split="val", building=None):
+        root = self.root / name
+        root.mkdir()
+        building = building or split + "-B"
+        rows, pairs = [], []
+        for index, (year, status) in enumerate(((2020, "mined_needs_review"),
+                                               (2015, "mined_needs_review"),
+                                               (2025, "rejected_alignment"))):
+            reference_row, source_row = self.raw_images[split, 1], self.raw_images[split, index+2]
+            pair = {"pair_id": f"{reference_row['image_id']}-{source_row['image_id']}",
+                    "reference_id": reference_row["image_id"], "source_id": source_row["image_id"],
+                    "reference_year": 2010, "source_year": year, "split": split,
+                    "building_id": building, "view_id": building + "-front", "status": status,
+                    "candidate_count": int(index == 0)}
+            if status == "mined_needs_review":
+                child = self.root / f"{name}-alignment-{index}"
+                child.mkdir()
+                record = run_record("pair_alignment", {"method": "sift"})
+                record["observations"] = {role: {**row, "building_id": building, "view_id": building + "-front"}
+                    for role, row in (("reference", reference_row), ("source", source_row))}
+                record["quality_gate"] = {"passed": True}
+                for role in ("reference", "source"):
+                    Image.fromarray(np.full((20, 24, 3), 90+index, np.uint8)).save(child / f"{role}_rgb.png")
+                finish_record(child, record, "completed_needs_review")
+                pair.update(alignment_run=str(child), alignment_run_sha256=sha256(child / "run.json"))
+                if index == 0:
+                    row = {**pair, "candidate_id": "candidate-00000", "path": "candidate-00000",
+                           "event_type": "replacement", "from_class": "DELAMINATION", "to_class": "SPALLING",
+                           "bbox_canvas_xyxy": [2, 3, 8, 9],
+                           "image_sha256": {role: value["sha256"] for role, value in record["observations"].items()}}
+                    rows.append(row)
+                    (root / row["path"]).mkdir()
+                    Image.fromarray(np.ones((6, 6), np.uint8)*255).save(root / row["path"] / "candidate_mask.png")
+            pairs.append(pair)
+        config = {"candidate_version": 2, "splits": [split], "dataset": self.identity}
+        write_json(root / "pairs.json", pairs)
+        write_json(root / "candidates.json", {"candidate_version": 2, "categories": [{"id": 1, "name": "DELAMINATION"}], "candidates": rows})
+        finish_record(root, run_record("real_semantic_transition_candidates", config), "completed_needs_review")
+        return root
+
+    def synthetic(self):
+        root = self.root / "synthetic"
+        root.mkdir()
+        config = {"splits": ["train", "val"], "input_sha256": self.identity["sha256"]}
+        sequences, bases = [], []
+        for split in ("train", "val"):
+            base_id = split + "-base"
+            bases.append({"base_id": base_id, "building_id": split + "-B", "view_id": split + "-B-front",
+                          "split": split, "image_sha256": self.raw_images[split, 1]["sha256"]})
+            for arm in ("clean", "event"):
+                frames = []
+                for frame in range(1, 6):
+                    paths = {}
+                    for kind in ("rgb", "damage_present", "new_change", "repaired"):
+                        filename = f"{split}-{arm}-{frame}-{kind}.png"
+                        image = Image.new("RGB" if kind == "rgb" else "L", (12, 8), 80 if kind == "rgb" else 0)
+                        image.save(root / filename)
+                        paths[kind] = filename
+                    frames.append({"frame": frame, "paths": paths, "event": "none", "nuisance": {"kind": "shadow"}})
+                sequences.append({"base_id": base_id, "building_id": split + "-B", "split": split,
+                                  "arm": arm, "frames": frames})
+        write_json(root / "manifest.json", {"kind": "persistent_procedural_histories", "config": config,
+                                           "bases": bases, "sequences": sequences})
+        finish_record(root, run_record("history_dataset", config), "completed_exploratory")
+        return root
+
+    def review(self, sources, name="review", **kwargs):
+        from facade_change.semantic_training import prepare_transition_review
+        return prepare_transition_review(sources, self.root / name, **kwargs)
+
+    def test_complete_static_gallery_synthetic_pairs_gaps_and_unchanged_sources(self):
+        val, train, synthetic = self.source(), self.source("train", "train"), self.synthetic()
+        before = {str(p): sha256(p) for p in self.root.rglob("*") if p.is_file()}
+        result = self.review([val, train], synthetic_run=synthetic)
+        self.assertEqual((result["synthetic_bases"], result["synthetic_sequences"], result["real_histories"],
+                          result["real_pairs"], result["input_candidates"]), (2, 4, 2, 6, 2))
+        self.assertEqual(result["pair_status_counts"], {"mined_needs_review": 4, "rejected_alignment": 2})
+        page = (self.root / "review/gallery.html").read_text()
+        self.assertIn("H0", page)
+        self.assertIn("H1", page)
+        self.assertIn("ПРОБЕЛ", page)
+        self.assertEqual(result["real_original_frames"], 8)
+        self.assertIn("2025 · исходное фото · rejected_alignment", page)
+        exported_images = read_json(self.root / "review/histories.json")["real_images"]
+        self.assertEqual({row["year"] for row in exported_images}, {2010, 2015, 2020, 2025})
+        self.assertTrue(all(row["split"] in {"train", "val"} for row in exported_images))
+        self.assertIn("кандидатов нет", page)
+        self.assertIn("Фиолетовая", page)
+        self.assertNotIn("<select", page)
+        self.assertNotIn("<input", page)
+        self.assertNotIn("review-completed.csv", page)
+        self.assertEqual(before, {path: sha256(path) for path in before})
+        exported = read_json(self.root / "review/histories.json")["real_pairs"]
+        self.assertEqual([p["source_year"] for p in exported], [2015, 2020, 2025]*2)
+        self.assertFalse(result["quantitative_temporal_evaluation_allowed"])
+        record = read_json(self.root / "review/run.json")
+        for relative, digest in record["artifact_sha256"].items():
+            self.assertEqual(sha256(self.root / "review" / relative), digest)
+
+    def test_render_preview_only_and_cli_has_no_sampling_or_verdict_flags(self):
+        from facade_change.cli import parser
+        source = self.source()
+        result = self.review([source], preview_max_side=10)
+        self.assertEqual(result["preview_max_side"], 10)
+        for path in (self.root / "review/images").glob("*.jpg"):
+            with Image.open(path) as image:
+                self.assertLessEqual(max(image.size), 10)
+        options = parser().parse_args(["review-transitions", "--candidate-runs", str(source),
+                                      "--synthetic-run", "histories", "--out", "out"])
+        self.assertEqual(options.preview_max_side, 0)
+        self.assertFalse(hasattr(options, "limit"))
+        self.assertFalse(hasattr(options, "seed"))
+
+    def test_reject_test_crosssplit_and_mismatched_dataset(self):
+        with self.assertRaisesRegex(ValueError, "TRAIN/VAL"):
+            self.review([self.source("test", "test")])
+        val = self.source("val")
+        train = self.source("train", "train", building=" VAL-b ")
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            self.review([val, train], "leaked")
+        synthetic = self.synthetic()
+        record = read_json(synthetic / "run.json")
+        record["config"]["input_sha256"] = {"wrong": "dataset"}
+        finish_record(synthetic, run_record("history_dataset", record["config"]), "completed_exploratory")
+        with self.assertRaisesRegex(ValueError, "same TRAIN/VAL dataset"):
+            self.review([val], "different", synthetic_run=synthetic)
+
+    def test_tampered_alignment_rgb_mask_manifest_and_missing_sources_fail(self):
+        for index, relative in enumerate(("candidate-00000/candidate_mask.png", "candidates.json", "pairs.json")):
+            source = self.source(f"source{index}")
+            (source / relative).write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                self.review([source], f"bad{index}")
+        source = self.source("alignment-tamper")
+        (self.root / "alignment-tamper-alignment-0/source_rgb.png").write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            self.review([source], "badalignment")
+
+    def test_symlinks_and_candidate_traversal_are_rejected(self):
+        source = self.source()
+        mask = source / "candidate-00000/candidate_mask.png"
+        mask.unlink()
+        mask.symlink_to(self.root / "nonexistent.png")
+        with self.assertRaisesRegex(ValueError, "Symlink"):
+            self.review([source])
+        source = self.source("traversal")
+        doc = read_json(source / "candidates.json")
+        doc["candidates"][0]["path"] = "../outside"
+        write_json(source / "candidates.json", doc)
+        finish_record(source, read_json(source / "run.json"), "completed_needs_review")
+        with self.assertRaisesRegex(ValueError, "leaves"):
+            self.review([source], "badtraversal")
+
+    def test_missing_or_modified_original_in_rejected_pair_is_not_silently_omitted(self):
+        source = self.source()
+        missing = Path(self.raw_images["val", 4]["image_path"])
+        missing.unlink()
+        with self.assertRaisesRegex(ValueError, "Required original image is unavailable"):
+            self.review([source])
+        Image.new("RGB", (30, 18), "red").save(missing)
+        with self.assertRaisesRegex(ValueError, "Original image hash mismatch"):
+            self.review([source], "modified")
+
+    def test_synthetic_incomplete_chain_and_candidate_count_mismatch_fail(self):
+        source, synthetic = self.source(), self.synthetic()
+        doc = read_json(synthetic / "manifest.json")
+        doc["sequences"][0]["frames"].pop()
+        write_json(synthetic / "manifest.json", doc)
+        finish_record(synthetic, read_json(synthetic / "run.json"), "completed_exploratory")
+        with self.assertRaisesRegex(ValueError, "five-frame"):
+            self.review([source], synthetic_run=synthetic)
+        pairs = read_json(source / "pairs.json")
+        pairs[0]["candidate_count"] = 2
+        write_json(source / "pairs.json", pairs)
+        finish_record(source, read_json(source / "run.json"), "completed_needs_review")
+        with self.assertRaisesRegex(ValueError, "candidate count"):
+            self.review([source], "bad-count")
 
 
 if __name__ == "__main__":

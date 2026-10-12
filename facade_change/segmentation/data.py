@@ -32,17 +32,20 @@ def _integer(value, name, minimum=0):
 
 
 class PreparedData:
-    """Metadata-only construction; lazy RGB and COCO rasterization for TRAIN/VAL.
+    """Metadata-only construction; lazy RGB and COCO rasterization.
 
     A single full image and a uint16 label bitset are cached. Test RGB is never
-    opened by this reader, while all split identities are audited as metadata.
+    opened unless explicitly enabled for frozen-checkpoint evaluation, while all
+    split identities are audited as metadata. Training keeps the default gate.
     """
 
-    def __init__(self, dataset_path, splits=("train", "val"), raster_cache_dir=None):
+    def __init__(self, dataset_path, splits=("train", "val"), raster_cache_dir=None,
+                 allow_test=False):
         path = Path(dataset_path).expanduser().resolve()
         self.dataset_path = path / "dataset.json" if path.is_dir() else path
         self.splits = tuple(splits)
-        if not self.splits or len(set(self.splits)) != len(self.splits) or not set(self.splits) <= {"train", "val"}:
+        allowed = {"train", "val", "test"} if allow_test else {"train", "val"}
+        if not self.splits or len(set(self.splits)) != len(self.splits) or not set(self.splits) <= allowed:
             raise ValueError("Training reader accepts only distinct train/val splits")
         config = read_json(self.dataset_path)
         if config.get("kind") != "semantic_crop_index":
@@ -87,7 +90,7 @@ class PreparedData:
         all_images = {row["image_id"]: row for row in self.manifest["images"]}
         self.images = {key: dict(row) for key, row in all_images.items() if row.get("split") in self.splits}
         if not self.images:
-            raise ValueError("No selected TRAIN/VAL images")
+            raise ValueError("No images in the explicitly selected splits")
         coco_images = {}
         for row in coco["images"]:
             if row["id"] in coco_images:
@@ -155,7 +158,7 @@ class PreparedData:
 
     def load_image(self, image_id):
         if image_id not in self.images:
-            raise ValueError(f"Image is outside selected TRAIN/VAL: {image_id}")
+            raise ValueError(f"Image is outside selected splits: {image_id}")
         row = self.images[image_id]
         path = Path(row["image_path"])
         stat = path.stat()
@@ -173,6 +176,8 @@ class PreparedData:
         # large photograph and its masks. Existing caller arrays remain valid.
         self._cache = None
         rgb, opaque = load_rgb(path)
+        if row["split"] == "test":
+            self.metadata["test_rgb_loaded"] = True
         h, w = rgb.shape[:2]
         if (h, w) != (row["height"], row["width"]):
             raise ValueError(f"Stored image dimensions differ from manifest: {path}")
@@ -210,6 +215,8 @@ class PreparedData:
         return rgb, packed, opaque
 
     def _rasterize(self, image_id, h, w):
+        if self.images[image_id]["split"] == "test":
+            self.metadata["test_annotations_rasterized"] = True
         try:
             from pycocotools import mask as mask_utils
         except ImportError as error:

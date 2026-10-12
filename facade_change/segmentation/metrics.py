@@ -508,3 +508,163 @@ def write_gallery(out: str | Path, previews: Iterable[dict], categories: list[di
     path = out / "gallery.html"
     path.write_text("\n".join(sections), encoding="utf-8")
     return path
+
+
+def semantic_legend(categories: list[dict]) -> list[dict]:
+    """A shared, complete legend, including classes absent from an image."""
+    result = []
+    for category, color in zip(categories, _gallery_colors(categories)):
+        name = category["name"]
+        translated = _CLASS_NAMES_RU.get(name, name)
+        label = f"{translated} ({name})" if translated != name else name
+        result.append({"name": f"{label} · ID {category['id']}",
+                       "color": "#" + "".join(f"{value:02x}" for value in color)})
+    return result
+
+
+def _write_full_semantic_view(rgb, bits, support, colors, mask_path, overlay_path):
+    """Render row blocks, without a C,H,W expansion or an int64 cumsum."""
+    from PIL import Image
+
+    height, width = bits.shape
+    rendered = np.empty_like(rgb)
+    xx = np.arange(width, dtype=np.uint32)[None, :]
+    for top in range(0, height, 256):
+        bottom = min(top + 256, height)
+        block, valid = bits[top:bottom], support[top:bottom]
+        yy = np.arange(top, bottom, dtype=np.uint32)[:, None]
+        counts = np.zeros(block.shape, np.uint8)
+        for channel in range(len(colors)):
+            counts += ((block & (1 << channel)) != 0) & valid
+        stripe = ((xx + yy) // 3) % np.maximum(counts, 1)
+        ordinal = np.zeros(block.shape, np.uint8)
+        result = rendered[top:bottom]
+        result[:] = 0
+        for channel, color in enumerate(colors):
+            active = ((block & (1 << channel)) != 0) & valid
+            result[active & (ordinal == stripe)] = color
+            ordinal += active
+        checker = np.where((xx // 8 + yy // 8) % 2, 74, 94).astype(np.uint8)
+        result[~valid] = checker[~valid, None]
+    Image.fromarray(rendered).save(mask_path, compress_level=1)
+    # Reuse the color-map allocation for the overlay. Outside labelled support,
+    # leave the source photograph visible; the separate mask marks unknowns.
+    for top in range(0, height, 256):
+        bottom = min(top + 256, height)
+        selected = (bits[top:bottom] != 0) & support[top:bottom]
+        result, source = rendered[top:bottom], rgb[top:bottom]
+        result[~selected] = source[~selected]
+        result[selected] = np.rint(.45 * source[selected] + .55 * result[selected]).astype(np.uint8)
+    Image.fromarray(rendered).save(overlay_path, compress_level=1)
+
+
+def write_full_image_panels(out: str | Path, *, rgb: np.ndarray, target: np.ndarray,
+                            prediction: np.ndarray, valid: np.ndarray, categories: list[dict],
+                            image_id: int | str, building_id: str | None = None,
+                            split: str = "val", source_name: str | None = None,
+                            prediction_valid: np.ndarray | None = None) -> dict:
+    """Save native-photo panels immediately and return a small gallery section.
+
+    Target/prediction are H,W uint16 bit fields: bit i is category channel i.
+    They preserve multilabel overlaps exactly. ``valid`` is annotation support
+    for evaluation; predictions remain visible outside it. Optional prediction
+    support masks transparent/padded source pixels, never unannotated regions.
+    Native exports remain exact; only browser previews may be resized.
+    No inference, EXIF transform, or threshold calibration occurs here.
+    """
+    from PIL import Image
+
+    rgb, target, prediction, valid = map(np.asarray, (rgb, target, prediction, valid))
+    if split not in {"train", "val", "test"}:
+        raise ValueError("full-image gallery split must be train, val or test")
+    if (not 1 <= len(categories) <= 16
+            or len({category["id"] for category in categories}) != len(categories)):
+        raise ValueError("full-image gallery requires 1 to 16 unique category IDs")
+    if (rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8
+            or target.shape != rgb.shape[:2] or prediction.shape != target.shape
+            or valid.shape != target.shape or not all(target.shape)
+            or target.dtype != np.uint16 or prediction.dtype != np.uint16
+            or valid.dtype != np.bool_):
+        raise ValueError("full-image gallery requires RGB uint8, H,W uint16 bit masks and boolean valid")
+    allowed = (1 << len(categories)) - 1
+    if np.any(target > allowed) or np.any(prediction > allowed):
+        raise ValueError("mask contains bits outside the category channels")
+    if prediction_valid is None:
+        prediction_valid = np.ones(target.shape, dtype=bool)
+    else:
+        prediction_valid = np.asarray(prediction_valid)
+    if prediction_valid.dtype != np.bool_ or prediction_valid.shape != target.shape:
+        raise ValueError("prediction_valid must be boolean H,W")
+    if not isinstance(image_id, (str, int)) or isinstance(image_id, bool):
+        raise ValueError("image_id must be a string or integer")
+    identity = json.dumps([split, image_id], ensure_ascii=False, separators=(",", ":"))
+    key = f"{split}-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+    out = Path(out)
+    folder = out / "photos" / key
+    # An already exported identity is a caller error; never overwrite panels.
+    folder.mkdir(parents=True, exist_ok=False)
+    colors = _gallery_colors(categories)
+    Image.fromarray(rgb).save(folder / "original.png", compress_level=1)
+    _write_full_semantic_view(rgb, target, valid, colors,
+                             folder / "gt-masks.png", folder / "gt-overlay.png")
+    _write_full_semantic_view(rgb, prediction, prediction_valid, colors,
+                             folder / "predicted-masks.png", folder / "predicted-overlay.png")
+    np.savez_compressed(folder / "masks.npz", target_bits=target, prediction_bits=prediction,
+                        valid=valid, prediction_valid=prediction_valid,
+                        category_ids=np.asarray([category["id"] for category in categories]),
+                        category_names=np.asarray([category["name"] for category in categories]))
+    panels = [{"label": label, "src": f"photos/{key}/{filename}"}
+              for label, filename in (("ORIGINAL · исходное фото", "original.png"),
+                                       ("GT · разметка на фото", "gt-overlay.png"),
+                                       ("GT MASKS · все классы", "gt-masks.png"),
+                                       ("PREDICTED · прогноз на фото", "predicted-overlay.png"),
+                                       ("PREDICTED MASKS · все классы", "predicted-masks.png"))]
+    # Browsers would decode five potentially huge native images per section.
+    # Bound page previews, while every link still opens its native PNG.
+    for panel in panels:
+        panel["href"] = panel["src"]
+        if max(rgb.shape[:2]) > 1600:
+            native = out / panel["src"]
+            preview = native.with_name(native.stem + "-preview.jpg")
+            with Image.open(native) as image:
+                image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                image.save(preview, quality=90, subsampling=0)
+            panel["src"] = preview.relative_to(out).as_posix()
+    name = building_id or "Адрес не подтверждён — TRAIN"
+    source = f" · {source_name}" if source_name else ""
+    return {"title": f"{split.upper()} · {name} · фото {image_id}",
+            "caption": (f"{rgb.shape[1]} × {rgb.shape[0]} пикселей, исходное разрешение{source}. "
+                        f"Точные пересекающиеся маски: photos/{key}/masks.npz"),
+            "panels": panels}
+
+
+def write_full_image_gallery(out: str | Path, sections: Iterable[dict], categories: list[dict],
+                             split: str = "val", checkpoint_name: str | None = None) -> Path:
+    """Write a static all-class gallery for already exported full photographs."""
+    from ..visualization import write_static_gallery
+
+    if split not in {"train", "val", "test"}:
+        raise ValueError("full-image gallery split must be train, val or test")
+    notes = [
+        "Все фотографии показаны целиком. Для быстрой загрузки страницы большие фото "
+        "имеют уменьшенное превью (до 1600 пикселей по длинной стороне). Нажмите на изображение, "
+        "чтобы открыть исходное разрешение PNG; масштаб меняется средствами браузера. "
+        "Исходные фото, маски и метрики не уменьшаются.",
+        "ORIGINAL — исходный RGB без маскирования. GT показывает известную разметку; "
+        "серая клетка в GT MASKS означает неизвестную разметку, а не здоровый фон. "
+        "В GT-наложении эти области остаются исходным RGB.",
+        "PREDICTED показан на всём фото: sigmoid ≥ 0.5 независимо для каждого класса. "
+        "Метрики считаются только на размеченной поддержке. Прогноз за её пределами "
+        "не оценён. Чёрный в PREDICTED MASKS означает отсутствие классов выше порога, "
+        "а не подтверждённое отсутствие повреждений. Серая клетка в прогнозе, если она есть, "
+        "обозначает недопустимые пиксели исходного фото, например прозрачность.",
+        "Пересечения классов показаны чередующимися диагональными полосами с цветами "
+        "активных каналов. В очень малом пересечении не каждый цвет будет виден. "
+        "Это обзор, не argmax и не взаимоисключающая разметка. "
+        "Точные битовые маски сохранены рядом в masks.npz; бит i соответствует каналу i "
+        "в category_ids/category_names. Легенда включает все классы.",
+    ]
+    if checkpoint_name:
+        notes.insert(0, f"Снимок весов: {checkpoint_name}")
+    return write_static_gallery(out, f"Семантическая сегментация · {split.upper()}",
+                                sections, legend=semantic_legend(categories), notes=notes)

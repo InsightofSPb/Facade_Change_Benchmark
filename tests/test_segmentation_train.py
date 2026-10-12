@@ -52,6 +52,35 @@ def make_grid(width, height, size, xs, ys):
 
 @unittest.skipUnless(HAS_TORCH, "optional torch dependency is unavailable")
 class OwnershipTests(unittest.TestCase):
+    def test_full_image_callback_predicts_unannotated_crops_once_without_scoring_them(self):
+        from types import SimpleNamespace
+        from facade_change.segmentation.train import evaluate
+        rows = make_grid(64, 32, 32, [0, 32], [0])
+        categories = [{"id": 3, "name": "CRACK"}]
+        calls, images = [], []
+        class PositiveModel(nn.Module):
+            def forward(self, values):
+                calls.append(len(values))
+                return torch.ones((len(values), 1, *values.shape[-2:]), device=values.device)
+        def crop(image_id, row):
+            rgb = np.full((32, 32, 3), row["x"], np.uint8)
+            target = np.zeros((1, 32, 32), bool)
+            if row["x"] == 0:
+                target[:, 1:3, 2:4] = True
+            return rgb, target, target.any(0)
+        data = SimpleNamespace(categories=categories, crop_size=32,
+                               images={1: {"split": "test", "building_id": "test-facade", "width": 64, "height": 32}},
+                               crops_by_image={1: rows}, crop=crop)
+        report = evaluate(PositiveModel(), data, [1], "cpu", 1, split="test",
+                          image_prediction_callback=lambda **row: images.append(row))
+        self.assertEqual(calls, [1, 1])
+        self.assertTrue(images[0]["prediction"].all())
+        self.assertEqual(images[0]["target"].sum(), 4)
+        self.assertEqual(images[0]["valid"].sum(), 4)
+        self.assertTrue((images[0]["rgb"][:, 32:] == 32).all())
+        self.assertEqual(report["image_records"][0]["counts"], [[4, 0, 0]])
+        self.assertEqual(report["image_records"][0]["loss_stats"]["valid_pixels"], 4)
+
     def test_full_train_schedule_always_includes_final_without_changing_val(self):
         self.assertEqual(train_evaluation_epochs(20, .2), [4, 8, 12, 16, 20])
         self.assertEqual(train_evaluation_epochs(7, .4), [3, 6, 7])
@@ -466,6 +495,115 @@ class TrainingIntegrationTests(unittest.TestCase):
                 evaluate_checkpoint(trained, self.root / "invalid-hash", device="cpu")
             gpu.assert_not_called()
 
+    def test_original_evaluation_test_opt_in_native_galleries_and_frozen_metrics(self):
+        from facade_change.methods.dinov2 import _source_provenance
+        from facade_change.segmentation.evaluate import evaluate_checkpoint
+
+        # Make TEST accessible and annotated before freezing preparation hashes.
+        rgb = np.zeros((32, 35, 3), dtype=np.uint8)
+        rgb[..., 0] = np.arange(35, dtype=np.uint8)[None] * 5
+        rgb[..., 1] = np.arange(32, dtype=np.uint8)[:, None] * 5
+        rgb[..., 2] = 130
+        Image.fromarray(rgb).save(self.dataset / "image-4.png")
+        # Transparent native pixels are not the same as unannotated opaque ones.
+        val_path = self.dataset / "image-3.png"
+        with Image.open(val_path) as original:
+            val_rgb = np.array(original)
+        alpha = np.full((32, 35, 1), 255, np.uint8)
+        alpha[:, -3:] = 0
+        Image.fromarray(np.concatenate([val_rgb, alpha], axis=2)).save(val_path)
+        manifest = read_json(self.dataset / "manifest.json")
+        manifest["images"][2]["sha256"] = sha256(val_path)
+        write_json(self.dataset / "manifest.json", manifest)
+        rows = [json.loads(line) for line in (self.dataset / "crops.jsonl").read_text().splitlines()]
+        for row in rows:
+            if row["image_id"] == 3:
+                row["image_sha256"] = sha256(val_path)
+        (self.dataset / "crops.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        coco = read_json(self.dataset / "coco.json")
+        coco["annotations"] = [row for row in coco["annotations"] if row["image_id"] != 4]
+        coco["annotations"].append({"id": 999, "image_id": 4, "category_id": 3,
+                                    "segmentation": [[2, 2, 20, 2, 20, 26, 2, 26]]})
+        write_json(self.dataset / "coco.json", coco)
+        config = read_json(self.dataset / "dataset.json")
+        config["source_coco_sha256"] = sha256(self.dataset / "coco.json")
+        write_json(self.dataset / "dataset.json", config)
+        with self.assertRaisesRegex(ValueError, "only distinct train/val"):
+            segmentation_data.PreparedData(self.dataset, splits=("test",))
+
+        calls = []
+        def fixture(source, checkpoint, num_classes, device, trust):
+            with torch.random.fork_rng():
+                torch.manual_seed(93)
+                model = FrozenDinoSegmenter(TinyBackbone(), num_classes).to(device)
+            model.register_forward_hook(lambda module, args, output: calls.append(len(args[0])))
+            return model, {"sources": _source_provenance(source),
+                           "checkpoint": {"sha256": sha256(checkpoint)}, "backbone_frozen": True}
+
+        augmentations, trained = self.root / "original-augmentations", self.root / "original-training"
+        prepare_augmentations(self.dataset, augmentations)
+        with patch("facade_change.segmentation.train.load_model", side_effect=fixture):
+            train(self.dataset, trained, augmentations=augmentations, source_root=self.source,
+                  checkpoint=self.weights, device="cpu", epochs=1, batch_size=2)
+        original_load = segmentation_data.PreparedData.load_image
+        loads = []
+        def test_only(reader, image_id):
+            self.assertEqual(image_id, 4, "TRAIN/VAL must reuse cached originals")
+            loads.append(image_id)
+            return original_load(reader, image_id)
+
+        calls.clear()
+        with patch("facade_change.segmentation.evaluate.load_model", side_effect=fixture), \
+                patch.object(segmentation_data.PreparedData, "load_image", side_effect=test_only, autospec=True):
+            result = evaluate_checkpoint(trained, self.root / "original-report", device="cpu", batch_size=2,
+                                         evaluation_mode="originals", splits=["test", "val", "train"])
+        out = Path(result["out"])
+        self.assertEqual(result["images"], {"test": 1, "val": 1, "train": 2})
+        self.assertEqual(sum(calls), 8)  # Every native crop once, no gallery inference pass.
+        self.assertEqual(result["images_visualized"], 4)
+        self.assertTrue(result["test_evaluated"])
+        self.assertTrue(result["test_rgb_loaded"])
+        self.assertTrue(result["test_annotations_rasterized"])
+        self.assertEqual(set(loads), {4})
+        self.assertEqual(read_json(out / "val" / "metrics.json")["primary"],
+                         read_json(trained / "metrics.json")["primary"])
+        for split in ("test", "val", "train"):
+            self.assertTrue((out / split / "gallery.html").is_file())
+            self.assertTrue((out / split / "per_class.csv").is_file())
+            for path in (out / split / "photos").glob("*/masks.npz"):
+                with np.load(path, allow_pickle=False) as masks:
+                    self.assertEqual(masks["target_bits"].shape, (32, 35))
+                    self.assertEqual(masks["prediction_bits"].dtype, np.uint16)
+                    if split == "val":
+                        self.assertTrue(masks["prediction_valid"][:, :-3].all())
+                        self.assertFalse(masks["prediction_valid"][:, -3:].any())
+                    if split != "test":
+                        self.assertTrue(((masks["target_bits"] & 1 != 0)
+                                         & (masks["target_bits"] & 2 != 0)).any())
+                for name in ("original.png", "gt-masks.png", "predicted-masks.png"):
+                    with Image.open(path.parent / name) as panel:
+                        self.assertEqual(panel.size, (35, 32))
+        self.assertEqual(len(list(out.glob("*/photos/*/masks.npz"))), 4)
+        self.assertTrue((out / "gallery.html").is_file())
+        self.assertEqual(read_json(out / "config.json")["head_sha256"], sha256(trained / "best.pth"))
+
+        # Originals with its default VAL-only scope must not open TEST.
+        with patch("facade_change.segmentation.evaluate.load_model", side_effect=fixture), \
+                patch.object(segmentation_data.PreparedData, "load_image",
+                             side_effect=AssertionError("VAL original cache only")):
+            result = evaluate_checkpoint(trained, self.root / "original-val-only", device="cpu",
+                                         evaluation_mode="originals")
+        self.assertFalse(result["test_evaluated"])
+        self.assertEqual(result["images"], {"val": 1})
+        with patch("facade_change.segmentation.evaluate.gpu_preflight") as gpu:
+            for splits in (["test", "test"], [], ["unrecognised"]):
+                with self.assertRaisesRegex(ValueError, "distinct nonempty"):
+                    evaluate_checkpoint(trained, self.root / "invalid-originals", device="cpu",
+                                        evaluation_mode="originals", splits=splits)
+            with self.assertRaisesRegex(ValueError, "VAL-only"):
+                evaluate_checkpoint(trained, self.root / "invalid-robustness", splits=["test"])
+            gpu.assert_not_called()
+
     def test_prepare_only_cli_needs_no_model_and_legacy_crop_budget_is_rejected(self):
         out = self.root / "cli-augmentations"
         command = [sys.executable, "-m", "facade_change.segmentation", "--dataset", str(self.dataset)]
@@ -533,6 +671,13 @@ class RobustnessTransformTests(unittest.TestCase):
                         main()
                     evaluate.assert_called_once_with("completed-training", "report", **expected)
                     evaluate.reset_mock()
+            with patch.object(sys, "argv", base + ["--out=originals", "--evaluation-mode", "originals",
+                                                    "--splits", "test", "val", "train"]):
+                with redirect_stdout(io.StringIO()):
+                    main()
+                self.assertEqual(evaluate.call_args.kwargs["evaluation_mode"], "originals")
+                self.assertEqual(evaluate.call_args.kwargs["splits"], ["test", "val", "train"])
+                evaluate.reset_mock()
 
     def test_photometry_is_label_independent_and_translation_pairs_masks(self):
         from types import SimpleNamespace

@@ -14,6 +14,10 @@ def main():
     parser.add_argument("--augmentations", help="Completed fixed augmentation directory used for training")
     parser.add_argument("--reuse-augmentations", help="During preparation, reuse unchanged assets from an earlier snapshot")
     parser.add_argument("--evaluate-run", help="Completed training directory: evaluate best checkpoint on fixed VAL observation conditions")
+    parser.add_argument("--evaluation-mode", choices=("robustness", "originals"), default="robustness",
+                        help="Evaluation only: VAL robustness (default), or unchanged originals with full-photo galleries")
+    parser.add_argument("--splits", nargs="+", choices=("train", "val", "test"),
+                        help="With --evaluation-mode originals: requested original splits; default val; TEST is explicit opt-in")
     parser.add_argument("--export-probabilities", action="store_true", help="With --evaluate-run, save class probabilities and annotated-support uncertainty diagnostics")
     parser.add_argument("--class-groups", help="Explicit semantic class-group JSON (default: repository semantic_class_groups.json)")
     parser.add_argument("--methods-config", help="Existing methods or benchmark JSON containing DINOv2 paths")
@@ -35,30 +39,38 @@ def main():
     arguments = vars(parser.parse_args())
     if arguments["out"] is None:
         tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        suffix = ("-semantic-robustness" if arguments["evaluate_run"] else "-semantic-augmentations"
+        suffix = (("-semantic-originals" if arguments["evaluation_mode"] == "originals" else "-semantic-robustness") if arguments["evaluate_run"] else "-semantic-augmentations"
                   if arguments["prepare_only"] else "-dino-seg" + ("-smoke" if arguments["smoke"] else ""))
         arguments["out"] = str(Path("runs") / (tag + suffix))
     try:
         prepare_only = arguments.pop("prepare_only")
         evaluation = arguments.pop("evaluate_run")
+        evaluation_mode = arguments.pop("evaluation_mode")
+        splits = arguments.pop("splits")
         export = arguments.pop("export_probabilities")
         reuse = arguments.pop("reuse_augmentations")
         cutmix, cutout = arguments.pop("cutmix_prob"), arguments.pop("cutout_prob")
         if evaluation:
             allowed = {"--evaluate-run", "--augmentations", "--device", "--batch-size",
-                       "--out", "--smoke", "--no-amp", "--export-probabilities"}
+                       "--out", "--smoke", "--no-amp", "--export-probabilities",
+                       "--evaluation-mode", "--splits"}
             explicit = {value.split("=", 1)[0] for value in sys.argv[1:] if value.startswith("--")}
             rejected = sorted(explicit - allowed)
             if rejected:
                 parser.error("--evaluate-run uses the saved training settings; incompatible options: "
                              + ", ".join(rejected))
             from .evaluate import evaluate_checkpoint
+            options = {}
+            if evaluation_mode != "robustness" or splits is not None:
+                options = {"evaluation_mode": evaluation_mode, "splits": splits}
             result = evaluate_checkpoint(evaluation, arguments["out"],
                                          augmentations=arguments["augmentations"], device=arguments["device"],
                                          batch_size=arguments["batch_size"], export_probabilities=export,
-                                         smoke=arguments["smoke"], no_amp=arguments["no_amp"])
-            print(f"\nRobustness evaluation: {result['out']}", flush=True)
+                                         smoke=arguments["smoke"], no_amp=arguments["no_amp"], **options)
+            print(f"\nEvaluation ({evaluation_mode}): {result['out']}", flush=True)
             return
+        if splits is not None or any(value.split("=", 1)[0] == "--evaluation-mode" for value in sys.argv[1:]):
+            parser.error("--evaluation-mode/--splits require --evaluate-run")
         if export:
             parser.error("--export-probabilities requires --evaluate-run")
         if not arguments["dataset"]:

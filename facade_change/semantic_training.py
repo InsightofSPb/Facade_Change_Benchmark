@@ -639,3 +639,355 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
         write_json(out / "pairs.json", pair_rows)
         finish_record(out, record, "failed", f"{type(exc).__name__}: {exc}")
         raise
+
+
+def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_max_side=0):
+    """Static overview of all cached TRAIN/VAL histories; no inference or event GT."""
+    import hashlib
+    import json
+    from pathlib import Path
+    from PIL import Image, ImageChops
+    from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
+    from .visualization import write_static_gallery
+
+    if not candidate_runs or type(preview_max_side) is not int or preview_max_side < 0:
+        raise ValueError("Provide candidate runs and preview_max_side >=0 (0 preserves native dimensions)")
+
+    def plain_path(value):
+        path = Path(value).expanduser().absolute()
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            raise ValueError(f"Symlink paths are not accepted: {path}")
+        return path.resolve()
+
+    def checked(root, relative, hashes=None):
+        relative = Path(relative)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Artifact path leaves its source run")
+        path = plain_path(root / relative)
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ValueError(f"Missing source artifact: {path}")
+        if hashes is not None and hashes.get(relative.as_posix()) != sha256(path):
+            raise ValueError(f"Artifact hash mismatch: {relative}")
+        return path
+
+    ownership, provenance, snapshots = {}, [], {}
+
+    def own(row, image_hashes=()):
+        split = row.get("split")
+        if split not in {"train", "val"}:
+            raise ValueError("Review accepts TRAIN/VAL only; TEST is excluded")
+        for field, value in (("building", row.get("building_id")), ("view", row.get("view_id")),
+                             *(("image", value) for value in image_hashes)):
+            if field == "view" and value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Missing {field} identity")
+            key = field, value.strip().casefold()
+            if ownership.setdefault(key, split) != split:
+                raise ValueError("Building, view or image overlaps TRAIN and VAL")
+
+    def source_record(root, kind, expected=None):
+        path = checked(root, "run.json")
+        digest, record = sha256(path), read_json(path)
+        config = record.get("config", {})
+        encoded = json.dumps(config, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+        if (record.get("kind") != kind or not str(record.get("status", "")).startswith("completed")
+                or hashlib.sha256(encoded).hexdigest() != record.get("config_sha256")
+                or (expected is not None and expected != digest)):
+            raise ValueError(f"Requires unchanged completed {kind}: {root}")
+        snapshots[str(path)] = digest
+        return record
+
+    roots = sorted({plain_path(path) for path in candidate_runs})
+    if synthetic_run is not None:
+        synthetic_run = plain_path(synthetic_run)
+    destination = plain_path(out)
+    if any(destination.is_relative_to(root) for root in roots + ([synthetic_run] if synthetic_run else [])):
+        raise ValueError("Review output must be outside immutable source runs")
+    dataset_identity, categories, pairs, all_candidates = None, None, [], []
+    for root in roots:
+        record = source_record(root, "real_semantic_transition_candidates")
+        config, hashes = record["config"], record.get("artifact_sha256", {})
+        if config.get("candidate_version") != 2:
+            raise ValueError("Review requires v2 candidate runs")
+        if not config.get("splits") or not set(config["splits"]) <= {"train", "val"}:
+            raise ValueError("Review accepts TRAIN/VAL only; TEST is excluded")
+        identity = {key: config.get("dataset", {}).get(key) for key in ("paths", "sha256")}
+        if not all(identity.values()) or (dataset_identity is not None and identity != dataset_identity):
+            raise ValueError("Candidate runs must share dataset paths and hashes")
+        dataset_identity = identity
+        document = read_json(checked(root, "candidates.json", hashes))
+        pair_document = read_json(checked(root, "pairs.json", hashes))
+        if document.get("candidate_version") != 2:
+            raise ValueError("Unsupported candidate document version")
+        if categories is not None and categories != document.get("categories"):
+            raise ValueError("Candidate category ontologies differ")
+        categories = document.get("categories", [])
+        candidate_groups, identifiers = defaultdict(list), set()
+        pair_ids = {str(row["pair_id"]) for row in pair_document}
+        if len(pair_ids) != len(pair_document):
+            raise ValueError("Pair IDs must be unique within each candidate run")
+        for candidate in document["candidates"]:
+            own(candidate, candidate.get("image_sha256", {}).values())
+            if candidate["split"] not in config["splits"]:
+                raise ValueError("Candidate split differs from declared TRAIN/VAL input")
+            cid = candidate.get("candidate_id")
+            if not cid or cid in identifiers or str(candidate.get("pair_id")) not in pair_ids:
+                raise ValueError("Candidate IDs must be unique and belong to a recorded pair")
+            identifiers.add(cid)
+            bbox = candidate.get("bbox_canvas_xyxy", [])
+            if (len(bbox) != 4 or any(type(v) is not int for v in bbox) or min(bbox) < 0
+                    or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
+                raise ValueError("Invalid candidate bounding box")
+            candidate_groups[str(candidate["pair_id"])].append(candidate)
+        for pair in pair_document:
+            own(pair)
+            if pair["split"] not in config["splits"]:
+                raise ValueError("Pair split differs from declared TRAIN/VAL input")
+            local = candidate_groups[str(pair["pair_id"])]
+            if len(local) != pair.get("candidate_count", 0):
+                raise ValueError("Pair candidate count does not match saved candidates")
+            for item in local:
+                if any(item.get(key) != pair.get(key) for key in
+                       ("split", "building_id", "view_id", "reference_id", "source_id")):
+                    raise ValueError("Candidate endpoints differ from its recorded pair")
+            pairs.append({**pair, "candidate_run": str(root), "candidates": local, "hashes": hashes})
+        all_candidates.extend(document["candidates"])
+        provenance.append({"run_path": str(root), "run_sha256": sha256(root / "run.json"),
+                           "candidates_sha256": hashes["candidates.json"], "pairs_sha256": hashes["pairs.json"]})
+        for name in ("candidates.json", "pairs.json"):
+            snapshots[str(root / name)] = hashes[name]
+
+    manifest_path = plain_path(dataset_identity["paths"].get("manifest", ""))
+    manifest_sha = dataset_identity["sha256"].get("manifest")
+    if not manifest_path.is_file() or not manifest_sha or sha256(manifest_path) != manifest_sha:
+        raise ValueError("Prepared image manifest is missing or its hash differs from candidate provenance")
+    manifest = read_json(manifest_path)
+    images = {str(row["image_id"]): row for row in manifest.get("images", [])}
+    if len(images) != len(manifest.get("images", [])):
+        raise ValueError("Prepared manifest contains duplicate image IDs")
+    snapshots[str(manifest_path)] = manifest_sha
+    required_images = {}
+    for pair in pairs:
+        for role in ("reference", "source"):
+            image_id = str(pair[role + "_id"])
+            row = images.get(image_id)
+            if (row is None or any(row.get(key) != pair.get(key) for key in ("split", "building_id", "view_id"))
+                    or row.get("year") != pair.get(role + "_year")):
+                raise ValueError("Prepared image identity/year differs from a recorded real pair")
+            own(row, [row.get("sha256")])
+            image_path = Path(row["image_path"]).expanduser()
+            image_path = plain_path(image_path if image_path.is_absolute() else manifest_path.parent / image_path)
+            if not image_path.is_file():
+                raise ValueError(f"Required original image is unavailable: {image_path}; restore it before creating the complete history gallery")
+            required_images[image_id] = {**row, "image_path": str(image_path)}
+
+    synthetic, synthetic_record = None, None
+    if synthetic_run:
+        synthetic_record = source_record(synthetic_run, "history_dataset")
+        config = synthetic_record["config"]
+        if (not config.get("splits") or not set(config["splits"]) <= {"train", "val"}
+                or config.get("input_sha256") != dataset_identity["sha256"]):
+            raise ValueError("Synthetic history must use the same TRAIN/VAL dataset hashes")
+        hashes = synthetic_record.get("artifact_sha256", {})
+        synthetic = read_json(checked(synthetic_run, "manifest.json", hashes))
+        if synthetic.get("kind") != "persistent_procedural_histories" or synthetic.get("config") != config:
+            raise ValueError("Synthetic manifest differs from its run configuration")
+        bases = {row["base_id"]: row for row in synthetic["bases"]}
+        if len(bases) != len(synthetic["bases"]):
+            raise ValueError("Duplicate synthetic base IDs")
+        for base in bases.values():
+            own(base, [base["image_sha256"]])
+            if base["split"] not in config["splits"]:
+                raise ValueError("Synthetic base split differs from declared TRAIN/VAL input")
+        seen = set()
+        for sequence in synthetic["sequences"]:
+            base = bases.get(sequence["base_id"])
+            key = sequence["base_id"], sequence["arm"]
+            if (base is None or sequence["split"] != base["split"]
+                    or sequence["building_id"] != base["building_id"]
+                    or key in seen or sequence["arm"] not in {"clean", "event"}
+                    or [f["frame"] for f in sequence["frames"]] != [1, 2, 3, 4, 5]):
+                raise ValueError("Synthetic histories require matched five-frame clean/event arms")
+            seen.add(key)
+        if seen != {(key, arm) for key in bases for arm in ("clean", "event")}:
+            raise ValueError("Synthetic history has missing paired arms")
+        provenance.append({"run_path": str(synthetic_run), "run_sha256": sha256(synthetic_run / "run.json"),
+                           "manifest_sha256": hashes["manifest.json"]})
+        snapshots[str(synthetic_run / "manifest.json")] = hashes["manifest.json"]
+
+    notes = ["Все подготовленные TRAIN/VAL истории: синтетика и реальные наблюдения. TEST не используется.",
+             "Синтетика: H0 — без новых процедурных событий; исходный фасад не объявляется здоровым. H1 содержит известные добавленные события.",
+             "Основная реальная история содержит исходные полные фото, включая кадры с отклонённым выравниванием. Ниже отдельно показаны принятые попарные выравнивания; это не единая зарегистрированная видеопоследовательность.",
+             "Фиолетовая область — объединение сохранённых кандидатов разметки, не подтверждённое изменение. Отсутствие кандидатов не означает H0. Отклонённое выравнивание означает пробел в проверке совмещения, но исходный кадр сохранён в истории.",
+             "Классы реальных кандидатов перечислены под историей. Нужна проверка видимого изменения, совмещения и полноты аннотаций; метрики temporal GT не вычисляются.",
+             "На странице — облегчённые превью целых изображений; по клику открывается сохранённая панель в полном размере.",
+             f"Изображения — копии только для просмотра (JPEG); {'исходные размеры сохранены' if not preview_max_side else 'длинная сторона ограничена ' + str(preview_max_side) + ' px'}. Исходные RGB, маски и запуски не изменены."]
+    config = {"sources": provenance, "dataset": dataset_identity, "preview_max_side": preview_max_side,
+              "scope": "all cached TRAIN/VAL histories; no sampling, scoring, re-alignment or temporal ground truth"}
+    out = new_directory(destination)
+    record = run_record("static_history_review", config)
+    write_json(out / "run.json", record)
+    try:
+        new_directory(out / "images")
+        sections, exported, image_number, raw_exports = [], [], 0, {}
+
+        def rgb(path):
+            with Image.open(path) as image:
+                result = image.convert("RGB")
+            if preview_max_side:
+                result.thumbnail((preview_max_side, preview_max_side), Image.Resampling.LANCZOS)
+            return result
+
+        def panel(image, label):
+            nonlocal image_number
+            image_number += 1
+            relative = f"images/{image_number:05d}.jpg"
+            image.save(out / relative, quality=95, subsampling=0)
+            if max(image.size) > 1600:
+                preview = image.copy()
+                preview.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                small = f"images/{image_number:05d}-preview.jpg"
+                preview.save(out / small, quality=90, subsampling=0)
+                return {"label": label, "src": small, "href": relative}
+            return {"label": label, "src": relative}
+
+        def tint(image, mask, color):
+            mask = mask.resize(image.size, Image.Resampling.NEAREST).point(lambda x: 115 if x else 0)
+            return Image.composite(Image.new("RGB", image.size, color), image, mask)
+
+        if synthetic:
+            by_base = defaultdict(dict)
+            for sequence in synthetic["sequences"]:
+                by_base[sequence["base_id"]][sequence["arm"]] = sequence
+            for base in sorted(synthetic["bases"], key=lambda b: (b["split"], b["building_id"], b["base_id"])):
+                title = f"СИНТЕТИКА | {base['split'].upper()} | {base['building_id']} | {base['base_id']}"
+                for arm in ("clean", "event"):
+                    raw_panels, overlay_panels = [], []
+                    for frame in by_base[base["base_id"]][arm]["frames"]:
+                        paths = frame["paths"]
+                        image_path = checked(synthetic_run, paths["rgb"], synthetic_record["artifact_sha256"])
+                        image = rgb(image_path)
+                        label = f"Кадр {frame['frame']} · {frame['event']} · {frame['nuisance']['kind']}"
+                        raw_panels.append(panel(image, label))
+                        if arm == "event":
+                            for name, color in (("damage_present", "#e53935"), ("new_change", "#ffb300"), ("repaired", "#00a878")):
+                                mask_path = checked(synthetic_run, paths[name], synthetic_record["artifact_sha256"])
+                                with Image.open(mask_path) as mask:
+                                    image = tint(image, mask.convert("L"), color)
+                            overlay_panels.append(panel(image, label))
+                    sections.append({"title": title + (" · H0" if arm == "clean" else " · H1"),
+                                     "caption": "Пять кадров, условия съёмки совпадают между H0/H1. " +
+                                     ("Новых процедурных событий нет." if arm == "clean" else "Кадр 4 сохраняет повреждение без нового события."),
+                                     "panels": raw_panels})
+                    if arm == "event":
+                        sections.append({"title": title + " · известные процедурные состояния/события",
+                                         "caption": "Наложены скрытые процедурные маски: повреждение, новое изменение, восстановление. Под окклюзией они могут быть невидимы; это не видимая GT-маска.",
+                                         "panels": overlay_panels})
+
+        histories = defaultdict(list)
+        for pair in pairs:
+            histories[(pair["split"], pair["building_id"], pair["view_id"], pair["reference_id"])].append(pair)
+        for key, chain in sorted(histories.items(), key=lambda item: tuple(map(str, item[0]))):
+            timeline, checks, captions = [], [], []
+            observations = defaultdict(set)
+            for pair in chain:
+                observations[str(pair["reference_id"])].add("ранняя опора")
+                observations[str(pair["source_id"])].add(pair["status"])
+            for image_id in sorted(observations, key=lambda item: (required_images[item]["year"], item)):
+                row = required_images[image_id]
+                path = Path(row["image_path"])
+                if row["sha256"] not in raw_exports:
+                    if sha256(path) != row["sha256"]:
+                        raise ValueError(f"Original image hash mismatch: {path}")
+                    with Image.open(path) as native:
+                        if native.size != (row["width"], row["height"]):
+                            raise ValueError(f"Original image dimensions differ from manifest: {path}")
+                    raw_exports[row["sha256"]] = panel(rgb(path), "")
+                    snapshots[str(path)] = row["sha256"]
+                status_label = ", ".join(sorted(observations[image_id]))
+                timeline.append({**raw_exports[row["sha256"]],
+                                 "label": f"{row['year']} · исходное фото · {status_label}"})
+            for pair in sorted(chain, key=lambda p: (p.get("source_year", 0), str(p["source_id"]))):
+                title = f"{pair.get('reference_year', '?')} → {pair.get('source_year', '?')}"
+                status = pair["status"]
+                if status != "mined_needs_review":
+                    captions.append(title + ": ПРОБЕЛ — " + status + "; " + pair.get("reason", "выравнивание недоступно"))
+                    exported.append({k: v for k, v in pair.items() if k not in {"hashes", "candidates"}})
+                    continue
+                child = plain_path(pair["alignment_run"])
+                if destination.is_relative_to(child):
+                    raise ValueError("Review output must be outside immutable alignment inputs")
+                alignment = source_record(child, "pair_alignment", pair["alignment_run_sha256"])
+                if alignment.get("quality_gate", {}).get("passed") is not True:
+                    raise ValueError("A mined pair no longer passes its recorded alignment gate")
+                observations = alignment.get("observations", {})
+                for role in ("reference", "source"):
+                    observation = observations.get(role, {})
+                    own(observation, [observation.get("sha256")])
+                    if any(observation.get(k) != pair.get(k) for k in ("split", "building_id", "view_id")):
+                        raise ValueError("Alignment observation differs from candidate pair metadata")
+                    if observation.get("year") != pair.get(role + "_year"):
+                        raise ValueError("Alignment observation chronology differs from candidate pair")
+                    if observation.get("sha256") != required_images[str(pair[role + "_id"])]["sha256"]:
+                        raise ValueError("Alignment observation fingerprint differs from the prepared original")
+                artifact_hashes = alignment.get("artifact_sha256", {})
+                reference_path = checked(child, "reference_rgb.png", artifact_hashes)
+                source_path = checked(child, "source_rgb.png", artifact_hashes)
+                with Image.open(source_path) as native, Image.open(reference_path) as reference_native:
+                    native_size = native.size
+                    if reference_native.size != native_size:
+                        raise ValueError("Saved aligned RGB pair has inconsistent canvas sizes")
+                reference, source = rgb(reference_path), rgb(source_path)
+                union = Image.new("L", native_size)
+                event_counts = Counter()
+                for candidate in pair["candidates"]:
+                    if (candidate.get("alignment_run") != str(child)
+                            or candidate.get("image_sha256") != {role: observations[role]["sha256"] for role in ("reference", "source")}):
+                        raise ValueError("Candidate alignment/endpoints differ from pair provenance")
+                    box = candidate["bbox_canvas_xyxy"]
+                    if box[2] > native_size[0] or box[3] > native_size[1]:
+                        raise ValueError("Candidate bounding box exceeds saved alignment canvas")
+                    path = checked(Path(pair["candidate_run"]), Path(candidate["path"]) / "candidate_mask.png", pair["hashes"])
+                    with Image.open(path) as mask:
+                        mask = mask.convert("L")
+                        if mask.size != (box[2]-box[0], box[3]-box[1]):
+                            raise ValueError("Candidate mask dimensions differ from bounding box")
+                        union.paste(ImageChops.lighter(union.crop(box), mask), box)
+                    event_counts[f"{candidate['event_type']}: {candidate.get('from_class') or '∅'} → {candidate.get('to_class') or '∅'}"] += 1
+                checks.append(panel(reference, title + " · опора на холсте этой пары"))
+                checks.append(panel(tint(source, union, "#a855f7"), title + " · поздний снимок / кандидаты"))
+                captions.append(title + ": " + ("; ".join(f"{name} ({count} окон)" for name, count in sorted(event_counts.items()))
+                                                 or "кандидатов нет — отсутствие изменений не подтверждено"))
+                exported.append({k: v for k, v in pair.items() if k != "hashes"})
+            title = f"РЕАЛЬНЫЕ | {key[0].upper()} | {key[1]} | {key[2]} | опора ID {key[3]}"
+            sections.append({"title": title, "caption": "Хронология исходных полных фотографий всех подготовленных пар; без геометрического преобразования. " + " | ".join(captions), "panels": timeline})
+            if checks:
+                sections.append({"title": title + " · проверка совмещения и кандидатов",
+                                 "caption": "Каждые два соседних изображения используют один холст пары. Фиолетовые маски объединены только для просмотра; пересекающиеся окна не являются отдельными событиями.",
+                                 "panels": checks})
+        legend = [{"name": "Текущее процедурное повреждение", "color": "#e53935"},
+                  {"name": "Новое процедурное изменение", "color": "#ffb300"},
+                  {"name": "Процедурное восстановление", "color": "#00a878"},
+                  {"name": "Реальный кандидат из аннотаций — не GT", "color": "#a855f7"}]
+        write_static_gallery(out, "Истории фасадов: синтетика и реальные наблюдения", sections, legend=legend, notes=notes)
+        write_json(out / "histories.json", {"sources": provenance, "real_pairs": exported, "real_images": list(required_images.values()),
+                                             "synthetic_run": str(synthetic_run) if synthetic_run else None,
+                                             "categories": categories})
+        for path, expected in snapshots.items():
+            if sha256(path) != expected:
+                raise ValueError("Source provenance changed during gallery preparation")
+        summary = {"status": "completed_needs_review", "out": str(out), "gallery": "gallery.html",
+                   "synthetic_bases": len(synthetic["bases"]) if synthetic else 0,
+                   "synthetic_sequences": len(synthetic["sequences"]) if synthetic else 0,
+                   "real_histories": len(histories), "real_pairs": len(pairs), "real_original_frames": len(required_images),
+                   "pair_status_counts": dict(Counter(pair["status"] for pair in pairs)),
+                   "input_candidates": len(all_candidates), "rendered_images": image_number,
+                   "quantitative_temporal_evaluation_allowed": False, "test_rgb_loaded": False,
+                   "annotation_files_opened": False, "preview_max_side": preview_max_side}
+        write_json(out / "summary.json", summary)
+        finish_record(out, record, "completed_needs_review")
+        return summary
+    except Exception as exc:
+        finish_record(out, record, "failed", f"{type(exc).__name__}: {exc}")
+        raise

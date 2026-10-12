@@ -1,4 +1,4 @@
-"""Frozen-checkpoint VAL robustness and optional multilabel probability export.
+"""Frozen-checkpoint original photos, VAL robustness and probability export.
 
 No training or threshold selection occurs here. The geometry control is a known
 integer crop translation, not an estimate of robustness to real camera motion.
@@ -141,8 +141,16 @@ def _comparisons(reports):
 
 
 def evaluate_checkpoint(training_run, out, augmentations=None, device="cuda:0", batch_size=4,
-                        export_probabilities=False, smoke=False, no_amp=False):
-    """Evaluate seven fixed VAL conditions against a verified completed best.pth."""
+                        export_probabilities=False, smoke=False, no_amp=False,
+                        evaluation_mode="robustness", splits=None):
+    """Evaluate a verified completed best.pth; robustness remains VAL-only."""
+    if evaluation_mode == "originals":
+        return evaluate_original_checkpoint(training_run, out, augmentations=augmentations,
+                                            device=device, batch_size=batch_size,
+                                            export_probabilities=export_probabilities,
+                                            smoke=smoke, no_amp=no_amp, splits=splits)
+    if evaluation_mode != "robustness" or splits is not None:
+        raise ValueError("--splits requires --evaluation-mode originals; robustness remains VAL-only")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("Batch size must be a positive integer")
     root, training_record, config, saved = _checked_run(training_run)
@@ -229,6 +237,166 @@ def evaluate_checkpoint(training_run, out, augmentations=None, device="cuda:0", 
                    "exported_crops": len(exports), "test_evaluated": False,
                    "physical_disjointness_verified": data.metadata["leakage_check"]["physical_disjointness_verified"],
                    "scope": "VAL diagnostic, annotated support only; no new independent generalization claim"}
+        write_json(destination / "summary.json", summary)
+        finish_record(destination, record, summary["status"])
+        return summary
+    except BaseException as error:
+        finish_record(destination, record, "interrupted" if isinstance(error, KeyboardInterrupt) else "failed", str(error))
+        raise
+
+
+def evaluate_original_checkpoint(training_run, out, augmentations=None, device="cuda:0", batch_size=4,
+                                 export_probabilities=False, smoke=False, no_amp=False, splits=None):
+    """Frozen best-VAL head, unchanged threshold and full native-image galleries.
+
+    TEST is opt-in through the requested split list. TRAIN/VAL RGB and targets
+    come from verified cached originals; TEST is decoded from the same immutable
+    dataset snapshot. All image regions receive predictions for visual review,
+    but quantitative metrics remain restricted to the original annotated union.
+    """
+    from PIL import Image
+    from .metrics import write_full_image_gallery, write_full_image_panels, semantic_legend
+    from ..visualization import write_static_gallery as write_project_gallery
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("Batch size must be a positive integer")
+    splits = ("val",) if splits is None else tuple(splits)
+    if not splits or len(splits) != len(set(splits)) or not set(splits) <= {"train", "val", "test"}:
+        raise ValueError("Request distinct nonempty train/val/test splits")
+    root, training_record, config, saved = _checked_run(training_run)
+    training_data = PreparedData(config["dataset"])
+    if (training_data.metadata["sha256"] != config["dataset_provenance"]["sha256"]
+            or training_data.categories != config["categories"]
+            or training_data.metadata["category_to_channel"] != config["category_to_channel"]):
+        raise ValueError("Dataset/ontology fingerprint differs from checkpoint training data")
+    prepared = PreparedAugmentations(augmentations or config["augmentations"]["path"], training_data)
+    if prepared.metadata["run_sha256"] != config["augmentations"]["run_sha256"]:
+        raise ValueError("Prepared augmentation snapshot differs from training")
+    # Constructing the explicit TEST reader validates labels/identities only.
+    # No TEST RGB is opened unless the inference loop below requests it.
+    test_data = PreparedData(config["dataset"], splits=("test",), allow_test=True) if "test" in splits else None
+    readers = {split: test_data if split == "test" else training_data for split in splits}
+    ids = {}
+    partial = bool(smoke or config.get("smoke"))
+    for split, data in readers.items():
+        selected = data.image_ids(split) if split == "test" else config[f"{'training' if split == 'train' else 'validation'}_image_ids"]
+        if not selected or len(selected) != len(set(selected)) or any(key not in data.image_ids(split) for key in selected):
+            raise ValueError(f"Checkpoint {split.upper()} IDs must be a distinct nonempty matching subset")
+        if not config.get("smoke") and set(selected) != set(data.image_ids(split)):
+            raise ValueError(f"Completed training record omits original {split.upper()} images")
+        ids[split] = list(selected[:2] if partial else selected)
+    gpu = gpu_preflight(device)
+    destination = new_directory(out)
+    settings = {"training_run": str(root), "training_run_sha256": sha256(root / "run.json"),
+                "head_checkpoint": str(root / "best.pth"), "head_sha256": sha256(root / "best.pth"),
+                "checkpoint_epoch": saved["epoch"], "checkpoint_selection": "saved best VAL mIoU; unchanged",
+                "dataset_provenance": training_data.metadata, "augmentations": prepared.metadata,
+                "categories": training_data.categories, "category_to_channel": training_data.metadata["category_to_channel"],
+                "class_groups": config["class_groups"], "splits": list(splits), "image_ids": ids,
+                "device": str(device), "batch_size": batch_size, "smoke": partial,
+                "amp": bool(config["amp"] and str(device).startswith("cuda") and not no_amp),
+                "export_probabilities": bool(export_probabilities), "threshold": .5,
+                "evaluation_mode": "originals", "test_requested": "test" in splits,
+                "selection": "no training, checkpoint reselection, threshold fitting or TEST tuning",
+                "prediction_grid": "native RGB; full grid, fixed midpoint ownership; all classes retained as independent bits",
+                "evaluation_scope": "annotated opaque non-crowd union only; unannotated pixels remain unknown",
+                "gallery_scope": "whole original photos; predictions outside annotation support are unverified",
+                "unknown_train": "separate image-level diagnostics; facade disjointness unconfirmed"}
+    record = run_record("semantic_original_evaluation", settings)
+    record["gpu_preflight"] = gpu
+    write_json(destination / "run.json", record)
+    write_json(destination / "config.json", settings)
+    try:
+        model, provenance = load_model(config["source_root"], config["checkpoint"], len(training_data.categories),
+                                       device, config.get("trust_checkpoint", False))
+        for key, fingerprint in (("sources", "python_tree_sha256"), ("checkpoint", "sha256")):
+            if provenance[key][fingerprint] != saved["backbone_provenance"][key][fingerprint]:
+                raise ValueError("Loaded backbone fingerprint differs from saved checkpoint")
+        model.head.load_state_dict(saved["head_state_dict"], strict=True)
+        reports, exports, all_sections = {}, [], []
+        for split, data in readers.items():
+            folder = destination / split
+            folder.mkdir()
+            sections = []
+            if export_probabilities:
+                (folder / "probabilities").mkdir()
+
+            def export_crop(*, image_id, row, crop, valid, probability, logits):
+                key = hashlib.sha256(f"{image_id}:{row['crop_id']}".encode()).hexdigest()[:24]
+                path = folder / "probabilities" / (key + ".npz")
+                np.savez_compressed(path, probabilities=probability.astype(np.float32),
+                                    targets=crop[1], valid=valid,
+                                    mean_bernoulli_entropy=bernoulli_entropy(probability))
+                exports.append({"split": split, "image_id": image_id, "crop_id": row["crop_id"],
+                                "building_id": data.images[image_id]["building_id"],
+                                "crop": {key: row[key] for key in ("x", "y", "width", "height")},
+                                "path": path.relative_to(destination).as_posix(), "sha256": sha256(path),
+                                "valid_pixels": int(valid.sum())})
+
+            def export_image(*, image_id, image, rgb, target, prediction, valid):
+                # Cached training originals encode annotation support, not the
+                # complete alpha plane. Read only source headers for RGB; RGBA
+                # needs its verified alpha channel to avoid painting transparent
+                # pixels as reliable predictions. TEST already cached this plane.
+                if data._cache is not None and data._cache[0] == image_id:
+                    opaque = data._cache[3]
+                else:
+                    source_path = Path(image["image_path"])
+                    if sha256(source_path) != image["sha256"]:
+                        raise ValueError(f"Original image hash mismatch: {source_path}")
+                    with Image.open(source_path) as original:
+                        if original.size != (image["width"], image["height"]) or original.mode not in {"RGB", "RGBA"}:
+                            raise ValueError(f"Original image grid/mode differs from prepared snapshot: {source_path}")
+                        opaque = np.array(original.getchannel("A")) == 255 if original.mode == "RGBA" else None
+                sections.append(write_full_image_panels(
+                    folder, rgb=rgb, target=target, prediction=prediction, valid=valid,
+                    categories=data.categories, image_id=image_id, building_id=image.get("building_id"),
+                    split=split, source_name=image.get("file_name", Path(image["image_path"]).name),
+                    prediction_valid=opaque))
+
+            report = evaluate(model, data, ids[split], device, batch_size, amp=settings["amp"],
+                              smoke=False, split=split, groups=config["class_groups"],
+                              prepared=None if split == "test" else prepared,
+                              prediction_callback=export_crop if export_probabilities else None,
+                              image_prediction_callback=export_image)
+            report.update(smoke=partial, checkpoint_epoch=saved["epoch"], checkpoint_sha256=settings["head_sha256"],
+                          prediction_source="frozen best-VAL checkpoint; original native-grid RGB",
+                          full_image_predictions=True, images_visualized=len(sections))
+            reports[split] = report
+            write_json(folder / "metrics.json", report)
+            write_reports(folder, report)
+            write_full_image_gallery(folder, sections, data.categories, split=split,
+                                     checkpoint_name=f"best.pth — epoch {saved['epoch']}")
+            for section in sections:
+                combined = dict(section, panels=[dict(panel, **{
+                    key: f"{split}/{panel[key]}" for key in ("src", "href") if key in panel})
+                    for panel in section["panels"]])
+                combined["caption"] = section.get("caption", "").replace("photos/", f"{split}/photos/")
+                all_sections.append(combined)
+            values = report["primary"]
+            print(f"{split.upper()} originals: mIoU={values['miou']}; Recall={values['recall']}; loss={values['loss']}", flush=True)
+        write_project_gallery(destination, title="DINOv2 — семантическая сегментация целых фотографий",
+                              sections=all_sections, legend=semantic_legend(training_data.categories),
+                              notes=[f"Сохранённый best.pth, эпоха {saved['epoch']}; sigmoid ≥ 0.5; без повторного обучения и подбора порогов.",
+                                     "GT — разметка на фото; GT MASKS — все размеченные классы. Серая клетка означает неизвестную разметку, не здоровый фон.",
+                                     "PREDICTED показывает прогноз на всём фото. Метрики охватывают только размеченные непрозрачные пиксели без crowd; прогноз вне этой поддержки не оценён.",
+                                     "Чёрный в PREDICTED MASKS означает отсутствие классов выше порога, не подтверждённое отсутствие повреждений. Непрозрачная поддержка исходного RGB учитывается отдельно.",
+                                     "Пересечения классов показаны диагональными полосами всех активных каналов. Точные пересекающиеся маски сохранены в masks.npz; argmax не применяется.",
+                                     "На странице — облегчённые превью целых фото; по клику открывается исходное разрешение выбранной панели.",
+                                     "TRAIN и VAL — диагностика разработки; TEST — exploratory-проверка зафиксированного checkpoint. Независимость неизвестных TRAIN-адресов от holdout пока не подтверждена."])
+        if export_probabilities:
+            (destination / "probabilities.jsonl").write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in exports), encoding="utf-8")
+        summary = {"status": "completed_smoke" if partial else "completed_exploratory", "out": str(destination),
+                   "training_run": str(root), "checkpoint_epoch": saved["epoch"], "checkpoint_sha256": settings["head_sha256"],
+                   "splits": {split: report["primary"] for split, report in reports.items()},
+                   "images": {split: len(keys) for split, keys in ids.items()},
+                   "images_visualized": len(all_sections), "exported_crops": len(exports),
+                   "test_evaluated": "test" in splits,
+                   "test_rgb_loaded": bool(test_data and test_data.metadata["test_rgb_loaded"]),
+                   "test_annotations_rasterized": bool(test_data and test_data.metadata["test_annotations_rasterized"]),
+                   "physical_disjointness_verified": training_data.metadata["leakage_check"]["physical_disjointness_verified"],
+                   "scope": "frozen-checkpoint semantic multilabel metrics on annotated union; no background or temporal-change claim"}
         write_json(destination / "summary.json", summary)
         finish_record(destination, record, summary["status"])
         return summary

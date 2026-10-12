@@ -15,8 +15,10 @@
 | Оригинальные кропы + две аугментации | `python -m facade_change.segmentation --prepare-only` | [Сегментация](docs/2026-10-11_dino_semantic_training.md) |
 | Обучение головы DINOv2 | `python -m facade_change.segmentation --augmentations ...` | [Обучение и метрики](docs/2026-10-11_dino_semantic_training.md) |
 | Устойчивость готовой головы | `python -m facade_change.segmentation --evaluate-run ...` | [VAL и вероятности](docs/2026-10-11_dino_semantic_training.md) |
+| Фиксированный checkpoint на TRAIN/VAL/TEST и целые фотографии | `python -m facade_change.segmentation --evaluate-run ... --evaluation-mode originals --splits train val test` | [Оценка и общая галерея](docs/2026-10-11_dino_semantic_training.md) |
 | Пятикадровые синтетические истории | `python -m facade_change prepare-history` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | Реальные кандидаты переходов классов | `python -m facade_change mine-transitions` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
+| Одна страница синтетических и реальных историй | `python -m facade_change review-transitions --synthetic-run ... --candidate-runs ...` | [Просмотр историй](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | Выравнивание временных пар | `python -m facade_change batch` | [Геометрия и кропы](docs/2026-10-04_geoscd_and_crop_preparation.md) |
 | Сравнение методов на фиксированных H0/H1 | `python -m facade_change h0h1-benchmark` | [Общий runner](docs/2026-10-04_common_runner.md) |
 | Анализ готовых карт и потерь Recall | `python -m data_analysis` | [Анализ результатов](data_analysis/README.md) |
@@ -57,8 +59,11 @@ DINOv2 заморожен, обучается линейная multilabel-гол
 батчей и явно отмечаются как онлайн-диагностика. Полная оценка имеет равные веса
 фасадов и учитывает перекрытия кропов один раз. Основной checkpoint выбирается
 по VAL; отдельный лучший TRAIN сохраняется для диагностики. Рядом с весами
-сохраняются галереи кропов с разметкой, прогнозом и легендой. TEST не используется
-в обучении и текущем подборе экспериментов.
+сохраняются галереи кропов с разметкой, прогнозом и легендой. Отдельная оценка
+`--evaluation-mode originals` строит общую страницу целых фотографий со всеми
+классами, GT, прогнозами и легендой. Она использует сохранённый лучший VAL
+checkpoint и прежний порог; TEST читается только при явном `--splits test`
+(или при перечислении нескольких split, включающем test), без обучения и настройки.
 
 Синтетические истории имеют известную программу событий и независимые условия
 наблюдения. Реальные переходы аннотаций после alignment — кандидаты для просмотра,
