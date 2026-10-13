@@ -17,7 +17,7 @@
 | Устойчивость готовой головы | `python -m facade_change.segmentation --evaluate-run ...` | [VAL и вероятности](docs/2026-10-11_dino_semantic_training.md) |
 | Фиксированный checkpoint на TRAIN/VAL/TEST и целые фотографии | `python -m facade_change.segmentation --evaluate-run ... --evaluation-mode originals --splits train val test` | [Оценка и общая галерея](docs/2026-10-11_dino_semantic_training.md) |
 | Пятикадровые синтетические истории | `python -m facade_change prepare-history` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
-| Реальные кандидаты переходов классов | `python -m facade_change mine-transitions` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
+| Реальные совмещённые кропы переходов классов + контекст 100 px | `python -m facade_change mine-transitions --context-padding 100` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | Одна страница синтетических и реальных историй | `python -m facade_change review-transitions --synthetic-run ... --candidate-runs ...` | [Просмотр историй](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | Выравнивание временных пар | `python -m facade_change batch` | [Геометрия и кропы](docs/2026-10-04_geoscd_and_crop_preparation.md) |
 | Сравнение методов на фиксированных H0/H1 | `python -m facade_change h0h1-benchmark` | [Общий runner](docs/2026-10-04_common_runner.md) |
@@ -51,6 +51,12 @@ VAL/TEST. Для оставшихся неизвестных адресов фи
 пригодным снимком того же вида. Опора не объявляется здоровой. Alignment работает
 с исходным RGB без EXIF-поворота; source_to_reference задаёт направление.
 Геометрическое перекрытие не доказывает отсутствие окклюзий.
+
+Реальные кандидаты по COCO экспортируются в исходном масштабе: весь связный
+переход классов и контекст 100 px вокруг. Общая галерея показывает совмещённые
+кропы, классовую легенду и тот же участок в доступные годы. Отбор по GT требует
+проверки и не заменяет оценку обнаружения на целом фасаде. Готовые SIFT-выравнивания
+и синтетические истории переиспользуются.
 
 DINOv2 заморожен, обучается линейная multilabel-голова. Неразмеченные пиксели
 не становятся здоровым фоном. VAL оценивается каждую эпоху; полная оценка TRAIN

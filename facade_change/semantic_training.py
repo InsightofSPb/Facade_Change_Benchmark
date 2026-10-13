@@ -188,7 +188,8 @@ def include_auxiliary_training(prepared: dict, split: dict, enabled: bool):
 def _transition_windows(reference, source, common, class_pairs, window_sizes,
                         min_support_fraction, min_transition_fraction,
                         min_component_pixels, *, event_types=("replacement",),
-                        boundary_tolerance_pixels=2, categories=None):
+                        boundary_tolerance_pixels=2, categories=None,
+                        crop_mode="windows", context_padding=100):
     """Component-supported multilabel changes with same-class contour tolerance.
 
     Dilating the OLD same-class mask suppresses contour jitter without eroding a
@@ -254,44 +255,64 @@ def _transition_windows(reference, source, common, class_pairs, window_sizes,
             if int(stats[component, cv2.CC_STAT_AREA]) < min_component_pixels:
                 continue
             cx, cy = centers[component]
-            for size in window_sizes:
-                if size > min(h, w):
+            boxes = []
+            if crop_mode == "component":
+                x, y, width, height = map(int, stats[component, :4])
+                boxes.append((x, y, x + width, y + height, None))
+            else:
+                for size in window_sizes:
+                    if size <= min(h, w):
+                        x = min(max(0, int(round(cx - (size - 1) / 2))), w - size)
+                        y = min(max(0, int(round(cy - (size - 1) / 2))), h - size)
+                        boxes.append((x, y, x + size, y + size, size))
+            for x, y, x1, y1, size in boxes:
+                if (x, y, x1, y1) in seen:
                     continue
-                x = min(max(0, int(round(cx - (size - 1) / 2))), w - size)
-                y = min(max(0, int(round(cy - (size - 1) / 2))), h - size)
-                if (x, y, size) in seen:
-                    continue
-                support = int(common[y:y+size, x:x+size].sum())
-                # Count only the contiguous component that proposed this window.
-                event = components[y:y+size, x:x+size] == component
+                core_box = [x, y, x1, y1]
+                core_area = (x1 - x) * (y1 - y)
+                support = int(common[y:y1, x:x1].sum())
+                event = components[y:y1, x:x1] == component
                 count = int(event.sum())
-                if (count < min_component_pixels or support / size**2 < min_support_fraction
-                        or count / size**2 < min_transition_fraction):
+                # Select on the unpadded region. Context must not dilute the
+                # selection score or discard a thin, wholly new crack.
+                if (count < min_component_pixels or support / core_area < min_support_fraction
+                        or count / core_area < min_transition_fraction):
                     continue
-                seen.add((x, y, size))
-                raw_local = raw_components[y:y+size, x:x+size]
+                seen.add((x, y, x1, y1))
+                if crop_mode == "component":
+                    x, y = max(0, x-context_padding), max(0, y-context_padding)
+                    x1, y1 = min(w, x1+context_padding), min(h, y1+context_padding)
+                event = components[y:y1, x:x1] == component
+                area = (x1-x) * (y1-y)
+                raw_local = raw_components[y:y1, x:x1]
                 ancestor = int(raw_local[event][0])
                 raw_event = raw_local == ancestor
-                ignored = raw_event & ~changed[y:y+size, x:x+size]
+                ignored = raw_event & ~changed[y:y1, x:x1]
                 windows.append({"event_type": event_type,
                                 "from_class": old["name"] if old else None,
                                 "to_class": new["name"] if new else None,
                                 "from_category_id": old["id"] if old else None,
                                 "to_category_id": new["id"] if new else None,
-                                "bbox_canvas_xyxy": [x, y, x+size, y+size], "window_size": size,
-                                "common_annotated_pixels": support, "candidate_pixels": count,
+                                "bbox_canvas_xyxy": [x, y, x1, y1], "window_size": size,
+                                "selection_bbox_canvas_xyxy": core_box,
+                                "crop_mode": crop_mode, "crop_width": x1-x, "crop_height": y1-y,
+                                "crop_area": area, "context_padding": context_padding if crop_mode == "component" else 0,
+                                "selection_support_fraction": support / core_area,
+                                "selection_transition_fraction": count / core_area,
+                                "common_annotated_pixels": int(common[y:y1, x:x1].sum()),
+                                "candidate_pixels": int(event.sum()),
                                 "raw_candidate_pixels": int(raw_event.sum()),
                                 "ignored_boundary_pixels": int(ignored.sum()),
                                 "other_robust_component_pixels": int((raw_event & ~ignored & ~event).sum()),
                                 "component_pixels": int(stats[component, cv2.CC_STAT_AREA]),
                                 "boundary_tolerance_pixels": boundary_tolerance_pixels,
-                                "support_fraction": support / size**2,
-                                "transition_fraction": count / size**2,
+                                "support_fraction": float(common[y:y1, x:x1].mean()),
+                                "transition_fraction": int(event.sum()) / area,
                                 "candidate_mask": event.copy(), "raw_candidate_mask": raw_event.copy(),
                                 "ignored_boundary_mask": ignored.copy()})
-    return sorted(windows, key=lambda row: (-row["transition_fraction"],
+    return sorted(windows, key=lambda row: (-row["selection_transition_fraction"],
                                            row["event_type"], row["from_class"] or "", row["to_class"] or "",
-                                           row["window_size"], row["bbox_canvas_xyxy"]))
+                                           row["window_size"] or 0, row["bbox_canvas_xyxy"]))
 
 
 def _select_transition_windows(windows, limit):
@@ -379,7 +400,7 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                                max_windows_per_pair=20, alignment_method=None,
                                all_class_pairs=True,
                                event_types=("replacement", "appearance", "disappearance"),
-                               boundary_tolerance_pixels=2):
+                               boundary_tolerance_pixels=2, crop_mode="component", context_padding=100):
     """CPU-only review pack from existing first-anchor raw-RGB alignments.
 
     Absence is meaningful only within the annotated union at BOTH dates. Even
@@ -395,6 +416,7 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
     from .geometry import Canvas, expanded_canvas, warp_pair
     from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
     from .segmentation.data import PreparedData
+    from .segmentation.metrics import _gallery_colors, _write_full_semantic_view
 
     if (not window_sizes or any(isinstance(size, bool) or not isinstance(size, int) or size < 8
                                for size in window_sizes) or len(set(window_sizes)) != len(window_sizes)):
@@ -407,6 +429,8 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
     if (isinstance(boundary_tolerance_pixels, bool) or not isinstance(boundary_tolerance_pixels, int)
             or boundary_tolerance_pixels < 0):
         raise ValueError("boundary_tolerance_pixels must be an integer >=0")
+    if crop_mode not in {"component", "windows"} or type(context_padding) is not int or context_padding < 0:
+        raise ValueError("crop_mode must be component/windows; context_padding must be an integer >=0")
     if (not event_types or len(set(event_types)) != len(event_types)
             or not set(event_types) <= {"replacement", "appearance", "disappearance"}):
         raise ValueError("event_types must contain distinct replacement/appearance/disappearance choices")
@@ -422,9 +446,13 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
         raise ValueError("No requested directed class pair exists in the COCO ontology")
     alignment_path, alignments, unreadable = _transition_alignments(alignment_run, alignment_method)
     pairs = [row for row in data.manifest.get("pairs", []) if row.get("split") in splits]
-    config = {"candidate_version": 2, "dataset": data.metadata, "alignment_run": str(alignment_path),
+    version = 3 if crop_mode == "component" else 2
+    colors = _gallery_colors(categories)
+    config = {"candidate_version": version, "dataset": data.metadata, "alignment_run": str(alignment_path),
               "alignment_run_sha256": sha256(alignment_path / "run.json"),
               "splits": list(splits), "window_sizes": list(window_sizes),
+              "crop_mode": crop_mode, "context_padding": context_padding if crop_mode == "component" else 0,
+              "selection_uses_annotations": True,
               "min_support_fraction": min_support_fraction,
               "min_transition_fraction": min_transition_fraction,
               "min_component_pixels": min_component_pixels,
@@ -437,8 +465,10 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                                            if any(name not in by_name for name in pair)],
               "candidate_rule": "appearance/loss outside dilated same-class mask at the other date; replacement intersects robust loss(A) and gain(B)",
               "raw_mask_scope": "ancestor raw component of the selected robust component; any other robust subcomponents counted separately",
-              "window_selection": "component-centered; strongest fraction within event/class groups; deterministic round-robin capped per pair",
-              "window_counting": "same robust connected component must meet absolute and full-window area thresholds; window is not labelled entirely positive",
+              "window_selection": ("complete connected-component bounding box plus context, clipped to alignment canvas; gates on unpadded box"
+                                   if crop_mode == "component" else "component-centered fixed windows") +
+                                  "; strongest selection fraction within event/class groups; deterministic round-robin capped per pair",
+              "window_counting": "same robust connected component must meet absolute and selection-box area thresholds before padding; crop is not labelled entirely positive",
               "support": "common geometric opaque support AND annotated non-crowd union at both dates",
               "pair_policy": "prepared earliest reference per view; never adjacent or future matching",
               "interpretation": "semantic annotation transition candidates; human review required; not temporal ground truth"}
@@ -460,6 +490,7 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
             view = views[key]
             view["prepared_pairs"] += 1
             pair_row = {**pair, "candidate_count": 0}
+            pair_row.update(reference_year=reference["year"], source_year=source["year"])
             pair_rows.append(pair_row)
             if (int(reference["year"]) >= int(source["year"])
                     or int(reference["year"]) != min(view["available_years"])):
@@ -518,11 +549,13 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
             windows = _transition_windows(*packed, common, class_pairs, window_sizes,
                                           min_support_fraction, min_transition_fraction, min_component_pixels,
                                           event_types=event_types, boundary_tolerance_pixels=boundary_tolerance_pixels,
-                                          categories=categories)
+                                          categories=categories, crop_mode=crop_mode, context_padding=context_padding)
             selected_windows, group_counts = _select_transition_windows(windows, max_windows_per_pair)
             pair_row.update(status="mined_needs_review", alignment_run=str(child),
                             alignment_run_sha256=selected["record_sha256"],
                             geometry_sha256=sha256(geometry_path), alignment_method=selected["method"],
+                            reference_to_canvas=canvas.reference_to_canvas.tolist(),
+                            canvas_size=[canvas.width, canvas.height],
                             alignment_quality_gate=child_record["quality_gate"],
                             common_annotated_pixels=int(common.sum()), qualifying_windows=len(windows),
                             truncated_windows=max(0, len(windows)-max_windows_per_pair),
@@ -544,14 +577,24 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                     overlay = warped[role].copy()
                     overlay[event] = (overlay[event].astype(np.float32)*.4 + np.array([255, 45, 10])*.6).astype(np.uint8)
                     Image.fromarray(overlay).save(directory / f"{role}_candidate.png")
+                    index = 0 if role == "reference" else 1
+                    bits = packed[index][y:y1, x:x1]
+                    valid = supports[index][y:y1, x:x1] & (bits != 0)
+                    _write_full_semantic_view(warped[role], bits, valid, colors,
+                                              directory / f"{role}_classes.png",
+                                              directory / f"{role}_semantic.png")
                 Image.fromarray(event.astype(np.uint8)*255).save(directory / "candidate_mask.png")
                 Image.fromarray(raw_event.astype(np.uint8)*255).save(directory / "raw_candidate_mask.png")
                 Image.fromarray(ignored.astype(np.uint8)*255).save(directory / "ignored_boundary_mask.png")
                 Image.fromarray(common[y:y1, x:x1].astype(np.uint8)*255).save(directory / "annotated_support.png")
+                Image.fromarray(warped["overlap"].astype(np.uint8)*255).save(directory / "geometric_support.png")
+                shift_x, shift_y = canvas.reference_to_canvas[:2, 2]
                 # Packed labels retain all overlap channels and can be re-inspected.
                 np.savez_compressed(directory / "semantic_masks.npz",
                                     reference=packed[0][y:y1, x:x1], source=packed[1][y:y1, x:x1])
-                result = {**window, "candidate_version": 2, "candidate_id": candidate_id, "path": candidate_id,
+                result = {**window, "candidate_version": version, "candidate_id": candidate_id, "path": candidate_id,
+                          "bbox_reference_xyxy": [int(x-shift_x), int(y-shift_y), int(x1-shift_x), int(y1-shift_y)],
+                          "selection_uses_annotations": True,
                           "pair_id": pair.get("pair_id"), "split": pair["split"],
                           "building_id": pair["building_id"], "view_id": pair["view_id"],
                           "reference_id": reference["image_id"], "source_id": source["image_id"],
@@ -567,8 +610,8 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                 candidates.append(result)
                 title = html.escape(f"{pair['view_id']} {reference['year']} → {source['year']}: "
                                     f"{window['event_type']}: {window['from_class'] or '∅'} → {window['to_class'] or '∅'}")
-                gallery.append(f'<h2>{title}</h2><p>{candidate_id}; {window["window_size"]} px window; '
-                               f'candidate pixels: {window["candidate_pixels"]}/{window["window_size"]**2} '
+                gallery.append(f'<h2>{title}</h2><p>{candidate_id}; {x1-x} × {y1-y} px crop; '
+                               f'candidate pixels: {window["candidate_pixels"]}/{window["crop_area"]} '
                                f'({window["transition_fraction"]:.2%} of window area); '
                                f'raw component pixels: {window["raw_candidate_pixels"]}; '
                                f'boundary-excluded pixels: {window["ignored_boundary_pixels"]}; '
@@ -594,7 +637,9 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                                                               "selected_windows": 0, "omitted_windows": 0})
                 for field in ("qualifying_windows", "selected_windows", "omitted_windows"):
                     aggregate[field] += group[field]
-        summary = {"status": "completed_needs_review", "candidate_version": 2,
+        summary = {"status": "completed_needs_review", "candidate_version": version,
+                   "crop_mode": crop_mode, "context_padding": config["context_padding"],
+                   "selection_uses_annotations": True,
                    "out": str(out), "candidate_count": len(candidates),
                    "qualifying_windows": sum(row.get("qualifying_windows", 0) for row in pair_rows),
                    "omitted_windows": sum(row.get("truncated_windows", 0) for row in pair_rows),
@@ -604,11 +649,12 @@ def mine_transition_candidates(dataset, alignment_run, out, window_sizes=(50, 10
                    "test_rgb_loaded": False, "test_annotations_rasterized": False,
                    "quantitative_temporal_evaluation_allowed": False,
                    "note": "A missing candidate does not establish an unchanged region; candidates are a biased review shortlist. Window counts are not event counts: sizes, classes and event types can overlap."}
-        write_json(out / "candidates.json", {"candidate_version": 2, "categories": categories, "candidates": candidates})
+        write_json(out / "candidates.json", {"candidate_version": version, "categories": categories, "candidates": candidates})
         write_json(out / "pairs.json", pair_rows)
         write_json(out / "summary.json", summary)
         fields = ["candidate_id", "split", "building_id", "view_id", "reference_year", "source_year",
-                  "event_type", "from_class", "to_class", "window_size", "candidate_pixels",
+                  "event_type", "from_class", "to_class", "window_size", "crop_width", "crop_height",
+                  "context_padding", "candidate_pixels",
                   "raw_candidate_pixels", "ignored_boundary_pixels", "other_robust_component_pixels",
                   "common_annotated_pixels",
                   "transition_fraction", "support_fraction", "review_status", "path"]
@@ -647,6 +693,8 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
     import json
     from pathlib import Path
     from PIL import Image, ImageChops
+    import numpy as np
+    from .segmentation.metrics import semantic_legend
     from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
     from .visualization import write_static_gallery
 
@@ -708,8 +756,8 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
     for root in roots:
         record = source_record(root, "real_semantic_transition_candidates")
         config, hashes = record["config"], record.get("artifact_sha256", {})
-        if config.get("candidate_version") != 2:
-            raise ValueError("Review requires v2 candidate runs")
+        if config.get("candidate_version") not in {2, 3}:
+            raise ValueError("Review requires v2/v3 candidate runs")
         if not config.get("splits") or not set(config["splits"]) <= {"train", "val"}:
             raise ValueError("Review accepts TRAIN/VAL only; TEST is excluded")
         identity = {key: config.get("dataset", {}).get(key) for key in ("paths", "sha256")}
@@ -718,8 +766,8 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
         dataset_identity = identity
         document = read_json(checked(root, "candidates.json", hashes))
         pair_document = read_json(checked(root, "pairs.json", hashes))
-        if document.get("candidate_version") != 2:
-            raise ValueError("Unsupported candidate document version")
+        if document.get("candidate_version") != config["candidate_version"]:
+            raise ValueError("Unsupported or inconsistent candidate document version")
         if categories is not None and categories != document.get("categories"):
             raise ValueError("Candidate category ontologies differ")
         categories = document.get("categories", [])
@@ -751,7 +799,8 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
                 if any(item.get(key) != pair.get(key) for key in
                        ("split", "building_id", "view_id", "reference_id", "source_id")):
                     raise ValueError("Candidate endpoints differ from its recorded pair")
-            pairs.append({**pair, "candidate_run": str(root), "candidates": local, "hashes": hashes})
+            pairs.append({**pair, "candidate_run": str(root), "candidate_version": config["candidate_version"],
+                          "candidates": local, "hashes": hashes})
         all_candidates.extend(document["candidates"])
         provenance.append({"run_path": str(root), "run_sha256": sha256(root / "run.json"),
                            "candidates_sha256": hashes["candidates.json"], "pairs_sha256": hashes["pairs.json"]})
@@ -818,19 +867,24 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
 
     notes = ["Все подготовленные TRAIN/VAL истории: синтетика и реальные наблюдения. TEST не используется.",
              "Синтетика: H0 — без новых процедурных событий; исходный фасад не объявляется здоровым. H1 содержит известные добавленные события.",
-             "Основная реальная история содержит исходные полные фото, включая кадры с отклонённым выравниванием. Ниже отдельно показаны принятые попарные выравнивания; это не единая зарегистрированная видеопоследовательность.",
-             "Фиолетовая область — объединение сохранённых кандидатов разметки, не подтверждённое изменение. Отсутствие кандидатов не означает H0. Отклонённое выравнивание означает пробел в проверке совмещения, но исходный кадр сохранён в истории.",
+             "Реальные данные показаны кропами после выравнивания: вся связная область перехода классов плюс контекст. Полные фасады не выводятся. Старые v2-запуски сохраняют размер своих окон; для контекста их нужно переэкспортировать.",
+             "Фиолетовая область — объединение кандидатов разметки в одном кропе, не подтверждённое изменение. Отсутствие кандидатов не означает H0. Отклонённое выравнивание отмечено как пробел; выровненный кроп для него не придумывается.",
              "Классы реальных кандидатов перечислены под историей. Нужна проверка видимого изменения, совмещения и полноты аннотаций; метрики temporal GT не вычисляются.",
-             "На странице — облегчённые превью целых изображений; по клику открывается сохранённая панель в полном размере.",
+             "Области выбраны по аннотациям: это направленный просмотр переходов, а не независимая проверка обнаружения на всём фасаде. Истории одного участка используют общий прямоугольник в координатах ранней опоры; они могут содержать больше или меньше пяти пригодных дат.",
+             "Классовые маски COCO имеют общую легенду; штриховка сохраняет пересечение классов. По клику открывается панель в полном размере.",
              f"Изображения — копии только для просмотра (JPEG); {'исходные размеры сохранены' if not preview_max_side else 'длинная сторона ограничена ' + str(preview_max_side) + ' px'}. Исходные RGB, маски и запуски не изменены."]
     config = {"sources": provenance, "dataset": dataset_identity, "preview_max_side": preview_max_side,
-              "scope": "all cached TRAIN/VAL histories; no sampling, scoring, re-alignment or temporal ground truth"}
+              "real_display": "aligned annotation-selected crops and same-region timelines",
+              "timeline_min_geometric_support_fraction": .5,
+              "selection_uses_annotations": True,
+              "scope": "cached TRAIN/VAL crop review; no scoring, re-alignment or temporal ground truth"}
     out = new_directory(destination)
     record = run_record("static_history_review", config)
     write_json(out / "run.json", record)
     try:
         new_directory(out / "images")
-        sections, exported, image_number, raw_exports = [], [], 0, {}
+        sections, exported, image_number, checked_originals = [], [], 0, set()
+        crop_exports, crop_histories = [], []
 
         def rgb(path):
             with Image.open(path) as image:
@@ -889,31 +943,24 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
         for pair in pairs:
             histories[(pair["split"], pair["building_id"], pair["view_id"], pair["reference_id"])].append(pair)
         for key, chain in sorted(histories.items(), key=lambda item: tuple(map(str, item[0]))):
-            timeline, checks, captions = [], [], []
-            observations = defaultdict(set)
-            for pair in chain:
-                observations[str(pair["reference_id"])].add("ранняя опора")
-                observations[str(pair["source_id"])].add(pair["status"])
-            for image_id in sorted(observations, key=lambda item: (required_images[item]["year"], item)):
-                row = required_images[image_id]
-                path = Path(row["image_path"])
-                if row["sha256"] not in raw_exports:
-                    if sha256(path) != row["sha256"]:
-                        raise ValueError(f"Original image hash mismatch: {path}")
-                    with Image.open(path) as native:
-                        if native.size != (row["width"], row["height"]):
-                            raise ValueError(f"Original image dimensions differ from manifest: {path}")
-                    raw_exports[row["sha256"]] = panel(rgb(path), "")
-                    snapshots[str(path)] = row["sha256"]
-                status_label = ", ".join(sorted(observations[image_id]))
-                timeline.append({**raw_exports[row["sha256"]],
-                                 "label": f"{row['year']} · исходное фото · {status_label}"})
+            title = f"РЕАЛЬНЫЕ | {key[0].upper()} | {key[1]} | {key[2]} | опора ID {key[3]}"
+            captions, chain_sections, aligned, history_seeds = [], [], [], {}
             for pair in sorted(chain, key=lambda p: (p.get("source_year", 0), str(p["source_id"]))):
-                title = f"{pair.get('reference_year', '?')} → {pair.get('source_year', '?')}"
-                status = pair["status"]
-                if status != "mined_needs_review":
-                    captions.append(title + ": ПРОБЕЛ — " + status + "; " + pair.get("reason", "выравнивание недоступно"))
-                    exported.append({k: v for k, v in pair.items() if k not in {"hashes", "candidates"}})
+                for role in ("reference", "source"):
+                    row = required_images[str(pair[role + "_id"])]
+                    path = Path(row["image_path"])
+                    if str(path) not in checked_originals:
+                        if sha256(path) != row["sha256"]:
+                            raise ValueError(f"Original image hash mismatch: {path}")
+                        with Image.open(path) as native:
+                            if native.size != (row["width"], row["height"]):
+                                raise ValueError(f"Original image dimensions differ from manifest: {path}")
+                        snapshots[str(path)] = row["sha256"]
+                        checked_originals.add(str(path))
+                dates = f"{pair.get('reference_year', '?')} → {pair.get('source_year', '?')}"
+                exported.append({k: v for k, v in pair.items() if k != "hashes"})
+                if pair["status"] != "mined_needs_review":
+                    captions.append(dates + ": ПРОБЕЛ — " + pair["status"] + "; " + pair.get("reason", "выравнивание недоступно"))
                     continue
                 child = plain_path(pair["alignment_run"])
                 if destination.is_relative_to(child):
@@ -938,9 +985,29 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
                     native_size = native.size
                     if reference_native.size != native_size:
                         raise ValueError("Saved aligned RGB pair has inconsistent canvas sizes")
-                reference, source = rgb(reference_path), rgb(source_path)
-                union = Image.new("L", native_size)
-                event_counts = Counter()
+                shift = None
+                if pair["candidate_version"] == 3:
+                    geometry_path = checked(child, "geometry.json", artifact_hashes)
+                    geometry = read_json(geometry_path)
+                    matrix = np.asarray(geometry["reference_to_canvas"], dtype=float)
+                    saved_matrix = np.asarray(pair.get("reference_to_canvas"), dtype=float)
+                    if (matrix.shape != (3, 3) or saved_matrix.shape != (3, 3)
+                            or not np.isfinite(matrix).all()):
+                        raise ValueError("Crop history requires finite 3x3 reference geometry")
+                    shift = matrix[:2, 2].round().astype(int)
+                    expected = np.array([[1., 0., shift[0]], [0., 1., shift[1]], [0., 0., 1.]])
+                    if (not np.allclose(matrix, expected, atol=1e-10, rtol=0)
+                            or not np.allclose(matrix, saved_matrix, atol=1e-10, rtol=0)
+                            or [geometry["width"], geometry["height"]] != list(native_size)
+                            or pair.get("geometry_sha256") != sha256(geometry_path)):
+                        raise ValueError("Crop history reference coordinates differ from alignment geometry")
+                    overlap_path = checked(child, "overlap.png", artifact_hashes)
+                    with Image.open(overlap_path) as overlap:
+                        if overlap.size != native_size:
+                            raise ValueError("Alignment overlap has inconsistent canvas size")
+                    aligned.append({"pair": pair, "source": source_path, "overlap": overlap_path,
+                                    "shift": shift.tolist()})
+                groups = defaultdict(list)
                 for candidate in pair["candidates"]:
                     if (candidate.get("alignment_run") != str(child)
                             or candidate.get("image_sha256") != {role: observations[role]["sha256"] for role in ("reference", "source")}):
@@ -948,32 +1015,99 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
                     box = candidate["bbox_canvas_xyxy"]
                     if box[2] > native_size[0] or box[3] > native_size[1]:
                         raise ValueError("Candidate bounding box exceeds saved alignment canvas")
-                    path = checked(Path(pair["candidate_run"]), Path(candidate["path"]) / "candidate_mask.png", pair["hashes"])
-                    with Image.open(path) as mask:
-                        mask = mask.convert("L")
-                        if mask.size != (box[2]-box[0], box[3]-box[1]):
-                            raise ValueError("Candidate mask dimensions differ from bounding box")
-                        union.paste(ImageChops.lighter(union.crop(box), mask), box)
-                    event_counts[f"{candidate['event_type']}: {candidate.get('from_class') or '∅'} → {candidate.get('to_class') or '∅'}"] += 1
-                checks.append(panel(reference, title + " · опора на холсте этой пары"))
-                checks.append(panel(tint(source, union, "#a855f7"), title + " · поздний снимок / кандидаты"))
-                captions.append(title + ": " + ("; ".join(f"{name} ({count} окон)" for name, count in sorted(event_counts.items()))
-                                                 or "кандидатов нет — отсутствие изменений не подтверждено"))
-                exported.append({k: v for k, v in pair.items() if k != "hashes"})
-            title = f"РЕАЛЬНЫЕ | {key[0].upper()} | {key[1]} | {key[2]} | опора ID {key[3]}"
-            sections.append({"title": title, "caption": "Хронология исходных полных фотографий всех подготовленных пар; без геометрического преобразования. " + " | ".join(captions), "panels": timeline})
-            if checks:
-                sections.append({"title": title + " · проверка совмещения и кандидатов",
-                                 "caption": "Каждые два соседних изображения используют один холст пары. Фиолетовые маски объединены только для просмотра; пересекающиеся окна не являются отдельными событиями.",
-                                 "panels": checks})
+                    groups[tuple(box)].append(candidate)
+                captions.append(dates + (f": {len(groups)} кропов" if groups else ": кандидатов нет — отсутствие изменений не подтверждено"))
+                for box, local in sorted(groups.items()):
+                    size = (box[2]-box[0], box[3]-box[1])
+                    union, labels = Image.new("L", size), set()
+                    for candidate in local:
+                        path = checked(Path(pair["candidate_run"]), Path(candidate["path"]) / "candidate_mask.png", pair["hashes"])
+                        with Image.open(path) as mask:
+                            if mask.size != size:
+                                raise ValueError("Candidate mask dimensions differ from bounding box")
+                            union = ImageChops.lighter(union, mask.convert("L"))
+                        labels.add(f"{candidate['event_type']}: {candidate.get('from_class') or '∅'} → {candidate.get('to_class') or '∅'}")
+                    crop_panels, crop_images = [], []
+                    for role, path in (("reference", reference_path), ("source", source_path)):
+                        with Image.open(path) as native:
+                            image = native.convert("RGB").crop(box)
+                        if preview_max_side:
+                            image.thumbnail((preview_max_side, preview_max_side), Image.Resampling.LANCZOS)
+                        crop_images.append(image)
+                        crop_panels.append(panel(image, f"{pair[role + '_year']} · RGB · совмещённый кроп"))
+                    for role in ("reference", "source"):
+                        relative = Path(local[0]["path"]) / f"{role}_semantic.png"
+                        if pair["candidate_version"] == 3 or relative.as_posix() in pair["hashes"]:
+                            path = checked(Path(pair["candidate_run"]), relative, pair["hashes"])
+                            with Image.open(path) as native:
+                                if native.size != size:
+                                    raise ValueError("Semantic crop overlay has inconsistent dimensions")
+                            crop_panels.append(panel(rgb(path), f"{pair[role + '_year']} · GT классов COCO"))
+                    for role, image in zip(("reference", "source"), crop_images):
+                        crop_panels.append(panel(tint(image, union, "#a855f7"), f"{pair[role + '_year']} · кандидат изменения"))
+                    crop_id = f"real-crop-{len(crop_exports):05d}"
+                    crop_record = {"crop_id": crop_id, "candidate_run": pair["candidate_run"],
+                                   "candidate_ids": [row["candidate_id"] for row in local],
+                                   "pair_id": pair["pair_id"], "split": pair["split"],
+                                   "building_id": pair["building_id"], "view_id": pair["view_id"],
+                                   "bbox_canvas_xyxy": list(box), "native_size": list(size),
+                                   "selection_uses_annotations": True, "panels": crop_panels}
+                    crop_exports.append(crop_record)
+                    padding = local[0].get("context_padding", 0)
+                    chain_sections.append({"title": title + f" | {dates} | {crop_id}",
+                                           "caption": f"{size[0]} × {size[1]} px; контекст до {padding} px с каждой стороны. " +
+                                                      "; ".join(sorted(labels)) + ". Совпадающие прямоугольники показаны один раз; это кандидаты из разметки.",
+                                           "panels": crop_panels})
+                    if shift is not None:
+                        anchor_box = tuple(int(v-shift[i % 2]) for i, v in enumerate(box))
+                        if any(row.get("bbox_reference_xyxy") != list(anchor_box) for row in local):
+                            raise ValueError("Candidate reference crop box differs from alignment coordinates")
+                        history_seeds.setdefault(anchor_box, {"crop_id": crop_id, "reference_panel": crop_panels[0],
+                                                             "reference_year": pair["reference_year"]})
+            sections.append({"title": title, "caption": " | ".join(captions), "panels": []})
+            sections.extend(chain_sections)
+            for anchor_box, seed in history_seeds.items():
+                timeline = [{**seed["reference_panel"], "label": f"{seed['reference_year']} · ранняя опора · тот же участок"}]
+                frames, gaps = [], []
+                for entry in aligned:
+                    pair, shift = entry["pair"], entry["shift"]
+                    box = tuple(int(v+shift[i % 2]) for i, v in enumerate(anchor_box))
+                    with Image.open(entry["overlap"]) as overlap:
+                        support = np.asarray(overlap.convert("L").crop(box)) > 0
+                    fraction = float(support.mean())
+                    frame = {"pair_id": pair["pair_id"], "year": pair["source_year"],
+                             "bbox_canvas_xyxy": list(box), "geometric_support_fraction": fraction,
+                             "alignment_run": pair["alignment_run"]}
+                    if fraction < config["timeline_min_geometric_support_fraction"]:
+                        frame["status"] = "insufficient_geometric_support"
+                        gaps.append(f"{pair['source_year']}: участок виден геометрически менее чем на 50%")
+                    else:
+                        with Image.open(entry["source"]) as native:
+                            image = np.array(native.convert("RGB").crop(box))
+                        image[~support] = 70
+                        preview = Image.fromarray(image)
+                        if preview_max_side:
+                            preview.thumbnail((preview_max_side, preview_max_side), Image.Resampling.LANCZOS)
+                        frame["status"] = "aligned_crop_preview"
+                        frame["panel"] = panel(preview, f"{pair['source_year']} · тот же участок · поддержка {fraction:.0%}")
+                        timeline.append(frame["panel"])
+                    frames.append(frame)
+                crop_histories.append({"crop_id": seed["crop_id"], "split": key[0], "building_id": key[1],
+                                       "view_id": key[2], "reference_id": key[3],
+                                       "bbox_reference_xyxy": list(anchor_box), "frames": frames,
+                                       "selection_uses_annotations": True, "preview_only": True})
+                sections.append({"title": title + f" | {seed['crop_id']} | история одного участка",
+                                 "caption": "Одинаковый прямоугольник ранней опоры во всех пригодных датах. Серый — нет общей геометрической поддержки; это не проверка окклюзий. " + " | ".join(gaps),
+                                 "panels": timeline})
         legend = [{"name": "Текущее процедурное повреждение", "color": "#e53935"},
                   {"name": "Новое процедурное изменение", "color": "#ffb300"},
                   {"name": "Процедурное восстановление", "color": "#00a878"},
-                  {"name": "Реальный кандидат из аннотаций — не GT", "color": "#a855f7"}]
+                  {"name": "Реальный кандидат из аннотаций — не GT", "color": "#a855f7"}] + semantic_legend(categories)
         write_static_gallery(out, "Истории фасадов: синтетика и реальные наблюдения", sections, legend=legend, notes=notes)
         write_json(out / "histories.json", {"sources": provenance, "real_pairs": exported, "real_images": list(required_images.values()),
                                              "synthetic_run": str(synthetic_run) if synthetic_run else None,
-                                             "categories": categories})
+                                             "categories": categories, "real_crops": crop_exports,
+                                             "real_crop_histories": crop_histories})
         for path, expected in snapshots.items():
             if sha256(path) != expected:
                 raise ValueError("Source provenance changed during gallery preparation")
@@ -983,6 +1117,8 @@ def prepare_transition_review(candidate_runs, out, synthetic_run=None, preview_m
                    "real_histories": len(histories), "real_pairs": len(pairs), "real_original_frames": len(required_images),
                    "pair_status_counts": dict(Counter(pair["status"] for pair in pairs)),
                    "input_candidates": len(all_candidates), "rendered_images": image_number,
+                   "real_crops": len(crop_exports), "real_crop_histories": len(crop_histories),
+                   "real_display": "aligned_crops", "selection_uses_annotations": True,
                    "quantitative_temporal_evaluation_allowed": False, "test_rgb_loaded": False,
                    "annotation_files_opened": False, "preview_max_side": preview_max_side}
         write_json(out / "summary.json", summary)

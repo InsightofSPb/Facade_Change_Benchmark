@@ -144,14 +144,21 @@ class RealTransitionCandidateTests(unittest.TestCase):
         # Native source -> reference translates right; canvas retains ref scale.
         canvas = expanded_canvas((24, 24), (24, 24), [[1, 0, 2], [0, 1, 0], [0, 0, 1]])
         write_json(self.alignment / "geometry.json", canvas.as_dict())
-        self.pair_record = {"kind": "pair_alignment", "config": {"method": "sift"},
-                            "quality_gate": {"passed": True, "reasons": []},
-                            "observations": {"reference": images[0], "source": images[1]}}
+        from facade_change.geometry import warp_pair
+        arrays = [np.array(Image.open(self.dataset / f"{i}.png")) for i in (1, 2)]
+        warped = warp_pair(arrays[0][..., :3], arrays[0][..., 3] == 255,
+                           arrays[1][..., :3], arrays[1][..., 3] == 255, canvas)
+        for role in ("reference", "source"):
+            Image.fromarray(warped[role]).save(self.alignment / f"{role}_rgb.png")
+        Image.fromarray(warped["overlap"].astype(np.uint8)*255).save(self.alignment / "overlap.png")
+        self.pair_record = run_record("pair_alignment", {"method": "sift"})
+        self.pair_record.update(quality_gate={"passed": True, "reasons": []},
+                                observations={"reference": images[0], "source": images[1]})
         finish_record(self.alignment, self.pair_record, "completed_needs_review")
 
     def run_mining(self, **kwargs):
         options = {"window_sizes": (8, 12), "min_component_pixels": 2, "all_class_pairs": False,
-                   "event_types": ("replacement",), "boundary_tolerance_pixels": 0}
+                   "event_types": ("replacement",), "boundary_tolerance_pixels": 0, "crop_mode": "windows"}
         options.update(kwargs)
         return mine_transition_candidates(self.dataset, self.alignment, self.root / "result",
                                            **options)
@@ -295,9 +302,39 @@ class RealTransitionCandidateTests(unittest.TestCase):
                 self.assertIsNone(row["to_class"])
 
     def test_boolean_pixel_parameters_are_invalid(self):
-        for name in ("boundary_tolerance_pixels", "min_component_pixels", "max_windows_per_pair"):
+        for name in ("boundary_tolerance_pixels", "min_component_pixels", "max_windows_per_pair", "context_padding"):
             with self.assertRaises(ValueError):
                 self.run_mining(**{name: True})
+
+    def test_component_export_and_review_preserve_native_rgb_geometry_and_separate_support(self):
+        from facade_change.semantic_training import prepare_transition_review
+        result = self.run_mining(crop_mode="component", context_padding=3)
+        self.assertEqual(result["candidate_version"], 3)
+        rows = read_json(self.root / "result/candidates.json")["candidates"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["selection_bbox_canvas_xyxy"], [6, 4, 18, 16])
+        self.assertEqual(row["bbox_canvas_xyxy"], [3, 1, 21, 19])
+        self.assertEqual(row["candidate_pixels"], row["component_pixels"])
+        directory = self.root / "result" / row["path"]
+        for role in ("reference", "source"):
+            with Image.open(self.alignment / f"{role}_rgb.png") as native:
+                expected = np.array(native.crop(row["bbox_canvas_xyxy"]))
+            np.testing.assert_array_equal(np.array(Image.open(directory / f"{role}.png")), expected)
+            with Image.open(directory / f"{role}_semantic.png") as overlay:
+                self.assertEqual(overlay.size, (18, 18))
+        geometric = np.array(Image.open(directory / "geometric_support.png")) > 0
+        event = np.array(Image.open(directory / "candidate_mask.png")) > 0
+        self.assertTrue(np.all(geometric[event]))
+        self.assertGreater(geometric.sum(), event.sum())  # Context is not marked as changed.
+        self.assertFalse(geometric[7:9, 7:9].any())  # Transparent source hole remains unsupported.
+        review = prepare_transition_review([self.root / "result"], self.root / "review")
+        self.assertEqual((review["real_crops"], review["real_crop_histories"]), (1, 1))
+        self.assertFalse(review["annotation_files_opened"])
+        page = (self.root / "review/gallery.html").read_text()
+        self.assertIn("GT классов COCO", page)
+        self.assertIn("история одного участка", page)
+        self.assertTrue(all(category["name"] in page for category in self.categories))
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "alignment extra required")
@@ -372,6 +409,29 @@ class RobustTransitionWindowTests(unittest.TestCase):
             self.assertEqual(row["ignored_boundary_pixels"], 0)
             self.assertEqual(int(row["candidate_mask"].any(axis=0).sum()), 1)
 
+    def test_component_crops_keep_whole_region_and_padding_does_not_change_selection(self):
+        earlier = np.ones((500, 600), np.uint16)
+        later = earlier.copy()
+        later[140:300, 180:440] |= 2  # Larger than either legacy window.
+        for padding, box in ((0, [180, 140, 440, 300]), (100, [80, 40, 540, 400])):
+            rows = self.windows(earlier, later, crop_mode="component", context_padding=padding)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["bbox_canvas_xyxy"], box)
+            self.assertEqual(row["candidate_pixels"], 160*260)
+            self.assertEqual(row["component_pixels"], row["candidate_pixels"])
+            self.assertEqual(row["selection_transition_fraction"], 1.)
+            self.assertIsNone(row["window_size"])
+        later = earlier.copy()
+        later[5:85, 2] |= 4  # Thin crack near the image edge; context must not dilute its gate.
+        rows = self.windows(earlier, later, crop_mode="component", context_padding=100)
+        self.assertEqual(rows[0]["bbox_canvas_xyxy"], [0, 0, 103, 185])
+        self.assertEqual(rows[0]["candidate_pixels"], 80)
+        self.assertLess(rows[0]["transition_fraction"], .02)
+        later[5:85, 2] = 1
+        later[5:15, 2] |= 4
+        self.assertFalse(self.windows(earlier, later, crop_mode="component"))
+
     def test_strong_patch_preserves_raw_boundary_exclusion_and_full_window_fraction(self):
         earlier = np.ones((100, 100), np.uint16)
         later = earlier.copy()
@@ -414,9 +474,12 @@ class RobustTransitionWindowTests(unittest.TestCase):
         self.assertTrue(default.all_class_pairs)
         self.assertEqual(default.event_types, ["replacement", "appearance", "disappearance"])
         self.assertEqual((default.boundary_tolerance_pixels, default.min_component_pixels), (2, 25))
+        self.assertEqual((default.crop_mode, default.context_padding), ("component", 100))
         legacy = parser().parse_args(base + ["--no-all-class-pairs", "--event-types", "replacement",
-                                             "--boundary-tolerance-pixels", "0", "--min-component-pixels", "16"])
+                                             "--boundary-tolerance-pixels", "0", "--min-component-pixels", "16",
+                                             "--crop-mode", "windows"])
         self.assertFalse(legacy.all_class_pairs)
+        self.assertEqual(legacy.crop_mode, "windows")
         self.assertEqual(legacy.event_types, ["replacement"])
         self.assertEqual((legacy.boundary_tolerance_pixels, legacy.min_component_pixels), (0, 16))
 
@@ -444,7 +507,7 @@ class StaticHistoryReviewTests(unittest.TestCase):
         self.identity = {"paths": {"dataset": "/unopened/dataset.json", "manifest": str(manifest)},
                          "sha256": {"dataset": "a"*64, "manifest": sha256(manifest)}}
 
-    def source(self, name="source", split="val", building=None):
+    def source(self, name="source", split="val", building=None, version=2):
         root = self.root / name
         root.mkdir()
         building = building or split + "-B"
@@ -467,6 +530,21 @@ class StaticHistoryReviewTests(unittest.TestCase):
                 record["quality_gate"] = {"passed": True}
                 for role in ("reference", "source"):
                     Image.fromarray(np.full((20, 24, 3), 90+index, np.uint8)).save(child / f"{role}_rgb.png")
+                if version == 3:
+                    from facade_change.geometry import expanded_canvas
+                    canvas = expanded_canvas((18, 30), (18, 30),
+                                             [[1, 0, -4*index], [0, 1, -2*index], [0, 0, 1]])
+                    write_json(child / "geometry.json", canvas.as_dict())
+                    shift_x, shift_y = canvas.reference_to_canvas[:2, 2].astype(int)
+                    yy, xx = np.indices((canvas.height, canvas.width))
+                    pixels = np.zeros((canvas.height, canvas.width, 3), np.uint8)
+                    pixels[..., 0] = np.clip((xx-shift_x)*7, 0, 255)
+                    pixels[..., 1] = np.clip((yy-shift_y)*11, 0, 255)
+                    for role in ("reference", "source"):
+                        Image.fromarray(pixels).save(child / f"{role}_rgb.png")
+                    Image.new("L", (canvas.width, canvas.height), 255).save(child / "overlap.png")
+                    pair.update(reference_to_canvas=canvas.reference_to_canvas.tolist(),
+                                geometry_sha256=sha256(child / "geometry.json"))
                 finish_record(child, record, "completed_needs_review")
                 pair.update(alignment_run=str(child), alignment_run_sha256=sha256(child / "run.json"))
                 if index == 0:
@@ -477,10 +555,14 @@ class StaticHistoryReviewTests(unittest.TestCase):
                     rows.append(row)
                     (root / row["path"]).mkdir()
                     Image.fromarray(np.ones((6, 6), np.uint8)*255).save(root / row["path"] / "candidate_mask.png")
+                    if version == 3:
+                        row.update(bbox_reference_xyxy=[2, 3, 8, 9], context_padding=100)
+                        for role in ("reference", "source"):
+                            Image.new("RGB", (6, 6), "purple").save(root / row["path"] / f"{role}_semantic.png")
             pairs.append(pair)
-        config = {"candidate_version": 2, "splits": [split], "dataset": self.identity}
+        config = {"candidate_version": version, "splits": [split], "dataset": self.identity}
         write_json(root / "pairs.json", pairs)
-        write_json(root / "candidates.json", {"candidate_version": 2, "categories": [{"id": 1, "name": "DELAMINATION"}], "candidates": rows})
+        write_json(root / "candidates.json", {"candidate_version": version, "categories": [{"id": 1, "name": "DELAMINATION"}], "candidates": rows})
         finish_record(root, run_record("real_semantic_transition_candidates", config), "completed_needs_review")
         return root
 
@@ -526,7 +608,14 @@ class StaticHistoryReviewTests(unittest.TestCase):
         self.assertIn("H1", page)
         self.assertIn("ПРОБЕЛ", page)
         self.assertEqual(result["real_original_frames"], 8)
-        self.assertIn("2025 · исходное фото · rejected_alignment", page)
+        self.assertIn("2025: ПРОБЕЛ — rejected_alignment", page)
+        self.assertNotIn("исходное фото · rejected_alignment", page)
+        self.assertEqual((result["real_crops"], result["real_crop_histories"]), (2, 0))
+        crops = read_json(self.root / "review/histories.json")["real_crops"]
+        for crop in crops:
+            for panel in crop["panels"]:
+                with Image.open(self.root / "review" / panel["src"]) as image:
+                    self.assertEqual(image.size, (6, 6))
         exported_images = read_json(self.root / "review/histories.json")["real_images"]
         self.assertEqual({row["year"] for row in exported_images}, {2010, 2015, 2020, 2025})
         self.assertTrue(all(row["split"] in {"train", "val"} for row in exported_images))
@@ -556,6 +645,50 @@ class StaticHistoryReviewTests(unittest.TestCase):
         self.assertEqual(options.preview_max_side, 0)
         self.assertFalse(hasattr(options, "limit"))
         self.assertFalse(hasattr(options, "seed"))
+
+    def test_same_region_timeline_translates_different_canvases_and_deduplicates_boxes(self):
+        source = self.source(version=3)
+        document = read_json(source / "candidates.json")
+        duplicate = {**document["candidates"][0], "candidate_id": "candidate-duplicate",
+                     "event_type": "appearance", "from_class": None}
+        document["candidates"].append(duplicate)
+        pairs = read_json(source / "pairs.json")
+        pairs[0]["candidate_count"] = 2
+        write_json(source / "candidates.json", document)
+        write_json(source / "pairs.json", pairs)
+        finish_record(source, read_json(source / "run.json"), "completed_needs_review")
+        result = self.review([source])
+        self.assertEqual((result["input_candidates"], result["real_crops"], result["real_crop_histories"]), (2, 1, 1))
+        history = read_json(self.root / "review/histories.json")["real_crop_histories"][0]
+        self.assertEqual(history["bbox_reference_xyxy"], [2, 3, 8, 9])
+        frames = history["frames"]
+        self.assertEqual([frame["year"] for frame in frames], [2015, 2020])
+        self.assertEqual([frame["bbox_canvas_xyxy"] for frame in frames], [[6, 5, 12, 11], [2, 3, 8, 9]])
+        arrays = [np.array(Image.open(self.root / "review" / frame["panel"]["src"])) for frame in frames]
+        np.testing.assert_array_equal(*arrays)  # Same anchor coordinates, not same canvas coordinates.
+
+    def test_component_review_rejects_wrong_reference_box_and_marks_missing_coverage(self):
+        source = self.source(version=3)
+        document = read_json(source / "candidates.json")
+        document["candidates"][0]["bbox_reference_xyxy"][0] += 1
+        write_json(source / "candidates.json", document)
+        finish_record(source, read_json(source / "run.json"), "completed_needs_review")
+        with self.assertRaisesRegex(ValueError, "reference crop box"):
+            self.review([source], "wrong-offset")
+        source = self.source("no-coverage", version=3)
+        child = self.root / "no-coverage-alignment-1"
+        with Image.open(child / "overlap.png") as image:
+            Image.new("L", image.size, 0).save(child / "overlap.png")
+        finish_record(child, read_json(child / "run.json"), "completed_needs_review")
+        pairs = read_json(source / "pairs.json")
+        pairs[1]["alignment_run_sha256"] = sha256(child / "run.json")
+        write_json(source / "pairs.json", pairs)
+        finish_record(source, read_json(source / "run.json"), "completed_needs_review")
+        self.review([source], "no-coverage-gallery")
+        frames = read_json(self.root / "no-coverage-gallery/histories.json")["real_crop_histories"][0]["frames"]
+        self.assertEqual(frames[0]["status"], "insufficient_geometric_support")
+        self.assertNotIn("panel", frames[0])
+        self.assertEqual(frames[1]["status"], "aligned_crop_preview")
 
     def test_reject_test_crosssplit_and_mismatched_dataset(self):
         with self.assertRaisesRegex(ValueError, "TRAIN/VAL"):

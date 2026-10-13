@@ -107,7 +107,12 @@ def parser():
     transitions.add_argument("--dataset", required=True)
     transitions.add_argument("--alignment-run", required=True)
     transitions.add_argument("--out", required=True)
-    transitions.add_argument("--window-sizes", nargs="+", type=int, default=[50, 100])
+    transitions.add_argument("--crop-mode", choices=["component", "windows"], default="component",
+                             help="Full connected transition region plus context; windows restores legacy fixed-size selection")
+    transitions.add_argument("--context-padding", type=int, default=100,
+                             help="Context on each side of the transition bounding box, in native reference pixels")
+    transitions.add_argument("--window-sizes", nargs="+", type=int, default=[50, 100],
+                             help="Used only with --crop-mode windows")
     transitions.add_argument("--splits", nargs="+", choices=["train", "val"], default=["train", "val"])
     transitions.add_argument("--min-support-fraction", type=float, default=.5)
     transitions.add_argument("--min-transition-fraction", type=float, default=.02)
