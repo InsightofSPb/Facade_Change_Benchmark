@@ -66,6 +66,10 @@ def serve(requests, responses):
                             if value.shape != support.shape or value.dtype != dtype:
                                 raise ValueError(f"Scorer {name} must use the native grid and {dtype}")
                             arrays[name] = value
+                    from .methods.remote import validate_auxiliary_arrays
+                    auxiliary = getattr(scorer, "auxiliary_arrays", {})
+                    validate_auxiliary_arrays(auxiliary, support, scorer.metadata)
+                    arrays.update(auxiliary)
                     np.savez(request["output_path"], **arrays)
                     payload = {"metadata": {**scorer.metadata, "worker_environment": worker_environment}}
                 elif operation == "close":

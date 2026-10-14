@@ -16,6 +16,36 @@ import numpy as np
 from .base import validate_rgb_inputs
 
 
+AUXILIARY_ARRAY_NAMES = frozenset({
+    "semantic_delta", "uncertainty_reference", "uncertainty_source",
+    "probabilities_reference", "probabilities_source",
+})
+
+
+def validate_auxiliary_arrays(arrays, support, metadata):
+    """Explicit numeric protocol; no pickle, arbitrary names, or ambiguous grids."""
+    if not isinstance(arrays, dict) or set(arrays) - AUXILIARY_ARRAY_NAMES:
+        raise ValueError("Unexpected auxiliary output arrays")
+    if not arrays:
+        return
+    mapping = metadata.get("category_to_channel")
+    if (not isinstance(mapping, list) or not mapping
+            or any(not isinstance(row, dict) or type(row.get("category_id")) is not int or row.get("channel") != i
+                   for i, row in enumerate(mapping))
+            or len({row["category_id"] for row in mapping}) != len(mapping)):
+        raise ValueError("Auxiliary semantic arrays require explicit category/channel mapping")
+    for name, value in arrays.items():
+        expected = support.shape if name.startswith("uncertainty_") else (len(mapping), *support.shape)
+        if not isinstance(value, np.ndarray) or value.shape != expected or value.dtype != np.float32:
+            raise ValueError(f"Invalid auxiliary {name}: expected native-grid float32 {expected}")
+        valid = value[..., support]
+        lower = -1.0 if name == "semantic_delta" else 0.0
+        if not np.isfinite(valid).all() or np.any(valid < lower) or np.any(valid > 1):
+            raise ValueError(f"Invalid supported auxiliary {name} values")
+        if not np.isnan(value[..., ~support]).all():
+            raise ValueError(f"Auxiliary {name} must be NaN outside geometric support")
+
+
 def _json_value(value):
     if isinstance(value, Path):
         return str(value)
@@ -161,8 +191,14 @@ class RemotePool:
                 raise self._error("did not save the requested inference output")
             with np.load(response_path, allow_pickle=False) as archive:
                 arrays = {name: archive[name].copy() for name in archive.files}
-        if "scores" not in arrays or set(arrays) - {"scores", "raw_scores", "native_prediction"}:
+        if "scores" not in arrays or set(arrays) - {"scores", "raw_scores", "native_prediction"} - AUXILIARY_ARRAY_NAMES:
             raise self._error("returned unexpected output arrays")
+        auxiliary = {name: arrays.pop(name) for name in list(arrays) if name in AUXILIARY_ARRAY_NAMES}
+        metadata = response.get("metadata", self.metadata)
+        try:
+            validate_auxiliary_arrays(auxiliary, support, metadata)
+        except ValueError as error:
+            raise self._error(str(error)) from error
         for name, array in arrays.items():
             if array.shape != support.shape:
                 raise self._error(f"returned {name} with a different native grid")
@@ -173,8 +209,8 @@ class RemotePool:
             raise self._error("returned nonfinite scores inside the base support")
         if not np.isnan(arrays["scores"][~support]).all():
             raise self._error("returned scores outside the base support")
-        self.metadata = response.get("metadata", self.metadata)
-        return {**arrays, "metadata": self.metadata}
+        self.metadata = metadata
+        return {**arrays, "auxiliary_arrays": auxiliary, "metadata": self.metadata}
 
     def release(self):
         if self.process is not None:
@@ -207,6 +243,7 @@ class RemoteScorer:
         self.pool = pool if pool is not None else RemotePool()
         self.raw_scores = None
         self.native_prediction = None
+        self.auxiliary_arrays = {}
         kind = "native_mask" if method in {"anychange", "geoscd"} else "score"
         self.metadata = {
             "method": method, "output_kind": kind, "initialization": "pending in selected worker",
@@ -225,6 +262,7 @@ class RemoteScorer:
         result = self.pool.score(self.method, self.options, reference, source, support)
         self.raw_scores = result.get("raw_scores")
         self.native_prediction = result.get("native_prediction")
+        self.auxiliary_arrays = result.get("auxiliary_arrays", {})
         self.metadata = {**result["metadata"],
                          "worker_python": str(self.options.get("worker_python", sys.executable)),
                          "worker_stderr_log": str(self.pool.stderr_path)}

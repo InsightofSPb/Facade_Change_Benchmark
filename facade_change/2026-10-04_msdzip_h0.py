@@ -9,6 +9,8 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
+import random
 import shutil
 import time
 from collections import defaultdict
@@ -19,7 +21,7 @@ import numpy as np
 from PIL import Image
 
 from .hypothesis_benchmark import _checked, _inside, _mask, _select
-from .io import finish_record, load_rgb, new_directory, read_json, run_record, sha256, write_json
+from .io import finish_record, load_rgb, new_directory, read_json, run_record, sha256, sync_directory, write_json
 
 
 SOURCE_SHA256 = "159a46f2d0736b784c0b078b88039f2e1477c09817c5889b7cf48788d3b32f72"
@@ -203,6 +205,8 @@ def _predict_groups(model, contexts):
 def _parent(dataset_run):
     root = Path(dataset_run).expanduser().resolve()
     record = read_json(root / "run.json")
+    if record.get("kind") == "history_dataset":
+        return _history_parent(root, record)
     if record.get("kind") != "hypothesis_dataset" or record.get("status") != "completed_needs_review":
         raise ValueError("MSDZip H0 training requires a completed procedural hypothesis dataset")
     summary_path, summary_hash = _checked(root, record, "summary.json")
@@ -220,8 +224,91 @@ def _parent(dataset_run):
     return root, record, index, split, fingerprints
 
 
+def _history_parent(root, record):
+    """Read/audit history metadata without opening event or TEST artifacts."""
+    if record.get("status") != "completed_exploratory":
+        raise ValueError("MSDZip history training requires a completed history dataset")
+    summary_path, summary_hash = _checked(root, record, "summary.json")
+    index_path, index_hash = _checked(root, record, "manifest.json")
+    split_path, split_hash = _checked(root, record, "split.json")
+    config_path, config_hash = _checked(root, record, "config.json")
+    index, split, config = read_json(index_path), read_json(split_path), read_json(config_path)
+    if (index.get("kind") != "persistent_procedural_histories" or index.get("config") != config
+            or record.get("config") != config or split.get("development_only", False)
+            or split.get("mode", "reviewed") != "reviewed"):
+        raise ValueError("MSDZip history metadata/config/reviewed split disagrees")
+    bases, owners = {}, {key: {} for key in ("building_id", "view_id", "image_sha256")}
+    for base in index["bases"]:
+        identifier, building, part = base["base_id"], base["building_id"], base["split"]
+        if (identifier in bases or not building or part not in {"train", "val", "test"}
+                or split["building_assignments"].get(building) != part
+                or base.get("source_to_reference") != np.eye(3).tolist()):
+            raise ValueError("History base identity/geometry disagrees with reviewed split")
+        for key, seen in owners.items():
+            value = base.get(key)
+            if value is not None and value in seen and seen[value] != part:
+                raise ValueError(f"History {key} leakage across partitions")
+            if value is not None:
+                seen[value] = part
+        bases[identifier] = base
+    cases, sequence_ids, clean_bases = [], set(), set()
+    for sequence in index["sequences"]:
+        base = bases.get(sequence["base_id"])
+        if (not base or sequence["sequence_id"] in sequence_ids
+                or any(sequence.get(key) != base.get(key) for key in ("building_id", "split"))
+                or sequence.get("arm") not in {"clean", "event"}):
+            raise ValueError("History sequence identity disagrees with its base")
+        sequence_ids.add(sequence["sequence_id"])
+        if sequence["arm"] != "clean" or sequence["split"] == "test":
+            continue
+        if base["base_id"] in clean_bases:
+            raise ValueError("History has duplicate clean arms")
+        clean_bases.add(base["base_id"])
+        frames = sequence["frames"]
+        if len(frames) != 5 or [frame["frame"] for frame in frames] != list(range(1, 6)):
+            raise ValueError("History H0 requires five chronological clean frames")
+        for previous, current in zip(frames, frames[1:]):
+            if current.get("event") != "none" or current.get("event_pixels") != 0:
+                raise ValueError("Clean history contains a procedural event")
+            # Per-frame support also excludes known procedural occlusion. It is
+            # evaluation information, not geometry available to the byte model.
+            support_path = base["support"]
+            support_hash = record["artifact_sha256"][support_path]
+            paths = {"reference_rgb": previous["paths"]["rgb"], "source_rgb": current["paths"]["rgb"],
+                     "reference_support": support_path, "source_support": support_path}
+            hashes = {"reference_rgb": previous["artifact_sha256"]["rgb"], "source_rgb": current["artifact_sha256"]["rgb"],
+                      "reference_support": support_hash, "source_support": support_hash}
+            cases.append({"case_id": f"{sequence['sequence_id']}-{previous['frame']}-{current['frame']}",
+                          "base_id": base["base_id"], "building_id": base["building_id"], "split": base["split"],
+                          "scenario_id": f"{previous['nuisance']['kind']}-{current['nuisance']['kind']}",
+                          "state": "unchanged", "hypothesis": "H0", "sham_self_paste": False,
+                          "history_clean_pair": True, "artifact_sha256": hashes, **paths})
+    summary = read_json(summary_path)
+    if summary.get("sequences") != len(index["sequences"]) or summary.get("selected_crops") != len(bases):
+        raise ValueError("History summary counts disagree with manifest")
+    # Histories are generated exclusively from metadata-reviewed buildings. Older
+    # prepared split files contain assignments without these legacy H0 flags.
+    split = {**split, "mode": "reviewed", "development_only": False}
+    fingerprints = {"parent_run": sha256(root / "run.json"), "parent_summary": summary_hash,
+                    "parent_index": index_hash, "split": split_hash, "config": config_hash}
+    return root, record, {**index, "cases": cases}, split, fingerprints
+
+
 def _rgb_inputs(root, parent, base, case, selected_hashes):
     paths = {}
+    if case.get("history_clean_pair"):
+        for key in ("reference_rgb", "source_rgb", "reference_support", "source_support"):
+            paths[key], digest = _checked(root, parent, case[key], case["artifact_sha256"][key])
+            selected_hashes[case[key]] = digest
+        reference, opaque = load_rgb(paths["reference_rgb"])
+        source, source_opaque = load_rgb(paths["source_rgb"])
+        if reference.shape != source.shape:
+            raise ValueError("History H0 RGB grids differ")
+        support = _mask(paths["reference_support"], reference.shape[:2])
+        source_support = _mask(paths["source_support"], reference.shape[:2])
+        if not np.array_equal(support, source_support) or np.any(support & (~opaque | ~source_opaque)):
+            raise ValueError("History H0 geometric support differs or includes nonopaque RGB")
+        return reference, source, support
     for key in ("reference_rgb", "source_rgb", "reference_support", "geometry"):
         paths[key], digest = _checked(root, parent, case[key], case["artifact_sha256"][key])
         selected_hashes[case[key]] = digest
@@ -319,9 +406,12 @@ def _samples(root, parent, bases, cases, manifest, representation, timesteps, ch
     return np.concatenate(windows), np.concatenate(labels), np.concatenate(indices)
 
 
-def _epoch(model, samples, device, window_groups, optimizer=None, rng=None, progress_description=None):
+def _epoch(model, samples, device, window_groups, optimizer=None, rng=None, progress_description=None,
+           progress_state=None, step_callback=None):
     torch = _torch()
-    total, count = 0., 0
+    progress_state = progress_state if progress_state is not None else {}
+    total, count = progress_state.get("total_bits", 0.), progress_state.get("count", 0)
+    start_step = progress_state.get("step", 0)
     model.train(optimizer is not None)
     contexts, labels, positions = samples
     started = time.perf_counter()
@@ -335,7 +425,11 @@ def _epoch(model, samples, device, window_groups, optimizer=None, rng=None, prog
         progress = tqdm(total=len(labels), desc=progress_description or phase,
                         unit="B", unit_scale=True, dynamic_ncols=True, mininterval=1)
     with progress as bar:
+        if bar is not None:
+            bar.update(count)
         for step, (batch, targets, indices) in enumerate(_batch_groups(contexts, labels, positions, model.batchsize, window_groups, rng), 1):
+            if step <= start_step:
+                continue
             active = torch.as_tensor(indices >= 0, device=device)
             x = torch.as_tensor(batch, device=device)
             y = torch.as_tensor(targets, device=device)
@@ -350,6 +444,9 @@ def _epoch(model, samples, device, window_groups, optimizer=None, rng=None, prog
             total += float(losses.detach().sum().cpu()) / math.log(2)
             processed = int(active.sum())
             count += processed
+            progress_state.update(step=step, total_bits=total, count=count)
+            if step_callback is not None:
+                step_callback()
             if bar is not None:
                 bar.set_postfix(bpb=f"{total / count:.5f}", refresh=False)
                 bar.update(processed)
@@ -359,58 +456,235 @@ def _epoch(model, samples, device, window_groups, optimizer=None, rng=None, prog
     return total / count
 
 
+def _atomic_torch_save(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        _torch().save(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    sync_directory(path.parent)
+
+
+def _load_checkpoint(path, trust_checkpoint):
+    try:
+        return _torch().load(path, map_location="cpu", weights_only=True)
+    except TypeError as exc:
+        if not trust_checkpoint:
+            raise RuntimeError("This PyTorch lacks weights_only loading; explicitly trust a known checkpoint") from exc
+        return _torch().load(path, map_location="cpu")
+
+
+def _rng_state(device):
+    numpy_state = np.random.get_state()
+    return {"torch": _torch().get_rng_state(), "python": random.getstate(),
+            "numpy": [numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:]],
+            "cuda": _torch().cuda.get_rng_state_all() if device.type == "cuda" else []}
+
+
+def _restore_rng(state, device):
+    _torch().set_rng_state(state["torch"])
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state((numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32), *numpy_state[2:]))
+    if device.type == "cuda":
+        _torch().cuda.set_rng_state_all(state["cuda"])
+
+
+def _training_events(out, config_sha256):
+    """Recover only an incomplete final append, preserving its original bytes."""
+    path = out / "events.jsonl"
+    if not path.exists():
+        return [], None
+    data = path.read_bytes()
+    lines, events, offset = data.splitlines(keepends=True), [], 0
+    recovery = None
+    for number, line in enumerate(lines):
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeDecodeError) as exc:
+            if number != len(lines) - 1 or line.endswith(b"\n"):
+                raise ValueError("MSDZip event log corruption before an incomplete final append") from exc
+            digest = hashlib.sha256(line).hexdigest()
+            orphan = out / f"2026-10-14_msdzip_event_tail_{digest[:16]}.bin"
+            if orphan.exists():
+                if orphan.read_bytes() != line:
+                    raise ValueError("MSDZip event recovery artifact hash collision")
+            else:
+                with orphan.open("xb") as stream:
+                    stream.write(line)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            with path.open("r+b") as stream:
+                stream.truncate(offset)
+                stream.flush()
+                os.fsync(stream.fileno())
+            recovery = {"orphan_path": orphan.name, "orphan_sha256": digest, "bytes": len(line)}
+            break
+        if (not isinstance(event, dict) or event.get("sequence") != len(events) + 1
+                or event.get("run_id") != out.name or event.get("config_sha256") != config_sha256):
+            raise ValueError("MSDZip event sequence/run/config identity is corrupt")
+        events.append(event)
+        offset += len(line)
+        if not line.endswith(b"\n"):
+            # A complete JSON object may have lost only its trailing newline.
+            with path.open("ab") as stream:
+                stream.write(b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            recovery = {"newline_restored": True, "bytes": 0}
+    return events, recovery
+
+
+def _recorded_event_prefix(path, expected):
+    """A kill after appending retry/reuse may precede the run.json update."""
+    digest = hashlib.sha256()
+    for line in path.read_bytes().splitlines(keepends=True):
+        digest.update(line)
+        if digest.hexdigest() == expected:
+            return True
+    return False
+
+
+class _PauseTraining(Exception):
+    """An explicitly requested smoke/recovery stop after durable optimizer steps."""
+
+
 def train_msdzip_h0(dataset_run, out, representations=("abs", "mod256"), device="cpu", epochs=5,
                     max_train_bytes=2000000, max_val_bytes=200000, model_batch_size=32,
                     timesteps=16, hidden_dim=256, ffn_dim=4096, vocab_dim=16, lr=.001,
-                    seed=42, max_bases_per_split=0, trust_checkpoint=False, window_groups=16):
-    """Fresh original predictors; H0 train fitting and H0 val checkpoint selection."""
+                    seed=42, max_bases_per_split=0, trust_checkpoint=False, window_groups=16,
+                    resume=False, checkpoint_every_steps=100, max_steps_per_call=0):
+    """Fit H0 predictors, with exact compatible resume from committed steps.
+
+    History datasets use clean-arm adjacent observed RGB pairs. Existing damage
+    in the base is preserved; clean does not mean a physically undamaged facade.
+    max_steps_per_call is only a safe interruption budget, not a change of fit.
+    """
+    from .research.common import ExperimentRun
+
     representations = tuple(representations)
     if not representations or len(set(representations)) != len(representations) or any(rep not in {"abs", "mod256"} for rep in representations):
         raise ValueError("representations must contain unique abs/mod256 names")
-    for name, value in (("epochs", epochs), ("max_train_bytes", max_train_bytes), ("max_val_bytes", max_val_bytes), ("window_groups", window_groups)):
+    for name, value in (("epochs", epochs), ("max_train_bytes", max_train_bytes), ("max_val_bytes", max_val_bytes),
+                        ("window_groups", window_groups), ("checkpoint_every_steps", checkpoint_every_steps)):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
-    if type(max_bases_per_split) is not int or max_bases_per_split < 0 or type(seed) is not int:
-        raise ValueError("Base budget must be nonnegative and seed an integer")
+    if (type(max_bases_per_split) is not int or max_bases_per_split < 0 or type(seed) is not int or seed < 0
+            or type(max_steps_per_call) is not int or max_steps_per_call < 0):
+        raise ValueError("Base/step budgets and seed must be nonnegative integers")
     if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(lr) or lr <= 0:
         raise ValueError("Learning rate must be finite and positive")
     args = _model_args(model_batch_size, timesteps, hidden_dim, ffn_dim, vocab_dim)
+    if sha256(SOURCE_PATH) != SOURCE_SHA256:
+        raise ValueError("Vendored original MSDZip source hash disagrees with pinned upstream")
     torch = _torch()
-    target_device = _device(device)
     root, parent, index, split, fingerprints = _parent(dataset_run)
-    signatures = {(state, scenario["id"]) for state in parent["config"]["states"] for scenario in parent["config"]["scenarios"]}
-    bases, cases = _select(index, split, max_bases_per_split, signatures)
+    if parent["kind"] == "history_dataset":
+        bases = []
+        for part in ("train", "val"):
+            candidates = sorted((base for base in index["bases"] if base["split"] == part),
+                                key=lambda base: _digest(base["base_id"]))
+            bases.extend(candidates[:max_bases_per_split] if max_bases_per_split else candidates)
+        selected_bases = {base["base_id"] for base in bases}
+        cases = [case for case in index["cases"] if case["base_id"] in selected_bases]
+    else:
+        signatures = {(state, scenario["id"]) for state in parent["config"]["states"] for scenario in parent["config"]["scenarios"]}
+        bases, cases = _select(index, split, max_bases_per_split, signatures)
     checked = {}
     plans = {part: _sampling_plan(root, parent, bases, cases, part, budget, seed, checked)
              for part, budget in (("train", max_train_bytes), ("val", max_val_bytes))}
+    # Fingerprint all selected model inputs before accepting a resume or a GPU.
+    selected_ids = {item["case_id"] for plan in plans.values() for item in plan}
+    for case in cases:
+        if case["case_id"] not in selected_ids:
+            continue
+        for key in ("reference_rgb", "source_rgb", "reference_support", "source_support", "geometry"):
+            if key in case:
+                _, digest = _checked(root, parent, case[key], case["artifact_sha256"][key])
+                checked[case[key]] = digest
     sampling = {"algorithm": "equal building/scenario cells, then cases; redistribute exhausted capacities; sample without replacement",
                 "seed": seed, "requested_bytes": {"train": max_train_bytes, "val": max_val_bytes},
                 "selected_bytes": {part: sum(len(item["target_byte_offsets"]) for item in plan) for part, plan in plans.items()},
                 "same_target_identities_across_representations": True, "partitions": plans}
     sampling_digest = _digest(sampling)
-    out = new_directory(out)
     config = {"dataset_run": str(root), "input_sha256": fingerprints, "representations": list(representations),
-              "model_args": args, "epochs": epochs, "lr": lr, "seed": seed, "device": str(target_device),
+              "model_args": args, "epochs": epochs, "lr": lr, "seed": seed, "device": str(torch.device(device)),
               "max_bases_per_split": max_bases_per_split, "protocol": PROTOCOL,
               "sampling_sha256": sampling_digest, "source_sha256": SOURCE_SHA256,
-              "trust_checkpoint": bool(trust_checkpoint), "window_groups": window_groups,
+              "window_groups": window_groups, "checkpoint_every_steps": checkpoint_every_steps,
+              "selected_artifact_sha256": checked,
+              "adapter_source_sha256": {name: sha256(Path(__file__).parent / name) for name in
+                                        (Path(__file__).name, "hypothesis_benchmark.py", "io.py")},
+              "runtime": {"torch": str(torch.__version__), "numpy": str(np.__version__),
+                          "torch_threads": torch.get_num_threads(), "torch_interop_threads": torch.get_num_interop_threads()},
+              "training_dataset_kind": parent["kind"],
+              "pair_policy": "adjacent observed clean-arm frames" if parent["kind"] == "history_dataset" else "unchanged non-sham H0 cases",
               "execution_backend": "torch.vmap" if hasattr(torch, "vmap") else "serial original forwards"}
-    record = run_record("msdzip_h0_training", config)
-    write_json(out / "run.json", record)
-    try:
+    out = Path(out).expanduser().resolve()
+    existing = out.exists()
+    if existing:
+        if not resume:
+            raise FileExistsError(f"Training output exists; use resume=True with exactly compatible inputs: {out}")
+        record = read_json(out / "run.json")
+        if record.get("kind") != "msdzip_h0_training" or record.get("config") != config:
+            raise ValueError("MSDZip resume config/data/source fingerprint is incompatible; use a new output directory")
+        if read_json(out / "2026-10-04_sampling.json") != sampling:
+            raise ValueError("MSDZip resume sampling changed")
+        events, recovery = _training_events(out, record["config_sha256"])
+        if record.get("status") != "running":
+            for relative, expected in record.get("artifact_sha256", {}).items():
+                if sha256(out / relative) != expected:
+                    if relative == "events.jsonl" and _recorded_event_prefix(out / relative, expected):
+                        continue
+                    raise ValueError(f"Recorded MSDZip training artifact changed: {relative}")
+    else:
+        new_directory(out)
+        record = run_record("msdzip_h0_training", config)
+        write_json(out / "run.json", record)
         shutil.copyfile(root / "split.json", out / "2026-10-04_reviewed_split.json")
         write_json(out / "2026-10-04_sampling.json", sampling)
-        results = {}
+        events, recovery = [], None
+    # Reuse the research ledger's schema/method rather than a second event API.
+    run = ExperimentRun.__new__(ExperimentRun)
+    run.out, run.record = out, record
+    run.sequence = max((event["sequence"] for event in events), default=0)
+    if recovery is not None:
+        run.event("event_tail_recovered", **recovery)
+    if existing and record.get("status") == "completed_exploratory":
+        summary = read_json(out / "2026-10-04_msdzip_h0_summary.json")
+        run.event("completed_reuse", summary_sha256=sha256(out / "2026-10-04_msdzip_h0_summary.json"))
+        finish_record(out, record, "completed_exploratory")
+        return summary
+    run.event("retry" if existing else "started", previous_status=record["status"], max_steps_per_call=max_steps_per_call)
+    record.pop("error", None)
+    record["status"] = "running"
+    write_json(out / "run.json", record)
+    results, steps_this_call = {}, 0
+    try:
+        target_device = _device(device)
         for representation in representations:
+            checkpoint = out / f"2026-10-04_msdzip_h0_{representation}.pt"
+            resume_path = out / f"2026-10-14_msdzip_resume_{representation}.pt"
+            saved = _load_checkpoint(resume_path, trust_checkpoint) if resume_path.exists() else None
+            if saved is not None and (saved.get("kind") != "msdzip_training_resume" or saved.get("config_sha256") != _digest(config)
+                                      or saved.get("representation") != representation):
+                raise ValueError("MSDZip optimizer checkpoint config/representation differs")
+            if saved is not None and saved["status"] == "completed":
+                if sha256(checkpoint) != saved["result"]["checkpoint_sha256"]:
+                    raise ValueError("Completed MSDZip representation checkpoint changed")
+                results[representation] = saved["result"]
+                run.event("representation_reuse", representation=representation)
+                continue
             samples = {part: _samples(root, parent, bases, cases, plan, representation, timesteps, checked)
                        for part, plan in plans.items()}
             torch.manual_seed(seed)
+            random.seed(seed)
+            np.random.seed(seed % 2**32)
             if target_device.type == "cuda":
                 torch.cuda.manual_seed_all(seed)
             model = _new_model(args, target_device)
             optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-            best, history = math.inf, []
-            checkpoint = out / f"2026-10-04_msdzip_h0_{representation}.pt"
             metadata = {"schema_version": 1, "kind": "original_msdzip_h0_frozen", "representation": representation,
                         "source_sha256": SOURCE_SHA256, "source_commit": SOURCE_COMMIT, "model_args": args,
                         "input_sha256": fingerprints, "reviewed_split": split, "protocol": PROTOCOL,
@@ -419,37 +693,80 @@ def train_msdzip_h0(dataset_run, out, representations=("abs", "mod256"), device=
                         "training_case_ids": [item["case_id"] for item in plans["train"]],
                         "validation_case_ids": [item["case_id"] for item in plans["val"]],
                         "selection": "minimum frozen-weight non-sham H0 validation NLL; no H1/test RGB or labels",
-                        "lr": lr, "seed": seed, "epochs_requested": epochs}
-            metadata.update(window_groups=window_groups, execution_backend=config["execution_backend"],
-                            maximum_optimizer_targets=model_batch_size * window_groups)
-            for epoch in range(1, epochs + 1):
-                print(f"MSDZip {representation}: epoch {epoch}/{epochs}; H0 bytes train={len(samples['train'][1])}, val={len(samples['val'][1])}", flush=True)
+                        "training_dataset_kind": parent["kind"], "pair_policy": config["pair_policy"],
+                        "lr": lr, "seed": seed, "epochs_requested": epochs,
+                        "window_groups": window_groups, "execution_backend": config["execution_backend"],
+                        "maximum_optimizer_targets": model_batch_size * window_groups}
+            state = {"epoch": 1, "global_step": 0, "progress": {}, "history": [], "best": None,
+                     "train_seconds": 0., "status": "running"}
+            if saved is not None:
+                model.load_state_dict(saved["state_dict"], strict=True)
+                optimizer.load_state_dict(saved["optimizer"])
+                state = saved["training"]
+                _restore_rng(saved["rng"], target_device)
+                if state["best"] is not None:
+                    _atomic_torch_save(checkpoint, state["best"])
+                run.event("checkpoint_resume", representation=representation, epoch=state["epoch"],
+                          step=state["progress"].get("step", 0), global_step=state["global_step"])
+
+            def save_progress(status="running", result=None):
+                payload = {"kind": "msdzip_training_resume", "schema_version": 1,
+                           "config_sha256": _digest(config), "representation": representation, "status": status,
+                           "state_dict": model.state_dict(), "optimizer": optimizer.state_dict(),
+                           "training": state, "rng": _rng_state(target_device), "result": result}
+                _atomic_torch_save(resume_path, payload)
+
+            def after_step():
+                nonlocal steps_this_call
+                steps_this_call += 1
+                state["global_step"] += 1
+                state["train_seconds"] = prior_train_seconds + time.perf_counter() - started
+                pause = bool(max_steps_per_call and steps_this_call >= max_steps_per_call)
+                if state["global_step"] % checkpoint_every_steps == 0 or pause:
+                    save_progress()
+                if pause:
+                    raise _PauseTraining("Requested optimizer-step budget reached")
+
+            if saved is None:
+                save_progress()
+            for epoch in range(state["epoch"], epochs + 1):
+                print(f"MSDZip {representation}: epoch {epoch}/{epochs}; resume batch={state['progress'].get('step', 0)}", flush=True)
+                prior_train_seconds = state["train_seconds"]
                 started = time.perf_counter()
-                train_bpb = _epoch(model, samples["train"], target_device, window_groups, optimizer, np.random.default_rng(seed + epoch),
-                                   progress_description=f"MSDZip {representation} train {epoch}/{epochs}")
-                train_seconds = time.perf_counter() - started
+                train_bpb = _epoch(model, samples["train"], target_device, window_groups, optimizer,
+                                   np.random.default_rng(seed + epoch), f"MSDZip {representation} train {epoch}/{epochs}",
+                                   progress_state=state["progress"], step_callback=after_step)
+                train_seconds = prior_train_seconds + time.perf_counter() - started
+                # Persist a completed train pass before validation, which is safe
+                # to replay after interruption because it has no optimizer steps.
+                state["train_seconds"] = train_seconds
+                save_progress()
                 val_started = time.perf_counter()
                 val_bpb = _epoch(model, samples["val"], target_device, window_groups,
                                  progress_description=f"MSDZip {representation} val {epoch}/{epochs}")
                 val_seconds = time.perf_counter() - val_started
-                history.append({"epoch": epoch, "train_bpb": train_bpb, "val_bpb": val_bpb,
-                                "train_seconds": train_seconds, "val_seconds": val_seconds,
-                                "train_bytes_per_second": len(samples["train"][1]) / train_seconds,
-                                "val_bytes_per_second": len(samples["val"][1]) / val_seconds})
-                write_json(out / f"2026-10-04_training_history_{representation}.json", history)
-                print(f"MSDZip {representation}: train_bpb={train_bpb:.6f}; val_bpb={val_bpb:.6f}; train bytes/s={history[-1]['train_bytes_per_second']:.1f}; val bytes/s={history[-1]['val_bytes_per_second']:.1f}", flush=True)
                 if not math.isfinite(train_bpb) or not math.isfinite(val_bpb):
                     raise ValueError("MSDZip training produced non-finite byte loss")
-                if val_bpb < best:
-                    best = val_bpb
-                    best_metadata = {**metadata, "best_epoch": epoch, "best_val_bpb": val_bpb}
-                    state = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
-                    temporary = checkpoint.with_suffix(".tmp")
-                    torch.save({"metadata": best_metadata, "state_dict": state}, temporary)
-                    temporary.replace(checkpoint)
+                state["history"].append({"epoch": epoch, "train_bpb": train_bpb, "val_bpb": val_bpb,
+                                         "train_seconds": train_seconds, "val_seconds": val_seconds,
+                                         "train_bytes_per_second": len(samples["train"][1]) / max(train_seconds, 1e-9),
+                                         "val_bytes_per_second": len(samples["val"][1]) / max(val_seconds, 1e-9)})
+                if state["best"] is None or val_bpb < state["best"]["metadata"]["best_val_bpb"]:
+                    state["best"] = {"metadata": {**metadata, "best_epoch": epoch, "best_val_bpb": val_bpb},
+                                     "state_dict": {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}}
+                    _atomic_torch_save(checkpoint, state["best"])
+                state.update(epoch=epoch + 1, progress={}, train_seconds=0.)
+                save_progress()
+                write_json(out / f"2026-10-04_training_history_{representation}.json", state["history"])
+                run.event("epoch_completed", representation=representation, epoch=epoch, train_bpb=train_bpb,
+                          val_bpb=val_bpb, global_step=state["global_step"], resume_sha256=sha256(resume_path))
+            write_json(out / f"2026-10-04_training_history_{representation}.json", state["history"])
+            best_metadata = state["best"]["metadata"]
             results[representation] = {"checkpoint_path": checkpoint.name, "checkpoint_sha256": sha256(checkpoint),
-                                       "best_val_bpb": best, "best_epoch": best_metadata["best_epoch"], "history": history,
-                                       "metadata": best_metadata}
+                                       "best_val_bpb": best_metadata["best_val_bpb"], "best_epoch": best_metadata["best_epoch"],
+                                       "history": state["history"], "metadata": best_metadata}
+            save_progress("completed", results[representation])
+            run.event("representation_completed", representation=representation, checkpoint_sha256=sha256(checkpoint))
             del samples, optimizer, model
             if target_device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -461,13 +778,24 @@ def train_msdzip_h0(dataset_run, out, representations=("abs", "mod256"), device=
         summary = {"status": "completed_exploratory", "scope": "H0 residual surprise; original MSDZip predictor; no full H0/H1 code comparison",
                    "input_sha256": fingerprints, "model_args": args, "protocol": PROTOCOL, "results": results,
                    "sampling_sha256": sampling_digest, "sampled_bytes": sampling["selected_bytes"],
-                   "selected_artifact_sha256": checked, "buildings": results[representations[0]]["metadata"]["buildings"]}
+                   "selected_artifact_sha256": checked, "buildings": results[representations[0]]["metadata"]["buildings"],
+                   "training_dataset_kind": parent["kind"], "pair_policy": config["pair_policy"], "test_rgb_loaded": False}
         write_json(out / "2026-10-04_msdzip_h0_summary.json", summary)
         record["summary"] = summary
+        run.event("completed", summary_sha256=sha256(out / "2026-10-04_msdzip_h0_summary.json"))
         finish_record(out, record, summary["status"])
         return summary
+    except _PauseTraining as exc:
+        run.event("interrupted", reason=str(exc), optimizer_steps_this_call=steps_this_call)
+        finish_record(out, record, "interrupted", str(exc))
+        return {"status": "interrupted", "out": str(out), "optimizer_steps_this_call": steps_this_call,
+                "resume": True, "results": results}
     except (Exception, KeyboardInterrupt) as exc:
-        finish_record(out, record, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", str(exc))
+        # Never snapshot a potentially half-updated optimizer on a signal/error.
+        # The last atomically committed step is authoritative on the next call.
+        status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        run.event(status, error=str(exc))
+        finish_record(out, record, status, str(exc))
         raise
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 import platform
 import subprocess
 from datetime import datetime, timezone
@@ -25,9 +26,23 @@ def read_json(path: str | Path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def sync_directory(path: str | Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def write_json(path: str | Path, value) -> None:
-    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2,
-                                    allow_nan=False) + "\n", encoding="utf-8")
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    sync_directory(path.parent)
 
 
 def new_directory(path: str | Path) -> Path:

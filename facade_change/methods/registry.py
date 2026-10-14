@@ -15,6 +15,7 @@ LEGACY_METHODS = (
 EXTERNAL_METHODS = (
     "lpips", "dinov2", "rscd_cmu", "rscd_diff_cmu", "rscd_pscd", "anychange", "geoscd",
     "jpegls_abs", "jpegls_mod256", "h264_rgb", "arib_bps_abs", "arib_bps_mod256", "bcm_net_rgb",
+    "semantic_dino",
 )
 ALL_METHODS = LEGACY_METHODS + EXTERNAL_METHODS
 
@@ -26,6 +27,7 @@ LEGACY_OPTIONS = {
 _EXTERNAL_ADAPTERS = {
     "lpips": ("lpips", "LPIPSScorer"),
     "dinov2": ("dinov2", "DINOv2Scorer"),
+    "semantic_dino": ("2026-10-14_semantic_dino", "SemanticDINOScorer"),
     "rscd_cmu": ("rscd", "RSCDScorer"),
     "rscd_diff_cmu": ("rscd", "RSCDScorer"),
     "rscd_pscd": ("rscd", "RSCDScorer"),

@@ -91,7 +91,7 @@ class MethodRegistryTests(unittest.TestCase):
         for name in EXTERNAL_METHODS:
             module = SimpleNamespace(**{class_name: FakeAdapter for class_name in (
                 "LPIPSScorer", "DINOv2Scorer", "RSCDScorer", "AnyChangeScorer", "GeoSCDScorer",
-                "ClassicalCodecScorer", "ArIBScorer", "BCMScorer")})
+                "ClassicalCodecScorer", "ArIBScorer", "BCMScorer", "SemanticDINOScorer")})
             with patch("facade_change.methods.registry.importlib.import_module", return_value=module) as importer:
                 scorer = make_method(name, checkpoint_path="local.pt", device="cpu")
             self.assertEqual(importer.call_count, 1)
@@ -106,7 +106,7 @@ class MethodRegistryTests(unittest.TestCase):
             make_method("rgb_diff")
             make_method("lzma_abs")
         self.assertEqual(len(LEGACY_METHODS), 8)
-        self.assertEqual(len(EXTERNAL_METHODS), 13)
+        self.assertEqual(len(EXTERNAL_METHODS), 14)
         for name, options in (("bad", {}), ("rgb_diff", {"edit_mask": None}),
                               ("lzma_abs", {"occlusion_mask": None})):
             with self.assertRaises(ValueError):

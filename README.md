@@ -21,6 +21,7 @@
 | Одна страница синтетических и реальных историй | `python -m facade_change review-transitions --synthetic-run ... --candidate-runs ...` | [Просмотр историй](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | Выравнивание временных пар | `python -m facade_change batch` | [Геометрия и кропы](docs/2026-10-04_geoscd_and_crop_preparation.md) |
 | Сравнение методов на фиксированных H0/H1 | `python -m facade_change h0h1-benchmark` | [Общий runner](docs/2026-10-04_common_runner.md) |
+| Возобновляемый TRAIN/VAL: обучение MSDZip, семантическая DINO, пары и память | `python -m facade_change temporal-experiment` | [Запуск и восстановление](docs/2026-10-14_temporal_experiment.md) |
 | Анализ готовых карт и потерь Recall | `python -m data_analysis` | [Анализ результатов](data_analysis/README.md) |
 | Оплаченные H0/H1 и контекст опоры | `python -m facade_change.research` | [Прототипы](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | План очистки локальных результатов | `python scripts/audit_environment.py --cleanup-plan` | Раздел ниже |

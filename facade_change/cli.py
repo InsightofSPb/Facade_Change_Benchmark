@@ -223,6 +223,27 @@ def parser():
     train.add_argument("--seed", type=int, default=42)
     train.add_argument("--max-bases-per-split", type=int, default=0)
     train.add_argument("--trust-checkpoint", action="store_true")
+    train.add_argument("--resume", action="store_true")
+    train.add_argument("--checkpoint-every-steps", type=int, default=100)
+    train.add_argument("--max-steps-per-call", type=int, default=0)
+    temporal = sub.add_parser("temporal-experiment", help="Resumable TRAIN/VAL pair and state-history experiment")
+    temporal.add_argument("--out", required=True)
+    temporal.add_argument("--config", dest="config_path")
+    temporal.add_argument("--dataset")
+    temporal.add_argument("--history-run")
+    temporal.add_argument("--alignment-runs", nargs="+")
+    temporal.add_argument("--semantic-run")
+    temporal.add_argument("--methods-config")
+    temporal.add_argument("--methods", nargs="+")
+    temporal.add_argument("--device")
+    temporal.add_argument("--training-python")
+    temporal.add_argument("--crops-per-building", type=int)
+    temporal.add_argument("--max-buildings-per-split", type=int)
+    temporal.add_argument("--resume", action="store_true")
+    temporal.add_argument("--report-only", action="store_true")
+    temporal.add_argument("--preflight-only", action="store_true")
+    temporal.add_argument("--smoke-only", action="store_true")
+    temporal.add_argument("--detach", action="store_true", help="Launch a new session; log to OUT.log")
     geo = sub.add_parser("geoscd", help="GeoSCD geometry-only dense alignment trial; no SAM/change detector")
     geo.add_argument("--manifest", required=True, dest="manifest_path")
     geo.add_argument("--out", required=True)
@@ -315,6 +336,11 @@ def main(argv=None):
         elif command == "msdzip-train":
             from importlib import import_module
             result = import_module(".2026-10-04_msdzip_h0", __package__).train_msdzip_h0(**args)
+        elif command == "temporal-experiment":
+            from importlib import import_module
+            module = import_module(".2026-10-14_temporal_experiment", __package__)
+            detached = args.pop("detach")
+            result = module.launch_detached(argv) if detached else module.run_temporal_experiment(**args)
         elif command == "arib-train":
             from .codec_training import train_arib_h0
             result = train_arib_h0(**args)
@@ -352,6 +378,10 @@ def main(argv=None):
         if command in ("geoscd", "geoscd-full") and result["failed_runs"]:
             return 2
         if command == "crop-dataset" and result.get("derivative_failures", 0):
+            return 2
+        if command == "temporal-experiment" and (result.get("status") == "completed_with_failures"
+                or any(item.get("status") == "failed" for item in result.get("methods", {}).values())
+                or result.get("missing_methods")):
             return 2
         return 0
     except Exception as exc:
