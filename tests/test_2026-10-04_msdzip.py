@@ -128,6 +128,39 @@ class OriginalMSDZipTests(unittest.TestCase):
             self.assertTrue(self.torch.equal(before[key], tensor))
         self.assertFalse(any(parameter.requires_grad for parameter in scorer.model.parameters()))
 
+    def test_inference_progress_is_throttled_flushed_and_preserves_exact_scores(self):
+        summary, _ = self._train()
+        checkpoint = self.root / "fit" / summary["results"]["abs"]["checkpoint_path"]
+        scorer = msdzip.MSDZipScorer(checkpoint, representation="abs")
+        reference = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
+        source = reference + np.uint8(3)
+        support = np.ones((8, 8), bool)
+        support[:, 2] = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            expected = scorer(reference, source, support)
+            expected_raw = scorer.raw_scores.copy()
+        clock = [0.]
+
+        def tick():
+            clock[0] += 2.
+            return clock[0]
+
+        with patch.object(msdzip.time, "monotonic", side_effect=tick), \
+                patch.object(msdzip, "print", create=True) as output:
+            actual = scorer(reference, source, support)
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(scorer.raw_scores, expected_raw)
+        messages = [call.args[0] for call in output.call_args_list]
+        self.assertIn(f"supported_bytes={int(support.sum()) * 3}", messages[0])
+        self.assertIn("start:", messages[0])
+        self.assertIn("complete:", messages[-1])
+        self.assertIn(f"bytes={int(support.sum()) * 3}/{int(support.sum()) * 3}", messages[-1])
+        updates = [float(message.rsplit("elapsed_s=", 1)[1]) for message in messages if "progress:" in message]
+        self.assertGreater(len(updates), 1)
+        self.assertGreaterEqual(updates[0], 5.)
+        self.assertTrue(all(right - left >= 5. for left, right in zip(updates, updates[1:])))
+        self.assertTrue(all(call.kwargs.get("flush") is True for call in output.call_args_list))
+
     def test_checkpoint_representation_and_dataset_mismatch_fail(self):
         summary, _ = self._train()
         checkpoint = self.root / "fit" / summary["results"]["abs"]["checkpoint_path"]

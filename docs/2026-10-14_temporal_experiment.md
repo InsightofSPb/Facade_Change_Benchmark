@@ -65,6 +65,47 @@ creates deterministic five-frame clean/event histories under `prepared_history/`
 `--crops-per-building N` increases the number of selected native crops.
 Multiple accepted alignment batches can follow `--alignment-runs`.
 
+### Corrected MSDZip smoke and live progress
+
+The initial implementation evaluated tiny smoke checkpoints (two target bytes
+per forward) on full crops. One fully supported 512×512 pair therefore required
+393,216 grouped forwards, before the additional history comparisons. The corrected
+smoke uses at most 16×16 **native pixels** for MSDZip only: 384 forwards for the
+equivalent fully supported pair. A deterministic maximum-common-geometric-support
+window is shared across all five synthetic dates; the real pair has its own
+window. No image resizing or annotation-based selection occurs. Coordinates and
+original/scored shapes are saved in `smoke/msdzip_*.json` under `smoke_inputs`.
+Other methods and the full experiment retain their original inputs.
+
+The main log now announces preparation, source verification, method initialization,
+individual smoke pairs/history frames, full training and reporting. Each MSDZip
+inference also writes start, periodic byte/group counts, and completion to its
+`logs/facade-worker-msdzip_*.log`. Updates are emitted at most once per five seconds
+between start/completion, after a batch finishes; there is no background heartbeat.
+
+If the original `...-001` run is still in its smoke stage, stop its recorded
+coordinator PID with SIGTERM and confirm that it exits before updating the checkout.
+This also closes its owned worker. Keep the old run directory. Because resume
+verifies source hashes, start the corrected code in a **new** output directory,
+reusing the completed synthetic preparation and existing alignment results:
+
+```bash
+cd /home/sasha/Facade_Change_Benchmark &&
+git pull --ff-only &&
+/home/sasha/miniconda3/envs/scd_bench/bin/python -u -s -m facade_change temporal-experiment \
+  --config /home/sasha/Facade_Change_Benchmark/runs/2026-10-14-temporal-experiment-001/request.json \
+  --history-run /home/sasha/Facade_Change_Benchmark/runs/2026-10-14-temporal-experiment-001/prepared_history \
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-10-14-temporal-experiment-002 \
+  --detach
+```
+
+This still launches the full experiment after corrected smoke checks. Add
+`--smoke-only` to stop after the checks; subsequently use the same `...-002`
+output with `--resume --detach` to continue. The smoke checks are repeated under
+the corrected source version; `request.json` preserves the previous dataset,
+alignment paths, selected semantic head and method settings. Previously saved
+research artifacts are not modified.
+
 ## Methods and targets
 
 | Method | Scoring and provenance |

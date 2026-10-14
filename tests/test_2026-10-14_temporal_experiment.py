@@ -6,9 +6,11 @@ import importlib.util
 import io
 import json
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -23,6 +25,136 @@ spec = importlib.util.spec_from_file_location(
     "temporal_input_fixtures", Path(__file__).with_name("test_2026-10-14_temporal_inputs.py"))
 fixtures = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixtures)
+
+
+class TemporalSmokeWindowTests(unittest.TestCase):
+    def frames(self, count=5, shape=(512, 512)):
+        y, x = np.indices(shape)
+        frames = []
+        for index in range(count):
+            rgb = np.stack(((x + index) % 256, (y + 7 * index) % 256,
+                            (x + y + 13 * index) % 256), axis=2).astype(np.uint8)
+            support = np.zeros(shape, bool)
+            support[200:260, 300:360] = True
+            if index >= 2:
+                support[:] = False
+                support[221:241, 323:343] = True
+            frames.append({"rgb": rgb, "support": support})
+        return frames
+
+    def test_window_is_native_deterministic_and_common_to_all_frames(self):
+        frames = self.frames()
+        original = copy.deepcopy(frames)
+        cropped, selection = runner._smoke_window(frames)
+        again, repeated = runner._smoke_window(frames)
+        self.assertEqual(selection, repeated)
+        x, y, width, height = selection["crop_xywh"]
+        self.assertGreaterEqual(x, 323)
+        self.assertGreaterEqual(y, 221)
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
+        self.assertLessEqual(width, 16)
+        self.assertLessEqual(height, 16)
+        self.assertEqual(len(cropped), 5)
+        for full, before, small, duplicate in zip(frames, original, cropped, again):
+            np.testing.assert_array_equal(small["rgb"], full["rgb"][y:y+height, x:x+width])
+            np.testing.assert_array_equal(small["support"], full["support"][y:y+height, x:x+width])
+            self.assertTrue(small["support"].all())
+            for key in ("rgb", "support"):
+                np.testing.assert_array_equal(small[key], duplicate[key])
+                np.testing.assert_array_equal(full[key], before[key])
+        # Returned samples must not expose mutable views of the prepared input.
+        cropped[0]["rgb"][:] = 0
+        cropped[0]["support"][:] = False
+        np.testing.assert_array_equal(frames[0]["rgb"], original[0]["rgb"])
+        np.testing.assert_array_equal(frames[0]["support"], original[0]["support"])
+
+    def test_small_inputs_are_not_resized_and_disjoint_support_is_rejected(self):
+        frames = [{"rgb": np.arange(7 * 11 * 3, dtype=np.uint8).reshape(7, 11, 3),
+                   "support": np.ones((7, 11), bool)} for _ in range(2)]
+        cropped, selection = runner._smoke_window(frames)
+        self.assertEqual(selection["crop_xywh"], [0, 0, 11, 7])
+        for full, small in zip(frames, cropped):
+            np.testing.assert_array_equal(small["rgb"], full["rgb"])
+        frames[0]["support"][:, 5:] = False
+        frames[1]["support"][:, :5] = False
+        with self.assertRaises(ValueError):
+            runner._smoke_window(frames)
+
+    def test_msdzip_smoke_bounds_pair_and_every_history_call(self):
+        native = self.frames()
+        sequences = [{"domain": domain, "sequence_id": domain + "-example",
+                      "frames": list(range(5 if domain == "synthetic" else 2))}
+                     for domain in ("synthetic", "real")]
+        inputs = runner._module("inputs")
+        for method in ("msdzip_abs", "msdzip_mod256"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as directory:
+                calls, events = [], []
+                scorer = self.recording_scorer(calls)
+                store = SimpleNamespace(out=Path(directory), event=lambda *args, **kwargs: events.append((args, kwargs)))
+                with patch.object(inputs, "load_frame", side_effect=lambda sequence, index: native[index]):
+                    runner._smoke(store, sequences, {"id": method, "method": method}, scorer,
+                                  {"history_methods": [method], "memory_exemplars": 3})
+                self.assertGreater(len(calls), 2, "history must invoke real scoring in addition to both pairs")
+                for reference, source, support in calls:
+                    self.assertLessEqual(source.shape[0], 16)
+                    self.assertLessEqual(source.shape[1], 16)
+                    self.assertEqual(reference.shape, source.shape)
+                    self.assertEqual(support.shape, source.shape[:2])
+                    self.assertTrue(support.any())
+                marker = read_json(Path(directory) / "smoke" / f"{method}.json")
+                for domain in ("synthetic", "real"):
+                    selection = marker["smoke_inputs"][domain]
+                    self.assertIn("selection_policy", selection)
+                    self.assertIn("native_shape", selection)
+                    self.assertIn("scored_shape", selection)
+                    x, y, width, height = selection["crop_xywh"]
+                    pair = calls[0 if domain == "synthetic" else 1]
+                    np.testing.assert_array_equal(pair[0], native[0]["rgb"][y:y+height, x:x+width])
+                    np.testing.assert_array_equal(pair[1], native[1]["rgb"][y:y+height, x:x+width])
+                with np.load(Path(directory) / marker["artifact"], allow_pickle=False) as saved:
+                    self.assertEqual(int(saved["memory__next_frame"]), 5)
+                    self.assertLessEqual(saved["memory__rgb"].shape[-3], 16)
+                    self.assertLessEqual(saved["memory__rgb"].shape[-2], 16)
+
+    @staticmethod
+    def recording_scorer(calls):
+        class RecordingScorer(RGBScorer):
+            def __call__(self, reference, source, support):
+                calls.append((reference.copy(), source.copy(), support.copy()))
+                return super().__call__(reference, source, support)
+        return RecordingScorer("rgb_diff")
+
+    def test_other_smoke_methods_and_full_msdzip_pairs_keep_native_crops(self):
+        frames = self.frames(count=2)
+        sequence = {"domain": "real", "frames": [0, 1], "sequence_id": "native",
+                    "split": "val", "building_id": "building"}
+        synthetic = {**sequence, "domain": "synthetic"}
+        inputs = runner._module("inputs")
+        calls = []
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(inputs, "load_frame", side_effect=lambda sequence, index: frames[index]):
+            store = SimpleNamespace(out=Path(directory), event=lambda *args, **kwargs: None)
+            runner._smoke(store, [synthetic, sequence], {"id": "rgb_diff", "method": "rgb_diff"},
+                          self.recording_scorer(calls), {"history_methods": [], "memory_exemplars": 3})
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(source.shape == (512, 512, 3) for _, source, _ in calls))
+            calls.clear()
+            committed = []
+
+            def stop_after_one(record, arrays):
+                committed.append(arrays)
+                raise KeyboardInterrupt("inspect first actual full-resolution inference unit")
+
+            store.read_unit = lambda identifier: None
+            store.save_unit = stop_after_one
+            with self.assertRaises(KeyboardInterrupt):
+                runner._pairs(store, [sequence], {"id": "msdzip_abs", "method": "msdzip_abs", "variant": "current"},
+                              self.recording_scorer(calls))
+            self.assertEqual(len(calls), 1)
+            np.testing.assert_array_equal(calls[0][0], frames[0]["rgb"])
+            np.testing.assert_array_equal(calls[0][1], frames[1]["rgb"])
+            self.assertEqual(committed[0]["scores"].shape, (512, 512))
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required")

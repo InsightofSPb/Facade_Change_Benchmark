@@ -847,23 +847,37 @@ class MSDZipScorer:
 
     def __call__(self, reference, source, support):
         torch = _torch()
+        started = time.monotonic()
         residual = residual_bytes(reference, source, self.metadata["representation"])
         if support.dtype != bool or support.shape != reference.shape[:2] or not support.any():
             raise ValueError("MSDZip requires same-grid boolean geometric support")
         positions = np.flatnonzero(np.repeat(support.reshape(-1), 3))
+        lane_count = int(np.bincount(positions % self.model.batchsize, minlength=self.model.batchsize).max())
+        total_groups = (lane_count + self.metadata["window_groups"] - 1) // self.metadata["window_groups"]
+        prefix = f"MSDZip {self.metadata['representation']} inference"
+        print(f"{prefix} start: supported_bytes={len(positions)}; grouped_forwards={total_groups}; device={self.device}", flush=True)
         contexts, targets = _windows(residual, support, positions, self.model.timesteps)
         byte_bits = np.full(residual.size, np.nan, dtype=np.float32)
+        processed = 0
+        next_progress = started + 5.
         with torch.inference_mode():
-            for batch, labels, indices in _batch_groups(contexts, targets, positions, self.model.batchsize, self.metadata["window_groups"]):
+            batches = _batch_groups(contexts, targets, positions, self.model.batchsize, self.metadata["window_groups"])
+            for group, (batch, labels, indices) in enumerate(batches, 1):
                 active = indices >= 0
                 active_tensor = torch.as_tensor(active, device=self.device)
                 logits = _predict_groups(self.model, torch.as_tensor(batch, device=self.device))
                 bits = torch.nn.functional.cross_entropy(logits[active_tensor], torch.as_tensor(labels[active], device=self.device), reduction="none") / math.log(2)
                 byte_bits[positions[indices[active]]] = bits.cpu().numpy().astype(np.float32)
+                processed += int(np.count_nonzero(active))
+                now = time.monotonic()
+                if now >= next_progress:
+                    print(f"{prefix} progress: groups={group}/{total_groups}; bytes={processed}/{len(positions)}; elapsed_s={now - started:.1f}", flush=True)
+                    next_progress = now + 5.
         self.model.last = []
         self.raw_scores = byte_bits.reshape(residual.shape).mean(axis=-1).astype(np.float32)
         scores = (-np.expm1(-self.raw_scores / np.float32(8))).astype(np.float32)
         if (not np.isfinite(scores[support]).all() or not np.isnan(scores[~support]).all()
                 or np.any(scores[support] < 0) or np.any(scores[support] > 1)):
             raise ValueError("MSDZip produced an invalid native-grid score map")
+        print(f"{prefix} complete: groups={total_groups}/{total_groups}; bytes={processed}/{len(positions)}; elapsed_s={time.monotonic() - started:.1f}", flush=True)
         return scores

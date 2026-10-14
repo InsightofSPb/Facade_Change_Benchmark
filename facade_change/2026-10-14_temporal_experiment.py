@@ -33,6 +33,10 @@ def _module(name):
     return importlib.import_module(f".research.2026-10-14_temporal_{name}", __package__)
 
 
+def _progress(message):
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {message}", flush=True)
+
+
 def _atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,10 +285,12 @@ def _fingerprints(config):
 
 def _prepare_history(config, store):
     if config.get("history_run"):
+        _progress(f"Reusing prepared synthetic histories: {config['history_run']}")
         return config
     target = store.out / "prepared_history"
     complete = target / "run.json"
     if not complete.exists() or not read_json(complete).get("status", "").startswith("completed"):
+        _progress(f"Preparing synthetic histories: {target}")
         if target.exists():
             abandoned = target.with_name(f"prepared_history_interrupted_{time.time_ns()}")
             target.rename(abandoned)
@@ -294,6 +300,8 @@ def _prepare_history(config, store):
                                 crops_per_building=config["crops_per_building"],
                                 max_buildings_per_split=config.get("max_buildings_per_split", 0),
                                 splits=("train", "val"))
+    else:
+        _progress(f"Reusing prepared synthetic histories: {target}")
     return {**config, "history_run": str(target)}
 
 
@@ -306,6 +314,7 @@ def _train(config, out, smoke=False):
     representations = [name.removeprefix("msdzip_") for name in config["methods"] if name.startswith("msdzip_")]
     if not representations:
         return {}
+    _progress(f"MSDZip {', '.join(representations)}: {'smoke' if smoke else 'full'} training; output {out}")
     options["representations"] = representations
     if smoke:
         options.update(epochs=1, max_train_bytes=128, max_val_bytes=64, model_batch_size=2,
@@ -522,6 +531,7 @@ def _history(store, sequences, variant, scorer, config):
                 auxiliary.append({key: value for key, value in result.items() if key != "scores"})
                 return result["scores"]
             started = time.monotonic()
+            _progress(f"{variant['id']} history {sequence['sequence_id']}: frame {index + 1}/{len(sequence['frames'])}")
             result = memory.score_then_update(current["rgb"], current["support"], compare, threshold)
             support = previous["support"] & current["support"] & result["support"]
             scores = result["scores"].astype(np.float32)
@@ -546,28 +556,75 @@ def _history(store, sequences, variant, scorer, config):
             previous = current
 
 
+def _smoke_window(frames, max_side=16):
+    """Bound a machinery check on native pixels; never select by temporal labels.
+
+    The same deterministic window is used at every date. This is only for tiny
+    MSDZip smoke checkpoints, whose two-byte batches are unsuitable for dense
+    full-frame inference. Experiment inputs and checkpoint parameters stay intact.
+    """
+    if not frames or type(max_side) is not int or max_side < 1:
+        raise ValueError("Smoke window requires frames and a positive integer side")
+    shape = frames[0]["support"].shape
+    if len(shape) != 2 or min(shape) < 1:
+        raise ValueError("Smoke frames require nonempty native support")
+    for frame in frames:
+        if (frame["support"].shape != shape or frame["support"].dtype != bool
+                or frame["rgb"].shape != (*shape, 3) or frame["rgb"].dtype != np.uint8):
+            raise ValueError("Smoke frames must share a native uint8 RGB/boolean support grid")
+    common = np.logical_and.reduce([frame["support"] for frame in frames])
+    if not common.any():
+        raise ValueError("MSDZip smoke history has no common geometric support")
+    height, width = shape
+    h, w = min(max_side, height), min(max_side, width)
+    integral = np.pad(common.astype(np.int64), ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    counts = integral[h:, w:] - integral[:-h, w:] - integral[h:, :-w] + integral[:-h, :-w]
+    y, x = map(int, np.unravel_index(int(counts.argmax()), counts.shape))
+    selected = [{"rgb": frame["rgb"][y:y+h, x:x+w].copy(),
+                 "support": frame["support"][y:y+h, x:x+w].copy()} for frame in frames]
+    return selected, {"crop_xywh": [x, y, w, h], "native_shape": list(shape),
+                      "scored_shape": [h, w], "common_supported_pixels": int(counts[y, x]),
+                      "selection_policy": "maximum common geometric support; native pixels, no resize; smoke only"}
+
+
 def _smoke(store, sequences, variant, scorer, config):
     marker = store.out / "smoke" / f"{variant['id']}.json"
     if marker.exists():
         old = read_json(marker)
         if old.get("status") == "passed" and sha256(store.out / old["artifact"]) == old["sha256"]:
+            _progress(f"Smoke {variant['id']}: reusing verified saved result")
             return
     inputs = _module("inputs")
     chosen = [next(sequence for sequence in sequences if sequence["domain"] == "synthetic")]
     real = next((sequence for sequence in sequences if sequence["domain"] == "real"), None)
     if real:
         chosen.append(real)
-    arrays = {}
+    arrays, smoke_inputs, prepared = {}, {}, []
     for number, sequence in enumerate(chosen):
-        reference, current = (inputs.load_frame(sequence, index) for index in (0, 1))
+        with_history = sequence["domain"] == "synthetic" and variant["method"] in config["history_methods"]
+        indices = range(len(sequence["frames"])) if with_history else (0, 1)
+        frames = [inputs.load_frame(sequence, index) for index in indices]
+        if variant["method"].startswith("msdzip_"):
+            frames, selection = _smoke_window(frames)
+        else:
+            h, w = frames[0]["support"].shape
+            selection = {"crop_xywh": [0, 0, w, h], "native_shape": [h, w],
+                         "scored_shape": [h, w], "selection_policy": "full native smoke input"}
+        smoke_inputs[sequence["domain"]] = {**selection, "sequence_id": sequence["sequence_id"]}
+        prepared.append(frames)
+        reference, current = frames[:2]
         support = reference["support"] & current["support"]
+        _progress(f"Smoke {variant['id']}: {sequence['domain']} pair, grid {selection['scored_shape']}, "
+                  f"supported pixels {int(support.sum())}")
+        started = time.monotonic()
         result = _outputs(scorer, reference["rgb"], current["rgb"], support)
         arrays[f"scores_{number}"] = result["scores"]
+        _progress(f"Smoke {variant['id']}: {sequence['domain']} pair completed in {time.monotonic() - started:.1f}s")
     if variant["method"] in config["history_methods"]:
         memory_class = _module("history").TemporalMemory
         memory = memory_class(config["memory_exemplars"])
-        for index in range(len(chosen[0]["frames"])):
-            frame = inputs.load_frame(chosen[0], index)
+        for index, frame in enumerate(prepared[0]):
+            _progress(f"Smoke {variant['id']}: synthetic history frame {index + 1}/{len(prepared[0])}")
             memory.score_then_update(frame["rgb"], frame["support"], scorer, 1.)
             memory = memory_class.from_state_dict(memory.state_dict())
         arrays.update({"memory__" + key: value for key, value in memory.state_dict().items()})
@@ -578,8 +635,10 @@ def _smoke(store, sequences, variant, scorer, config):
             if not np.array_equal(reloaded[key], value, equal_nan=True):
                 raise ValueError("Smoke save/reload parity failed")
     _atomic_json(marker, {"status": "passed", "artifact": str(artifact), "sha256": sha256(store.out / artifact),
-                          "real_pair_tested": real is not None, "method_metadata": scorer.metadata})
+                          "real_pair_tested": real is not None, "method_metadata": scorer.metadata,
+                          "smoke_inputs": smoke_inputs})
     store.event("smoke_passed", method=variant["id"], real_pair_tested=real is not None)
+    _progress(f"Smoke {variant['id']}: passed (including saved-artifact reload)")
 
 
 def _reports(store, statuses=None):
@@ -600,6 +659,7 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
     else:
         config = resolve_config(config_path, **overrides)
     store = RunStore(output, config, resume=resume or report_only)
+    _progress(f"Temporal experiment {'resuming' if resume else 'starting'}: {output}")
     statuses = read_json(output / "method_status.json") if (output / "method_status.json").exists() else {}
     previous_signal = signal.getsignal(signal.SIGTERM)
     if hasattr(signal, "SIGTERM"):
@@ -610,9 +670,13 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
             store.finish("reports_rebuilt", report=summary)
             return summary
         resolved = _prepare_history(config, store)
+        _progress("Loading histories, checking source hashes, and selecting real crops from saved geometry")
         sequences, inputs, coverage = _module("inputs").load_sequences(resolved)
         if not sequences:
             raise ValueError("No eligible TRAIN/VAL sequences")
+        _progress(f"Inputs ready: {sum(s['domain'] == 'synthetic' for s in sequences)} synthetic histories; "
+                  f"{sum(s['domain'] == 'real' for s in sequences)} real crop histories")
+        _progress("Verifying method sources, checkpoints, and execution environment")
         weights, missing = _fingerprints(resolved)
         env = environment()
         contract = {"config": resolved, "inputs": inputs, "weights_and_method_sources": weights,
@@ -627,6 +691,7 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
         _atomic_json(output / "preflight.json", {"missing_method_resources": missing, "coverage": coverage,
                                                  "resources": resources, "test_rgb_loaded": False})
         _atomic_json(output / "resolved_config.json", resolved)
+        _progress(f"Preflight complete; missing method resources: {len(missing)}")
         if preflight_only:
             store.finish("preflight_complete", missing_methods=missing)
             return {"status": "preflight_complete", "missing_methods": missing, "coverage": coverage}
@@ -643,6 +708,7 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
             for variant in _variants(resolved, smoke_weights):
                 name = variant["id"]
                 try:
+                    _progress(f"Smoke {name}: initializing method")
                     if variant["method"] in missing:
                         raise ValueError("; ".join(missing[variant["method"]]))
                     if variant["variant"] == "current_train" and variant["method"] in training_errors:
@@ -654,6 +720,7 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
                 except Exception as exc:
                     statuses[name] = {"status": "failed", "stage": "smoke", "error": f"{type(exc).__name__}: {exc}"}
                     store.event("method_failed", method=name, **statuses[name])
+                    _progress(f"Smoke {name}: failed: {statuses[name]['error']}")
                 finally:
                     pool.release()
                     _atomic_json(output / "method_status.json", statuses)
@@ -661,6 +728,7 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
             result = {"status": "smoke_complete", "methods": statuses}
             store.finish("smoke_complete", methods=statuses)
             return result
+        _progress("Smoke stage complete; starting full training for methods that passed")
         for name in (name for name in config["methods"] if name.startswith("msdzip_")):
             if statuses.get(name, {}).get("status") != "smoke_passed":
                 continue
@@ -675,6 +743,7 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
                 if statuses.get(name, {}).get("status") == "failed":
                     continue
                 try:
+                    _progress(f"Full inference {name}: initializing method")
                     scorer = _scorer(variant, pool)
                     _activate_verified(store, variant, scorer, sequences, "inference")
                     _pairs(store, sequences, variant, scorer)
@@ -685,9 +754,11 @@ def run_temporal_experiment(out, config_path=None, resume=False, report_only=Fal
                 except Exception as exc:
                     statuses[name] = {"status": "failed", "stage": "inference", "error": f"{type(exc).__name__}: {exc}"}
                     store.event("method_failed", method=name, **statuses[name])
+                    _progress(f"Full inference {name}: failed: {statuses[name]['error']}")
                 finally:
                     pool.release()
                     _atomic_json(output / "method_status.json", statuses)
+        _progress("Rebuilding tables and gallery from saved result maps")
         summary = _reports(store, statuses)
         status = "completed_with_failures" if any(s["status"] == "failed" for s in statuses.values()) else "completed_exploratory"
         store.finish(status, methods=statuses)
