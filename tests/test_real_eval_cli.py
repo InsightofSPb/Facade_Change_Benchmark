@@ -29,6 +29,16 @@ class RealEvalCLITests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn('--out', result.stdout)
 
+    def test_temporal_night_subcommands_from_unrelated_working_directory(self):
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'real_eval' / 'real_temporal_night.py'
+        with tempfile.TemporaryDirectory() as directory:
+            for command in ('audit', 'prepare', 'pilot', 'run', 'report', 'status'):
+                with self.subTest(command=command):
+                    result = subprocess.run([sys.executable, str(script), command, '--help'],
+                                            cwd=directory, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('--run' if command == 'status' else '--out', result.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()
