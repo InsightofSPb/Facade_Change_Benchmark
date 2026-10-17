@@ -64,12 +64,37 @@ def fixture(base):
             reads.append((sequence["sequence_id"], index))
             return frames[(sequence["sequence_id"], index)]
         return sequences, loader, {"categories": [{"id": 3, "name": "wall"}, {"id": 9, "name": "crack</script>"}],
-                                   "category_to_channel": {"3": 0, "9": 1}}
+                                   "category_to_channel": [{"category_id": 3, "channel": 0},
+                                                           {"category_id": 9, "channel": 1}]}
     return run, snapshot, adapter, frames, records, reads
 
 
 def tree_hashes(root):
     return {str(path.relative_to(root)): sha256(path) for path in root.rglob('*') if path.is_file()}
+
+
+def prepared_dataset_metadata(directory):
+    """Obtain channel metadata from the real provider without reading any RGB."""
+    from facade_change.segmentation.data import PreparedData
+    directory.mkdir()
+    categories = [{"id": 9, "name": "crack</script>"}, {"id": 3, "name": "wall"}]
+    image = dict(image_id=1, file_name="not-opened.png", image_path="not-opened.png",
+                 sha256="a" * 64, height=8, width=12, building_id="metadata-facade",
+                 view_id="metadata-view", metadata_status="reviewed", split="val")
+    atomic_json(directory / "coco.json", dict(categories=categories, annotations=[],
+                images=[dict(id=1, file_name="not-opened.png", height=8, width=12)]))
+    atomic_json(directory / "manifest.json", dict(categories=categories, images=[image]))
+    atomic_json(directory / "split.json", {})
+    crop = dict(crop_id="1:0:0:12", image_id=1, image_sha256=image["sha256"],
+                building_id=image["building_id"], view_id=image["view_id"], split="val",
+                x=0, y=0, width=12, height=8, pad_right=0, pad_bottom=4)
+    (directory / "crops.jsonl").write_text(json.dumps(crop) + "\n")
+    atomic_json(directory / "dataset.json", dict(kind="semantic_crop_index", crop_size=12,
+                source_coco="coco.json", source_coco_sha256=sha256(directory / "coco.json"),
+                manifest="manifest.json", crops="crops.jsonl", split="split.json", categories=categories))
+    with patch("facade_change.segmentation.data.load_rgb", side_effect=AssertionError("Metadata opened RGB")):
+        data = PreparedData(directory, splits=("val",))
+    return data.categories, data.metadata
 
 
 class PreparationTests(unittest.TestCase):
@@ -119,6 +144,71 @@ class PreparationTests(unittest.TestCase):
                     self.assertTrue(np.all(arrays["labels"] == 255))
                     self.assertFalse(row["recommended"])
             self.assertEqual(manifest['source_summary']['calibration'], [{'threshold': .5}])
+            self.assertEqual(manifest['category_to_channel'], [
+                {'category_id': 3, 'channel': 0}, {'category_id': 9, 'channel': 1}])
+
+    def test_actual_prepared_data_metadata_channel_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run, snapshot, original, *_ = fixture(base)
+            categories, metadata = prepared_dataset_metadata(base / 'dataset-metadata')
+            self.assertEqual(metadata['category_to_channel'], [
+                {'category_id': 3, 'channel': 0}, {'category_id': 9, 'channel': 1}])
+            def adapter(config, selected, contract):
+                sequences, loader, provenance = original(config, selected, contract)
+                provenance.update(categories=categories,
+                                  category_to_channel=metadata['category_to_channel'],
+                                  prepared_data=metadata)
+                return sequences, loader, provenance
+            manifest = self.prepare(run, snapshot, base / 'prepared', adapter)
+            self.assertEqual(manifest['category_to_channel'], metadata['category_to_channel'])
+            self.assertEqual(manifest['gt_provenance']['prepared_data'], metadata)
+            row = next(row for row in manifest['pairs'] if row['status'] == 'ready')
+            arrays = load_pair(base / 'prepared', row)
+            self.assertEqual(row['positive_pixels'], 9)
+            self.assertEqual(row['changed_channels'], [1])  # Channel 1 remains category 9.
+            self.assertEqual(int(arrays['source_bits'][2, 3]), 3)  # Overlapping labels preserved.
+
+    def test_equivalent_dict_mapping_preserves_schema_and_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run, snapshot, original, *_ = fixture(base)
+            listed = self.prepare(run, snapshot, base / 'listed', original)
+            # Reversed insertion order does not change the channel assignments.
+            mapping = {'9': 1, '3': 0}
+            def adapter(config, selected, contract):
+                sequences, loader, provenance = original(config, selected, contract)
+                provenance['category_to_channel'] = mapping
+                return sequences, loader, provenance
+            mapped = self.prepare(run, snapshot, base / 'mapped', adapter)
+            self.assertEqual(mapped['category_to_channel'], mapping)
+            self.assertIsInstance(mapped['category_to_channel'], dict)
+            self.assertIsInstance(listed['category_to_channel'], list)
+            self.assertEqual(listed['pairs'], mapped['pairs'])
+
+    def test_mismatched_or_duplicate_channel_mapping_is_rejected(self):
+        invalid = [
+            [{'category_id': 3, 'channel': 1}, {'category_id': 9, 'channel': 0}],
+            [{'category_id': 3, 'channel': 0}, {'category_id': 3, 'channel': 0},
+             {'category_id': 9, 'channel': 1}],
+            [{'category_id': 3, 'channel': 0}, {'category_id': 9, 'channel': 0}],
+            [{'category_id': 3, 'channel': 0}],
+            {'3': 1, '9': 0},
+            {'3': 0, '9': 0},
+            {'3': 0, '99': 1},
+            {3: 0, '3': 0, '9': 1},
+        ]
+        for mapping in invalid:
+            with self.subTest(mapping=mapping), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                run, snapshot, original, *_ = fixture(base)
+                def adapter(config, selected, contract):
+                    sequences, loader, provenance = original(config, selected, contract)
+                    provenance['category_to_channel'] = copy.deepcopy(mapping)
+                    return sequences, loader, provenance
+                with self.assertRaises(ValueError):
+                    self.prepare(run, snapshot, base / 'prepared', adapter)
+                self.assertFalse((base / 'prepared' / 'manifest.json').exists())
 
     def test_repeat_is_deterministic_and_cannot_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:

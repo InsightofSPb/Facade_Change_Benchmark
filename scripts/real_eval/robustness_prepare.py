@@ -23,6 +23,28 @@ COLORS = [(230, 70, 70), (55, 150, 225), (240, 180, 40), (110, 190, 70),
           (250, 135, 45), (125, 90, 180), (170, 80, 105), (65, 130, 150)]
 
 
+def _validate_category_mapping(categories, mapping):
+    """Accept PreparedData's record list and legacy dictionaries without reordering channels."""
+    message = "Порядок COCO-категорий не совпадает с каналами битовой маски"
+    if isinstance(mapping, dict):
+        entries = list(mapping.items())
+    elif isinstance(mapping, list):
+        if any(not isinstance(row, dict) or set(row) != {"category_id", "channel"} for row in mapping):
+            raise ValueError("Некорректная запись category_to_channel")
+        entries = [(row["category_id"], row["channel"]) for row in mapping]
+    else:
+        raise ValueError("category_to_channel должен быть списком записей или словарём")
+    normalized = {}
+    for category_id, channel in entries:
+        if (type(category_id) not in (int, str) or type(channel) is not int
+                or str(category_id) in normalized):
+            raise ValueError("Неоднозначное соответствие COCO-категорий и каналов")
+        normalized[str(category_id)] = channel
+    expected = {str(category["id"]): index for index, category in enumerate(categories)}
+    if len(expected) != len(categories) or normalized != expected:
+        raise ValueError(message)
+
+
 def _validate_frame(frame):
     rgb, support, packed = (frame[key] for key in ("rgb", "support", "packed"))
     if (rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3
@@ -225,8 +247,7 @@ def prepare(run_path, snapshot_path, out_path, repo_path=None, boundary_toleranc
     if not 1 <= len(categories) <= 16:
         raise ValueError("Нужно от 1 до 16 категорий COCO")
     category_to_channel = provenance.get("category_to_channel", {str(cat["id"]): i for i, cat in enumerate(categories)})
-    if {str(key): value for key, value in category_to_channel.items()} != {str(cat["id"]): i for i, cat in enumerate(categories)}:
-        raise ValueError("Порядок COCO-категорий не совпадает с каналами битовой маски")
+    _validate_category_mapping(categories, category_to_channel)
     out.mkdir(parents=True)
     for directory in ("pairs", "images"):
         (out / directory).mkdir()
