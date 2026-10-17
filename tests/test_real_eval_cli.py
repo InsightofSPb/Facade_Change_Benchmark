@@ -22,7 +22,7 @@ class RealEvalCLITests(unittest.TestCase):
     def test_robustness_subcommands_from_unrelated_working_directory(self):
         script = Path(__file__).resolve().parents[1] / 'scripts' / 'real_eval' / 'real_robustness.py'
         with tempfile.TemporaryDirectory() as directory:
-            for command in ('prepare', 'run', 'report'):
+            for command in ('prepare', 'review', 'run', 'report'):
                 with self.subTest(command=command):
                     result = subprocess.run([sys.executable, str(script), command, '--help'],
                                             cwd=directory, capture_output=True, text=True, timeout=30)

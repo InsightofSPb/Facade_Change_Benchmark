@@ -22,7 +22,7 @@
 | Выравнивание временных пар | `python -m facade_change batch` | [Геометрия и кропы](docs/2026-10-04_geoscd_and_crop_preparation.md) |
 | Сравнение методов на фиксированных H0/H1 | `python -m facade_change h0h1-benchmark` | [Общий runner](docs/2026-10-04_common_runner.md) |
 | Возобновляемый TRAIN/VAL: обучение MSDZip, семантическая DINO, пары и память | `python -m facade_change temporal-experiment` | [Запуск и восстановление](docs/2026-10-14_temporal_experiment.md) |
-| CPU-галерея реальных пар → ручной выбор → устойчивость восьми методов к освещению | `python scripts/real_eval/real_robustness.py prepare/run/report` | [Просмотр, запуск и метрики](docs/2026-10-17_real_robustness.md) |
+| CPU-галерея реальных пар, фильтры GT → ручной выбор → устойчивость восьми методов к освещению | `python scripts/real_eval/real_robustness.py prepare/review/run/report` | [Просмотр, запуск и метрики](docs/2026-10-17_real_robustness.md) |
 | Реальные GT-метрики, LOFO, классы, сочетания и повторный GeoSCD | `scripts/real_eval/` | [Перенесённые инструменты](docs/2026-10-17_real_eval_tools.md) |
 | Анализ готовых карт и потерь Recall | `python -m data_analysis` | [Анализ результатов](data_analysis/README.md) |
 | Оплаченные H0/H1 и контекст опоры | `python -m facade_change.research` | [Прототипы](docs/2026-10-11_paid_hypotheses_reference_context.md) |

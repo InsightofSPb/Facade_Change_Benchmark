@@ -17,6 +17,9 @@ def main(argv=None):
     prepare.add_argument('--out', required=True, help='Новый каталог галереи')
     prepare.add_argument('--repo', help='Checkout с исходным неизменённым кодом чтения данных')
     prepare.add_argument('--boundary-tolerance', type=int, choices=(0, 2), default=0)
+    review = sub.add_parser('review', help='CPU: статистика, фильтры и классы из уже подготовленных кропов')
+    review.add_argument('--prepared', required=True, help='Готовый каталог prepare с manifest.json')
+    review.add_argument('--out', required=True, help='Новый отдельный каталог просмотра')
     execute = sub.add_parser('run', help='Прогон только по сохранённому выбору из галереи')
     execute.add_argument('--prepared', required=True)
     execute.add_argument('--selection', required=True, help='reviewed_selection.json, скачанный из галереи')
@@ -40,6 +43,9 @@ def main(argv=None):
                          boundary_tolerance=args.boundary_tolerance)
         print(json.dumps({'gallery': str(Path(args.out).resolve() / 'gallery.html'),
                           'candidate_pairs': len(result['pairs']), 'gpu_started': False}, ensure_ascii=False))
+    elif args.command == 'review':
+        from scripts.real_eval.robustness_review import review
+        review(args.prepared, args.out)
     elif args.command == 'run':
         from scripts.real_eval.robustness_run import run
         result = run(args.prepared, args.selection, args.out, methods=args.methods,
