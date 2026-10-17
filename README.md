@@ -25,6 +25,7 @@
 | CPU-галерея реальных пар, фильтры GT → ручной выбор → устойчивость восьми методов к освещению | `python scripts/real_eval/real_robustness.py prepare/review/run/report` | [Просмотр, запуск и метрики](docs/2026-10-17_real_robustness.md) |
 | Аудит TRAIN/VAL/TEST → изменяющиеся фасады → пилот скорости → PREVIOUS/EARLIEST/HISTORY | `python scripts/real_eval/real_temporal_night.py audit/prepare/pilot/run/report` | [Ночная очередь и дальнейший план](docs/2026-10-17_real_temporal_night.md) |
 | Реальные GT-метрики, LOFO, классы, сочетания и повторный GeoSCD | `scripts/real_eval/` | [Перенесённые инструменты](docs/2026-10-17_real_eval_tools.md) |
+| Общий итоговый бюджет FPR для AND/OR и компонентов на real VAL | `python scripts/real_eval/real_final_fpr.py --metrics-run ... --out ...` | [Правила сравнения и ограничения](docs/2026-10-18_final_fpr_comparisons.md) |
 | Анализ готовых карт и потерь Recall | `python -m data_analysis` | [Анализ результатов](data_analysis/README.md) |
 | Оплаченные H0/H1 и контекст опоры | `python -m facade_change.research` | [Прототипы](docs/2026-10-11_paid_hypotheses_reference_context.md) |
 | План очистки локальных результатов | `python scripts/audit_environment.py --cleanup-plan` | Раздел ниже |
