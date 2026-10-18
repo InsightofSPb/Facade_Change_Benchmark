@@ -26,9 +26,10 @@ from .night_run import _caches
 from .real_gt_metrics import calibration
 from .robustness_common import atomic_json, digest, read_json, sha256
 from .robustness_run import (NATIVE_METHODS, _event, _file_hashes, _load_output,
-                             _method_contract, _snapshot_gpu, _verify_metadata,
+                             _snapshot_gpu, _verify_metadata,
                              model_identity, payload_sha256, validate_output)
 from .semantic_cache import Cache, hash_array
+from .semantic_contracts import resolve_change_contract
 from .semantic_geometry import regions, semantic_prediction, stitch, target_union
 from .semantic_remote import SemanticPool, preflight_remote
 from .semantic_report import change_metrics, render_report, segmentation_metrics
@@ -104,11 +105,11 @@ def binary_change(native, threshold, support):
     return predicted & support
 
 
-def change_contract(method, entry, manifest, device):
+def change_contract(method, entry, manifest, device, *, reuse_runs=(), prepared=None):
     if method not in ALL_METHODS:
         raise ValueError(f'Unregistered change method {method!r}; extend facade_change.methods.registry first')
     if 'options' not in entry:
-        return _method_contract(method, manifest, Path(manifest['source_run']), device)
+        return resolve_change_contract(method, manifest, device, reuse_runs=reuse_runs, prepared=prepared)
     # Explicit extension path for a registry method absent from the source run.
     # Every learned method must supply its existing provenance, not just a name.
     options = copy.deepcopy(entry['options'])
@@ -228,20 +229,24 @@ class Runner:
         return self.record(context, status='failed', error=str(error))
 
     def preflight(self):
-        # Verify selected prepared RGB/support/GT artifacts once before any model.
-        for sequence in self.manifest['sequences']:
-            if sequence['split'] in self.splits:
-                for frame in sequence['frames']:
-                    night_common.load_frame(self.prepared, frame)
+        # inventory_full_cache validates every selected RGB/support/GT artifact
+        # before GPU workers start, without a duplicate decode of the dataset.
         for method, entry in self.methods.items():
             try:
-                self.contracts[method] = change_contract(method, entry, self.manifest, self.config.get('device'))
+                print(f'Проверка CD-метода {method}: происхождение и готовые веса', flush=True)
+                self.contracts[method] = change_contract(
+                    method, entry, self.manifest, self.config.get('device'),
+                    reuse_runs=self.config.get('reuse_runs', []), prepared=self.prepared)
                 for mode in self.modes:
                     self.thresholds[method, mode] = fixed_threshold(self.manifest, method, entry, mode)
+                origin = self.contracts[method].get('provenance_origin', {})
+                if origin.get('kind') == 'declared_reuse_run':
+                    print(f'  {method}: происхождение восстановлено из {origin["run"]}', flush=True)
             except Exception as exc:
                 self.blocked['change:' + method] = str(exc)
         for name, cfg in self.segmenters.items():
             try:
+                print(f'Проверка сегментатора {name} (CPU, локальные файлы)', flush=True)
                 adapter = {k: v for k, v in cfg.items() if k not in ('variants', 'name', 'description', 'confidence')}
                 result = preflight_remote(adapter)
                 self.preflights[name] = result
@@ -269,7 +274,11 @@ class Runner:
         self.event('preflight', blocked=self.blocked)
         for name, error in self.blocked.items():
             print(f'BLOCKED {name}: {error}', flush=True)
+        if self.routes and all('change:' + name in self.blocked for name in self.methods):
+            print('Все CD-методы заблокированы: маршруты не запускаются. См. preflight.json.', flush=True)
+            return False
         self.inventory_full_cache()
+        return True
 
     @staticmethod
     def timing_group(stage, method=None, segmenter=None, variant=None):
@@ -315,6 +324,7 @@ class Runner:
         """
         print('Verifying full-image cache coverage (CPU only)', flush=True)
         for split in self.splits:
+            print(f'{split.upper()}: проверка готовых карт в кэше', flush=True)
             for sequence, frame, ref, mode in selected_pairs(self.manifest, split, self.modes):
                 reference, source = self.frame(sequence, ref), self.frame(sequence, frame)
                 inputs = dict(reference=reference['rgb'], source=source['rgb'], support=reference['support'] & source['support'])
@@ -322,13 +332,14 @@ class Runner:
                     if 'change:' + method in self.blocked:
                         continue
                     context = self.context(sequence, frame, ref, mode, method=method)
-                    saved = self.cache.get(self.change_spec(method, inputs))
+                    saved = self.cache.inspect(self.change_spec(method, inputs))
                     origin = 'cache'
                     if saved is None:
-                        saved = self.import_change(method, inputs, context, (method, mode, sequence['sequence_id'], frame))
+                        imported = self.import_change(method, inputs, context, (method, mode, sequence['sequence_id'], frame))
+                        saved = imported[1] if imported is not None else None
                         origin = 'imported'
                     if saved is not None:
-                        self.observe('change_full', saved[1], context, origin, inputs['support'].shape, inventory=True)
+                        self.observe('change_full', saved, context, origin, inputs['support'].shape, inventory=True)
             for sequence in self.manifest['sequences']:
                 if sequence['split'] != split:
                     continue
@@ -338,9 +349,9 @@ class Runner:
                         if 'segment:' + name in self.blocked:
                             continue
                         for variant in {vocabulary_key(v) for v in variants(cfg)}:
-                            saved = self.cache.get(self.segment_spec(name, variant, rgb))
+                            saved = self.cache.inspect(self.segment_spec(name, variant, rgb))
                             if saved is not None:
-                                self.observe('segment_full', saved[1], self.context(sequence, frame,
+                                self.observe('segment_full', saved, self.context(sequence, frame,
                                              segmenter=name, native_variant=variant), 'cache', rgb.shape[:2], inventory=True)
             self.frames.clear()
 
@@ -491,6 +502,11 @@ class Runner:
                 except Exception as exc:
                     self.fail(context, exc)
         self.cd_pool.release()
+        if self.routes and not baseline:
+            self.blocked['routes:' + split] = 'Every baseline CD task failed; no requested route can run'
+            self.frames.clear()
+            print(f'{split.upper()}: ни одна CD-пара не рассчитана; очередь остановлена до сегментации.', flush=True)
+            return False
         frames = {(s['sequence_id'], f): s for s, frame, ref, _ in pairs for f in (ref, frame)}
         for name, cfg in self.segmenters.items():
             for vocab_key in sorted({vocabulary_key(v) for v in variants(cfg)}):
@@ -499,7 +515,7 @@ class Runner:
                 confidence = float(cfg.get('confidence', self.confidence))
                 full = {}
                 print(f'{split.upper()}: segmenter={name}, vocabulary={vocab_key}', flush=True)
-                for (seqid, frame), sequence in frames.items():
+                for frame_number, ((seqid, frame), sequence) in enumerate(frames.items(), 1):
                     context = self.context(sequence, frame, kind='segmentation', method=None,
                                            segmenter=name, variant=vocab_key, route='baseline')
                     try:
@@ -516,6 +532,9 @@ class Runner:
                         for variant in selected_variants:
                             self.fail({**context, 'variant': variant}, exc)
                         self.blocked['segment:' + name] = str(exc)
+                    if frame_number == 1 or frame_number % 5 == 0 or frame_number == len(frames):
+                        print(f'  {name}/{vocab_key}: снимки {frame_number}/{len(frames)}', flush=True)
+                print(f'  {name}/{vocab_key}: оценка маршрутов для {len(pairs)} пар', flush=True)
                 for sequence, frame, ref, mode in pairs:
                     if (sequence['sequence_id'], frame) not in full or (sequence['sequence_id'], ref) not in full:
                         for variant in selected_variants:
@@ -527,11 +546,26 @@ class Runner:
                         continue
                     reference, source = self.frame(sequence, ref), self.frame(sequence, frame)
                     support = reference['support'] & source['support']
-                    # Read cached full semantic outputs without re-entering the worker.
+                    # All requested baselines may have failed at runtime. Do not
+                    # decompress semantic archives just to report those failures.
+                    if not any((method, mode, sequence['sequence_id'], frame) in baseline for method in self.methods):
+                        for variant in selected_variants:
+                            for method in self.methods:
+                                for route in self.routes:
+                                    self.fail(self.context(sequence, frame, ref, mode, kind='change', method=method,
+                                                           segmenter=name, variant=variant, route=route),
+                                              'Baseline change unavailable')
+                        continue
+                    # Only score maps are needed here. SAM instance masks remain
+                    # saved for diagnostics and are not decompressed for each pair.
                     full_values = {}
                     for index in (ref, frame):
                         saved = full[sequence['sequence_id'], index]
-                        arrays, checked = self.cache.get(saved['spec'])
+                        needed = ['scores'] + (['extra__raw_scores'] if 'extra__raw_scores' in saved['arrays'] else [])
+                        cached = self.cache.get(saved['spec'], names=needed)
+                        if cached is None:
+                            raise ValueError('Full semantic cache changed during route evaluation; resume to recompute')
+                        arrays, checked = cached
                         meta = checked['metadata']
                         native = dict(scores=arrays['scores'], class_names=meta['class_names'], score_kind=meta['score_kind'],
                                       metadata=meta['method_metadata'],
@@ -686,7 +720,7 @@ class Runner:
         self.event('split_completed', split=split)
         self.write_reports()
 
-    def write_reports(self, final=False):
+    def write_reports(self, final=False, status=None):
         atomic_json(self.out / 'timing_observations.json', self.observations)
         workload = self.workload()
         # Samples imported from another run have no measured timing. Count only
@@ -752,9 +786,9 @@ class Runner:
                 writer.writerows(rows)
         atomic_json(self.out / 'run.json', dict(schema_version=1, kind='semantic_routes', schema=SCHEMA,
                     config_revision=self.revision, smoke=self.smoke, config=self.config,
-                    status=('completed_with_failures' if failures else 'completed') if final else 'running',
+                    status=status or (('completed_with_failures' if failures else 'completed') if final else 'running'),
                     records=len(self.records), failed=failures,
-                    cache_root=str(self.cache.root), fixed_settings=True))
+                    blocked=self.blocked, cache_root=str(self.cache.root), fixed_settings=True))
 
     def expected_coverage(self):
         keys = ('kind', 'split', 'method', 'segmenter', 'variant', 'route', 'mode')
@@ -803,10 +837,21 @@ class Runner:
             self.event('request_started', revision=self.revision, smoke=self.smoke, splits=self.splits)
             _snapshot_gpu(self.out)
             try:
-                self.preflight()
+                if not self.preflight():
+                    self.write_reports(status='blocked')
+                    self.event('request_blocked', blocked=self.blocked)
+                    return 2
                 for split in self.splits:
-                    self.run_split(split)
+                    if self.run_split(split) is False:
+                        self.write_reports(status='blocked')
+                        self.event('request_blocked', blocked=self.blocked)
+                        return 2
                 self.write_reports(final=True)
+            except KeyboardInterrupt:
+                self.write_reports(status='interrupted')
+                self.event('request_interrupted')
+                print(f'Прервано. Готовые результаты сохранены: {self.out}. Продолжение: --resume.', flush=True)
+                return 130
             finally:
                 self.sem_pool.release()
                 self.cd_pool.release()
@@ -818,8 +863,12 @@ class Runner:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
-    from .semantic_config import add_configure_parser, configure
+    from .semantic_config import add_configure_parser, configure, repair_config
     add_configure_parser(sub)
+    repair = sub.add_parser('repair-config', help='Обновить только пути stock-моделей, сохранив остальные настройки')
+    repair.add_argument('--config', required=True)
+    repair.add_argument('--out', required=True)
+    repair.add_argument('--stock-root')
     for name in ('smoke', 'run'):
         child = sub.add_parser(name)
         child.add_argument('--config', required=True)
@@ -837,6 +886,9 @@ def main(argv=None):
     if args.command == 'configure':
         configure(args)
         return 0
+    if args.command == 'repair-config':
+        repair_config(args.config, args.out, stock_root=args.stock_root)
+        return 0
     config = read_json(Path(args.config).expanduser().resolve())
     if args.splits:
         config['splits'] = args.splits
@@ -848,8 +900,10 @@ def main(argv=None):
             parser.error(f'Unknown segmenters: {sorted(unknown)}')
         config['segmenters'] = {name: config['segmenters'][name] for name in args.segmenters}
     if args.command == 'run' and args.smoke_first:
-        Runner(config, Path(args.out) / 'smoke', smoke=True, resume=args.resume,
-               cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split).run()
+        smoke_status = Runner(config, Path(args.out) / 'smoke', smoke=True, resume=args.resume,
+                              cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split).run()
+        if smoke_status in (2, 130):
+            return smoke_status
     return Runner(config, args.out, smoke=args.command == 'smoke', resume=args.resume,
                   cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split).run()
 

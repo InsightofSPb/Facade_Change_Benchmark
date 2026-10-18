@@ -1,6 +1,7 @@
 """CPU-only configuration of the existing semantic/change inference assets."""
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -50,6 +51,139 @@ LEGACY_CHECKPOINTS = {
     ),
 }
 
+
+
+# Known sibling checkouts only; no recursive home-directory search or cloning.
+STOCK_SIBLING_NAMES = ("LPOSS_pr58_cuda_20260820", "Compress_to_prevent")
+STOCK_REQUIRED_FILES = (
+    "ovs_heritage/__init__.py",
+    "ovs_heritage/stock_features.py",
+    "ovs_heritage/stock_lposs.py",
+    "ovs_heritage/vocabulary.py",
+    "ovs_heritage/ontology.py",
+    "ovs_heritage/projection.py",
+    "ovs_heritage/scoring.py",
+    "segmentation/evaluation/lposs_eval.py",
+)
+
+
+def inspect_stock_root(root, model_config="configs/stock_lposs.yaml"):
+    """Check the local stock configuration and source files, without importing them."""
+    root = Path(root).expanduser().resolve()
+    config = Path(model_config).expanduser()
+    config = (config if config.is_absolute() else root / config).resolve()
+    expected = [("model_config", config)] + [("stock_source", root / name) for name in STOCK_REQUIRED_FILES]
+    missing = [{"field": field, "path": str(path)} for field, path in expected if not path.is_file()]
+    return {"root": str(root), "model_config": str(config), "missing": missing,
+            "status": "files_present_unverified" if not missing else "missing_stock_files",
+            "runtime_and_weights_validated": False}
+
+
+def resolve_stock_root(lposs_root, explicit=None, model_config="configs/stock_lposs.yaml"):
+    """Resolve only an existing checkout; an explicit root always takes precedence.
+
+    A missing/ambiguous automatic lookup retains the declared root with precise
+    diagnostics. It never claims that a historical sibling currently exists.
+    """
+    declared = Path(lposs_root).expanduser().resolve()
+    if explicit is not None:
+        selected = Path(explicit).expanduser().resolve()
+        inspected = inspect_stock_root(selected, model_config)
+        return selected, {"explicit": True, "status": "explicit", "selected_root": str(selected),
+                          "candidates": [inspected]}
+    inspected = inspect_stock_root(declared, model_config)
+    if not inspected["missing"]:
+        return declared, {"explicit": False, "status": "declared_root_present", "selected_root": str(declared),
+                          "candidates": [inspected]}
+    candidates = [inspected]
+    seen = {str(declared)}
+    for name in STOCK_SIBLING_NAMES:
+        candidate = (declared.parent / name).resolve()
+        if str(candidate) not in seen:
+            seen.add(str(candidate))
+            candidates.append(inspect_stock_root(candidate, model_config))
+    usable = [candidate for candidate in candidates if not candidate["missing"]]
+    if len(usable) == 1:
+        selected = Path(usable[0]["root"])
+        return selected, {"explicit": False, "status": "existing_sibling_discovered", "selected_root": str(selected),
+                          "candidates": candidates}
+    return declared, {"explicit": False, "status": "ambiguous" if usable else "missing",
+                      "selected_root": None, "retained_root": str(declared), "candidates": candidates,
+                      "note": "Укажите --stock-root: подходящий checkout не выбран однозначно."}
+
+
+def _asset_diagnostics(segmenters):
+    result = {}
+    for name, spec in segmenters.items():
+        missing = []
+        for key in ("worker_python", "source_root", "checkpoint", "training_run", "current_manifest"):
+            if key in spec and (not spec[key] or not Path(spec[key]).exists()):
+                missing.append({"field": key, "path": spec[key]})
+        if spec.get("kind") in {"stock_maskclip", "stock_lposs"} and spec.get("source_root"):
+            missing.extend(inspect_stock_root(spec["source_root"], spec.get("model_config", "configs/stock_lposs.yaml"))["missing"])
+        result[name] = {"status": "missing_declared_assets" if missing else "paths_present_unverified",
+                        "missing": missing, "runtime_and_weights_validated": False}
+    return result
+
+
+def repair_config(config_path, out, stock_root=None):
+    """Copy a configuration, repairing only verified stock checkout references.
+
+    Custom settings, trained checkpoint roots, vocabularies and cache roots are
+    retained verbatim. The source config is never overwritten. Explicit roots
+    recorded by configure remain explicit; a new stock_root argument is an
+    intentional override. Legacy configs are auto-repaired only when the stock
+    root equals the trained LPOSS root, the earlier configure default.
+    """
+    source = Path(config_path).expanduser().resolve(strict=True)
+    destination = Path(out).expanduser().resolve()
+    if destination == source or destination.exists():
+        raise FileExistsError(f"Выберите новое имя конфигурации: {destination}")
+    config = json.loads(source.read_text(encoding="utf-8"))
+    updated = copy.deepcopy(config)
+    segmenters = updated.get("segmenters", {})
+    if not isinstance(segmenters, dict):
+        raise ValueError("Конфигурация не содержит словарь segmenters")
+    legacy_roots = {str(Path(spec["source_root"]).expanduser().resolve()) for spec in segmenters.values()
+                    if spec.get("kind") == "finetuned_maskclip" and spec.get("source_root")}
+    prior = updated.get("source", {}).get("stock_root_resolution", {})
+    repairs = []
+    for name, spec in segmenters.items():
+        if spec.get("kind") not in {"stock_maskclip", "stock_lposs"}:
+            continue
+        original = spec.get("source_root")
+        if not original:
+            repairs.append({"segmenter": name, "status": "missing_source_root"})
+            continue
+        model_config = spec.get("model_config", "configs/stock_lposs.yaml")
+        current = Path(original).expanduser().resolve()
+        inspection = inspect_stock_root(current, model_config)
+        if stock_root is not None:
+            selected, resolution = resolve_stock_root(current, stock_root, model_config)
+        elif prior.get("explicit"):
+            selected, resolution = current, {"status": "explicit_root_preserved", "explicit": True, "candidates": [inspection]}
+        elif not inspection["missing"]:
+            selected, resolution = current, {"status": "valid_root_preserved", "candidates": [inspection]}
+        elif str(current) not in legacy_roots:
+            selected, resolution = current, {"status": "custom_root_preserved", "candidates": [inspection]}
+        else:
+            selected, resolution = resolve_stock_root(current, model_config=model_config)
+        if selected != current:
+            spec["source_root"] = str(selected)
+        repairs.append({"segmenter": name, "old_root": original, "new_root": spec["source_root"], **resolution})
+    updated["configure_diagnostics"] = _asset_diagnostics(segmenters)
+    updated.setdefault("source", {})["stock_root_repair"] = {
+        "source_config": str(source), "source_config_sha256": sha256(source), "models": repairs,
+    }
+    if stock_root is not None:
+        updated["source"]["stock_root_resolution"] = {"explicit": True, "status": "explicit_repair",
+                                                       "selected_root": str(Path(stock_root).expanduser().resolve())}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(destination, updated)
+    print(f"Конфигурация: {destination}")
+    for row in repairs:
+        print(f"{row['segmenter']}: {row['status']}; {row.get('new_root', '')}")
+    return updated
 
 def add_configure_parser(subparsers):
     parser = subparsers.add_parser("configure", help="Собрать конфигурацию без загрузки моделей")
@@ -187,7 +321,7 @@ def configure(args):
         raise FileExistsError(f"Конфигурация уже существует, выберите новое имя: {out}")
     repo = Path(__file__).resolve().parents[2]
     lposs_root = Path(args.lposs_root).expanduser().resolve()
-    stock_root = Path(args.stock_root or lposs_root).expanduser().resolve()
+    stock_root, stock_resolution = resolve_stock_root(lposs_root, args.stock_root)
     lposs_python = _lposs_python(args.lposs_python, lposs_root)
     device = args.device
     semantic_options = _semantic_options(manifest)
@@ -218,14 +352,7 @@ def configure(args):
                            "confidence_threshold": .25, "mask_threshold": .5, "precision": "bfloat16",
                            "variants": variants.copy()}
     domain, expanded, vocabulary_origin = _vocabularies(manifest["categories"], args.expanded_vocabulary)
-    diagnostics = {}
-    for name, spec in segmenters.items():
-        missing = []
-        for key in ("worker_python", "source_root", "checkpoint", "training_run", "current_manifest"):
-            if key in spec and (not spec[key] or not Path(spec[key]).exists()):
-                missing.append({"field": key, "path": spec[key]})
-        diagnostics[name] = {"status": "missing_declared_assets" if missing else "paths_present_unverified",
-                             "missing": missing, "runtime_and_weights_validated": False}
+    diagnostics = _asset_diagnostics(segmenters)
     reuse = args.reuse_run or []
     if isinstance(reuse, str):
         reuse = [reuse]
@@ -242,13 +369,15 @@ def configure(args):
         "cache_root": str(prepared.parent / "semantic-cache-v1"),
         "configure_diagnostics": diagnostics,
         "source": {"prepared_manifest_sha256": sha256(prepared / "manifest.json"),
-                   "source_run": manifest["source_run"], "model_selection": "existing frozen checkpoints; no training"},
+                   "source_run": manifest["source_run"], "model_selection": "existing frozen checkpoints; no training",
+                   "stock_root_resolution": stock_resolution},
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(out, config)
     unavailable = [name for name, value in diagnostics.items() if value["missing"]]
     print(f"Конфигурация: {out}")
     print(f"Сегментаторы: {', '.join(segmenters)}; словарь: {vocabulary_origin['name']}")
+    print(f"Stock checkout: {stock_root} ({stock_resolution['status']})")
     if unavailable:
         print(f"Нужна проверка указанных путей: {', '.join(unavailable)}. Модели сохранены в конфигурации.")
     return config

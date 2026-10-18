@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 
 from scripts.real_eval.semantic_config import (
-    CONTEXT_VERSION, LEGACY_CHECKPOINTS, _semantic_options, _vocabularies,
-    add_configure_parser, configure,
+    CONTEXT_VERSION, LEGACY_CHECKPOINTS, STOCK_REQUIRED_FILES, _semantic_options, _vocabularies,
+    add_configure_parser, configure, inspect_stock_root, repair_config, resolve_stock_root,
 )
 from scripts.real_eval.robustness_common import atomic_json, sha256
 
@@ -78,6 +78,129 @@ class SemanticConfigTests(unittest.TestCase):
             self.assertEqual(result["reuse_runs"], [str(root / "old-run")])
             with self.assertRaises(FileExistsError):
                 configure(args)
+
+    def stock_checkout(self, root):
+        for relative in (*STOCK_REQUIRED_FILES, "configs/stock_lposs.yaml"):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# local fixture, no imports or model execution\n")
+        return root
+
+    def test_stock_auto_selects_verified_sibling_and_keeps_trained_assets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            stock = self.stock_checkout(root / "LPOSS_pr58_cuda_20260820")
+            args = self.arguments(root, prepared)
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = configure(args)
+            self.assertEqual(result["source"]["stock_root_resolution"]["status"], "existing_sibling_discovered")
+            for name in ("maskclip_stock", "lposs_stock"):
+                self.assertEqual(result["segmenters"][name]["source_root"], str(stock))
+                self.assertEqual(result["configure_diagnostics"][name]["missing"], [])
+            for name, relative in LEGACY_CHECKPOINTS.items():
+                self.assertEqual(result["segmenters"][name]["source_root"], str(root / "missing-lposs"))
+                self.assertEqual(result["segmenters"][name]["checkpoint"], str(root / "missing-lposs" / relative))
+
+    def test_explicit_missing_stock_root_is_not_replaced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.stock_checkout(root / "Compress_to_prevent")
+            chosen, resolution = resolve_stock_root(root / "LPOSS", root / "explicit-missing")
+            self.assertEqual(chosen, root / "explicit-missing")
+            self.assertTrue(resolution["explicit"])
+            self.assertTrue(resolution["candidates"][0]["missing"])
+
+    def test_declared_valid_root_precedes_siblings_and_ambiguity_is_explicit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            declared = self.stock_checkout(root / "LPOSS")
+            self.stock_checkout(root / "LPOSS_pr58_cuda_20260820")
+            self.stock_checkout(root / "Compress_to_prevent")
+            chosen, resolution = resolve_stock_root(declared)
+            self.assertEqual(chosen, declared)
+            self.assertEqual(resolution["status"], "declared_root_present")
+            (declared / "configs/stock_lposs.yaml").unlink()
+            chosen, resolution = resolve_stock_root(declared)
+            self.assertEqual(chosen, declared)
+            self.assertEqual(resolution["status"], "ambiguous")
+            self.assertIsNone(resolution["selected_root"])
+
+    def test_discovery_requires_source_and_configuration_and_does_not_recurse(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            candidate = root / "Compress_to_prevent"
+            (candidate / "configs").mkdir(parents=True)
+            (candidate / "configs/stock_lposs.yaml").write_text("clip: {}")
+            self.stock_checkout(root / "unrelated/nested/LPOSS_pr58_cuda_20260820")
+            chosen, resolution = resolve_stock_root(root / "LPOSS")
+            self.assertEqual(resolution["status"], "missing")
+            self.assertEqual(chosen, root / "LPOSS")
+            self.assertEqual(len(resolution["candidates"]), 3)
+            missing = inspect_stock_root(candidate)["missing"]
+            self.assertTrue(any(row["path"].endswith("stock_features.py") for row in missing))
+            self.assertFalse(any(row["field"] == "model_config" for row in missing))
+
+    def test_config_diagnostics_show_missing_stock_model_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = configure(self.arguments(root, prepared))
+            missing = result["configure_diagnostics"]["maskclip_stock"]["missing"]
+            self.assertIn({"field": "model_config", "path": str(root / "missing-lposs/configs/stock_lposs.yaml")}, missing)
+            self.assertEqual(result["source"]["stock_root_resolution"]["status"], "missing")
+
+    def test_repair_preserves_custom_settings_and_source_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                config = configure(self.arguments(root, prepared))
+            config["segmenters"]["maskclip_stock"]["clip_checkpoint"] = "/custom/clip.bin"
+            config["segmenters"]["maskclip_stock"]["confidence"] = .37
+            config["roi"]["max_regions"] = 3
+            config["change_methods"]["msdzip_abs"] = {"threshold": .123}
+            config["vocabularies"]["domain"][0]["prompts"] = ["my exact prompt"]
+            source = root / "config.json"
+            atomic_json(source, config)
+            before = source.read_bytes()
+            stock = self.stock_checkout(root / "Compress_to_prevent")
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = repair_config(source, root / "repaired.json")
+            self.assertEqual(source.read_bytes(), before)
+            self.assertEqual(result["segmenters"]["maskclip_stock"]["source_root"], str(stock))
+            for name, spec in config["segmenters"].items():
+                expected = dict(spec)
+                if name in {"maskclip_stock", "lposs_stock"}:
+                    expected["source_root"] = str(stock)
+                self.assertEqual(result["segmenters"][name], expected)
+            for key in ("roi", "change_methods", "vocabularies", "cache_root", "splits"):
+                self.assertEqual(result[key], config[key])
+            with self.assertRaises(FileExistsError):
+                repair_config(source, source)
+            with self.assertRaises(FileExistsError):
+                repair_config(source, root / "repaired.json")
+
+    def test_repair_preserves_explicit_and_custom_stock_roots(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                configure(self.arguments(root, prepared, "--stock-root", str(root / "explicit")))
+            stock = self.stock_checkout(root / "Compress_to_prevent")
+            with contextlib.redirect_stdout(io.StringIO()):
+                retained = repair_config(root / "config.json", root / "kept.json")
+                changed = repair_config(root / "config.json", root / "overridden.json", stock_root=stock)
+            self.assertEqual(retained["segmenters"]["maskclip_stock"]["source_root"], str(root / "explicit"))
+            self.assertEqual(changed["segmenters"]["maskclip_stock"]["source_root"], str(stock))
+            self.assertTrue(changed["source"]["stock_root_resolution"]["explicit"])
+            old = json.loads((root / "config.json").read_text())
+            old["source"].pop("stock_root_resolution")
+            atomic_json(root / "legacy-custom.json", old)
+            with contextlib.redirect_stdout(io.StringIO()):
+                preserved = repair_config(root / "legacy-custom.json", root / "legacy-kept.json")
+            self.assertEqual(preserved["source"]["stock_root_repair"]["models"][0]["status"], "custom_root_preserved")
 
     def test_source_records_recover_missing_options_and_conflicts_fail(self):
         manifest = {"source_run": "/nonexistent/source", "source_config": {"method_options": {

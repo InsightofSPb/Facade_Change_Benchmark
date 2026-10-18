@@ -160,6 +160,66 @@ class SemanticRoutesIntegrationTests(unittest.TestCase):
         self.assertTrue(all(o['source'] == 'cache' for o in updated.observations if o['stage'] == 'change_full'))
         self.assertTrue(all(o['source'] == 'measured' for o in updated.observations if o['stage'] == 'segment_full'))
 
+    def test_all_change_methods_blocked_stops_before_inference_and_full_run(self):
+        config_path = self.root / 'config.json'
+        atomic_json(config_path, self.config)
+        output = self.root / 'blocked'
+        with patch.object(routes, 'change_contract', side_effect=ValueError('missing provenance')), \
+                redirect_stdout(io.StringIO()):
+            result = routes.main(['run', '--config', str(config_path), '--out', str(output),
+                                  '--smoke-first', '--resume'])
+        self.assertEqual(result, 2)
+        self.assertEqual(TestOnlySegmenterPool.calls, [])
+        self.assertFalse((output / 'run.json').exists())
+        smoke = read_json(output / 'smoke' / 'run.json')
+        self.assertEqual(smoke['status'], 'blocked')
+        self.assertIn('change:rgb_diff', smoke['blocked'])
+        coverage = read_json(output / 'smoke' / 'coverage_matrix.json')
+        self.assertTrue(any(row['not_attempted'] for row in coverage))
+
+    def test_threshold_failure_is_blocked_even_with_resolved_contract(self):
+        with patch.object(routes, 'fixed_threshold', side_effect=ValueError('no threshold')), \
+                redirect_stdout(io.StringIO()):
+            runner = routes.Runner(self.config, self.root / 'threshold-blocked', smoke=True)
+            self.assertEqual(runner.run(), 2)
+        self.assertIn('rgb_diff', runner.contracts)
+        self.assertEqual(TestOnlySegmenterPool.calls, [])
+
+    def test_full_pair_reads_request_only_scores(self):
+        original_get = routes.Cache.get
+        requested = []
+
+        def tracked_get(cache, spec, **kwargs):
+            if kwargs.get('names') is not None:
+                requested.append(kwargs['names'])
+            return original_get(cache, spec, **kwargs)
+
+        with patch.object(routes.Cache, 'get', tracked_get):
+            self.run_queue('selective', smoke=True)
+        self.assertTrue(requested)
+        self.assertTrue(all(names == ['scores'] for names in requested))
+
+    def test_every_runtime_change_failure_stops_before_segmentation(self):
+        with patch.object(routes.Runner, 'change', side_effect=RuntimeError('model cannot load')), \
+                redirect_stdout(io.StringIO()):
+            runner = routes.Runner(self.config, self.root / 'runtime-blocked', smoke=True)
+            self.assertEqual(runner.run(), 2)
+        self.assertTrue(runner.records)
+        self.assertTrue(all(row['status'] == 'failed' for row in runner.records))
+        self.assertEqual(TestOnlySegmenterPool.calls, [])
+        self.assertEqual(read_json(runner.out / 'run.json')['status'], 'blocked')
+
+    def test_interrupt_records_state_without_starting_full_queue(self):
+        config_path = self.root / 'interrupt-config.json'
+        atomic_json(config_path, self.config)
+        output = self.root / 'interrupt'
+        with patch.object(routes.Runner, 'run_split', side_effect=KeyboardInterrupt), \
+                redirect_stdout(io.StringIO()):
+            result = routes.main(['run', '--config', str(config_path), '--out', str(output), '--smoke-first'])
+        self.assertEqual(result, 130)
+        self.assertEqual(read_json(output / 'smoke' / 'run.json')['status'], 'interrupted')
+        self.assertFalse((output / 'run.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

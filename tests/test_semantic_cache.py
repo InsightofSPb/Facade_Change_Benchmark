@@ -1,11 +1,13 @@
 import tempfile
 import unittest
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 
+from scripts.real_eval import semantic_cache
 from scripts.real_eval.semantic_cache import Cache, hash_array
 from scripts.real_eval.robustness_common import atomic_json, atomic_npz
 
@@ -121,6 +123,117 @@ class SemanticCacheTest(unittest.TestCase):
         self.assertEqual(hash_array(array), hash_array(np.asfortranarray(array)))
         self.assertNotEqual(hash_array(array), hash_array(array.reshape(4, 3)))
         self.assertNotEqual(hash_array(array), hash_array(array.astype(np.uint16)))
+
+    def test_verified_entry_reuses_hashes_and_arrays_without_exposing_mutable_memo(self):
+        self.cache.put(self.spec, self.arrays)
+        cache = Cache(self.temporary.name)
+        with mock.patch.object(semantic_cache, "sha256", wraps=semantic_cache.sha256) as file_hash, \
+                mock.patch.object(semantic_cache, "_descriptions", wraps=semantic_cache._descriptions) as hashes, \
+                mock.patch.object(semantic_cache.np, "load", wraps=np.load) as decode:
+            arrays, record = cache.get(self.spec)
+            arrays["scores"].fill(-999)
+            record["spec"]["model"]["name"] = "mutated-return-value"
+            second, metadata = cache.get(self.spec)
+            np.testing.assert_array_equal(second["scores"], self.arrays["scores"])
+            self.assertEqual(metadata["spec"], self.spec)
+            self.assertEqual(cache.inspect(self.spec), metadata)
+            cache.put(self.spec, {"scores": np.zeros((1,), np.float32)})
+            self.assertEqual(file_hash.call_count, 1)
+            self.assertEqual(hashes.call_count, 1)
+            self.assertEqual(decode.call_count, 1)
+
+    def test_large_payload_not_retained_but_small_subset_is_reused(self):
+        arrays = {"scores": np.arange(4, dtype=np.float32).reshape(1, 2, 2),
+                  "extra__instance_masks": np.ones((100,), np.uint8)}
+        self.cache.put(self.spec, arrays)
+        cache = Cache(self.temporary.name, max_memory_bytes=64)
+        cache.get(self.spec)
+        self.assertEqual(cache.memory_bytes, 0)
+        original_load = np.load
+        loaded_names = []
+
+        class TracedArchive:
+            def __init__(self, path, **kwargs):
+                self.archive = original_load(path, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.archive.close()
+
+            def __getitem__(self, name):
+                loaded_names.append(name)
+                return self.archive[name]
+
+        with mock.patch.object(semantic_cache.np, "load", side_effect=TracedArchive) as decode, \
+                mock.patch.object(semantic_cache, "sha256", wraps=semantic_cache.sha256) as file_hash:
+            subset, _ = cache.get(self.spec, names=["scores"])
+            self.assertEqual(set(subset), {"scores"})
+            cache.get(self.spec, names=["scores"])
+            cache.inspect(self.spec)
+            self.assertEqual(loaded_names, ["scores"])
+            self.assertEqual(decode.call_count, 1)
+            self.assertEqual(file_hash.call_count, 0)
+        self.assertEqual(cache.memory_bytes, arrays["scores"].nbytes)
+        for index in range(6):
+            spec = {**self.spec, "new_image": index}
+            cache.put(spec, {"scores": arrays["scores"]})
+            cache.get(spec)
+            self.assertLessEqual(cache.memory_bytes, 64)
+
+    def test_new_commit_is_verified_without_reloading_large_instance_payload(self):
+        arrays = {"scores": np.arange(4, dtype=np.float32).reshape(1, 2, 2),
+                  "extra__instance_masks": np.ones((100,), np.uint8)}
+        cache = Cache(self.temporary.name, max_memory_bytes=64)
+        cache.put(self.spec, arrays)
+        self.assertEqual(cache.memory_bytes, 0)
+        with mock.patch.object(semantic_cache, "sha256", wraps=semantic_cache.sha256) as file_hash, \
+                mock.patch.object(semantic_cache, "_descriptions", wraps=semantic_cache._descriptions) as hashes, \
+                mock.patch.object(semantic_cache.np, "load", wraps=np.load) as decode:
+            self.assertIsNotNone(cache.inspect(self.spec))
+            self.assertEqual(decode.call_count, 0)
+            subset, _ = cache.get(self.spec, names=["scores"])
+            np.testing.assert_array_equal(subset["scores"], arrays["scores"])
+            self.assertEqual(set(subset), {"scores"})
+            self.assertEqual(decode.call_count, 1)
+            self.assertEqual(file_hash.call_count, 0)
+            self.assertEqual(hashes.call_count, 0)
+
+    def test_same_size_rewrite_with_restored_mtime_invalidates_verified_memo(self):
+        record = self.cache.put(self.spec, self.arrays)
+        self.cache.get(self.spec)
+        artifact = self.cache.root / record["artifact_path"]
+        before = artifact.stat()
+        payload = bytearray(artifact.read_bytes())
+        payload[len(payload) // 2] ^= 1
+        artifact.write_bytes(payload)
+        os.utime(artifact, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(artifact.stat().st_size, before.st_size)
+        self.assertEqual(artifact.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertIsNone(self.cache.inspect(self.spec))
+        self.assertEqual(self.cache.memory_bytes, 0)
+        self.assertTrue(list((self.cache.root / "quarantine").rglob("artifact.npz")))
+
+    def test_marker_rewrite_reverifies_and_unknown_subset_does_not_quarantine(self):
+        record = self.cache.put(self.spec, self.arrays)
+        self.cache.get(self.spec)
+        with self.assertRaises(LookupError):
+            self.cache.get(self.spec, names=["no_such_array"])
+        self.assertIsNotNone(self.cache.get(self.spec))
+        record["spec"]["model"]["name"] = "tampered-marker"
+        marker = self.cache.root / "records" / (record["cache_key"] + ".json")
+        atomic_json(marker, record)
+        self.assertIsNone(self.cache.get(self.spec, names=["scores"]))
+
+    def test_verified_record_memo_is_bounded_even_without_resident_arrays(self):
+        cache = Cache(self.temporary.name, max_memory_bytes=0, max_verified_entries=2)
+        for index in range(5):
+            spec = {**self.spec, "image": index}
+            cache.put(spec, self.arrays)
+            self.assertIsNotNone(cache.inspect(spec))
+        self.assertEqual(len(cache._verified), 2)
+        self.assertEqual(cache.memory_bytes, 0)
 
 
 if __name__ == "__main__":
