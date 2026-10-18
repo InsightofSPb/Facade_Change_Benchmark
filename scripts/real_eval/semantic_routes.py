@@ -189,6 +189,7 @@ class Runner:
         self.cache = Cache(cache_dir or config.get('cache_root') or self.prepared.parent / 'semantic-cache-v1',
                            event=self.event)
         self.records, self.observations, self.coverage = [], [], []
+        self.reported_failures = set()
         self.completed_tasks = defaultdict(set)
         self.contracts, self.preflights, self.blocked, self.thresholds = {}, {}, {}, {}
         self.method_sources = {m: method_source_identity(m) for m in self.methods if m in ALL_METHODS}
@@ -298,8 +299,21 @@ class Runner:
 
     def fail(self, context, error):
         self.activity(action='failed', failed=True)
-        self.event('unit_failed', context=context, error=str(error))
-        return self.record(context, status='failed', error=str(error))
+        message = str(error)
+        self.event('unit_failed', context=context, error=message)
+        record = self.record(context, status='failed', error=message)
+        # One model failure can invalidate many dependent routes. Show its
+        # first occurrence immediately, while keeping every failed unit on disk.
+        component = context.get('segmenter') or context.get('method')
+        key = (component, message)
+        if key not in self.reported_failures:
+            self.reported_failures.add(key)
+            label = ' / '.join(str(context[k]) for k in
+                               ('split', 'segmenter', 'variant', 'method', 'route') if context.get(k))
+            preview = message if len(message) <= 1600 else message[:500] + '\n…\n' + message[-1100:]
+            self.log(f'FAILED [{label}]: {preview}\n'
+                     f'  Полная ошибка: {self.out / "units" / (record["unit_id"] + ".json")}')
+        return record
 
     def preflight(self):
         # inventory_full_cache validates every selected RGB/support/GT artifact
@@ -764,6 +778,9 @@ class Runner:
                                              segmenter=name, timing_only=True))
                         except Exception as exc:
                             self.event('timing_probe_failed', segmenter=name, variant=vocab_key, error=str(exc))
+                            self.fail(self.context(sequence, frame, ref, mode, kind='timing_probe',
+                                                   method=None, segmenter=name, variant=vocab_key,
+                                                   route='change_first', timing_only=True), exc)
                 self.sem_pool.release()
         # Group RGB crop rescoring by CD method after every segmenter is released.
         for method in self.methods:
@@ -991,7 +1008,7 @@ def main(argv=None):
                            help='TTY progress bars (auto), force bars (on), or plain log lines (off)')
         if name == 'run':
             child.add_argument('--smoke-first', action='store_true',
-                               help='Run all-route smoke under OUT/smoke, then the full fixed queue')
+                               help='Run all-route smoke under OUT/smoke; start the full queue only if it succeeds')
     args = parser.parse_args(argv)
     if args.command == 'configure':
         configure(args)
@@ -1013,7 +1030,9 @@ def main(argv=None):
         smoke_status = Runner(config, Path(args.out) / 'smoke', smoke=True, resume=args.resume,
                               cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split,
                               progress=args.progress).run()
-        if smoke_status in (2, 130):
+        if smoke_status != 0:
+            print(f'SMOKE завершён с кодом {smoke_status}; полный прогон не запущен. '
+                  f'Диагностика: {Path(args.out) / "smoke" / "report.html"}', flush=True)
             return smoke_status
     return Runner(config, args.out, smoke=args.command == 'smoke', resume=args.resume,
                   cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split, progress=args.progress).run()

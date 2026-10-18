@@ -189,6 +189,78 @@ class SemanticRoutesIntegrationTests(unittest.TestCase):
         self.assertIn('rgb_diff', runner.contracts)
         self.assertEqual(TestOnlySegmenterPool.calls, [])
 
+    def test_partial_smoke_failure_is_visible_and_prevents_full_queue(self):
+        config = copy.deepcopy(self.config)
+        config['splits'] = ['val']
+        config['segmenters']['frozen']['variants'] = ['domain']
+        config['segmenters']['broken'] = {
+            **config['segmenters']['frozen'], 'test_checkpoint_sha256': 'b' * 64}
+        config_path = self.root / 'partial-config.json'
+        atomic_json(config_path, config)
+        output = self.root / 'partial'
+        original = TestOnlySegmenterPool.predict
+
+        def predict(pool, model, vocabulary, rgb):
+            if model['test_checkpoint_sha256'] == 'b' * 64:
+                raise RuntimeError('fixture model failed at runtime')
+            return original(pool, model, vocabulary, rgb)
+
+        log = io.StringIO()
+        with patch.object(TestOnlySegmenterPool, 'predict', predict), redirect_stdout(log):
+            result = routes.main(['run', '--config', str(config_path), '--out', str(output),
+                                  '--smoke-first', '--progress', 'off'])
+        self.assertEqual(result, 1)
+        self.assertFalse((output / 'run.json').exists())
+        smoke = read_json(output / 'smoke' / 'run.json')
+        self.assertEqual(smoke['status'], 'completed_with_failures')
+        self.assertGreater(smoke['failed'], 1)  # Includes dependent route failures.
+        self.assertGreater(smoke['records'], smoke['failed'])  # Other work succeeded.
+        self.assertEqual(log.getvalue().count('FAILED ['), 1)
+        self.assertIn('fixture model failed at runtime', log.getvalue())
+        self.assertIn('полный прогон не запущен', log.getvalue())
+        self.assertTrue((output / 'smoke' / 'report.html').exists())
+
+    def test_successful_smoke_starts_full_queue(self):
+        config = copy.deepcopy(self.config)
+        config['splits'] = ['val']
+        config['segmenters']['frozen']['variants'] = ['domain']
+        config_path = self.root / 'success-config.json'
+        atomic_json(config_path, config)
+        output = self.root / 'success'
+        with redirect_stdout(io.StringIO()):
+            result = routes.main(['run', '--config', str(config_path), '--out', str(output),
+                                  '--smoke-first', '--progress', 'off'])
+        self.assertEqual(result, 0)
+        self.assertEqual(read_json(output / 'smoke' / 'run.json')['status'], 'completed')
+        self.assertEqual(read_json(output / 'run.json')['status'], 'completed')
+
+    def test_failed_timing_probe_blocks_full_queue_without_quality_metrics(self):
+        config = copy.deepcopy(self.config)
+        config['splits'] = ['val']
+        config['segmenters']['frozen']['variants'] = ['domain']
+        config['roi']['min_area'] = 257  # No predicted region in a 16x16 frame.
+        config_path = self.root / 'probe-config.json'
+        atomic_json(config_path, config)
+        output = self.root / 'probe'
+        original = TestOnlySegmenterPool.predict
+
+        def predict(pool, model, vocabulary, rgb):
+            if rgb.shape[:2] != (16, 16):
+                raise RuntimeError('fixture crop inference failed')
+            return original(pool, model, vocabulary, rgb)
+
+        with patch.object(TestOnlySegmenterPool, 'predict', predict), redirect_stdout(io.StringIO()):
+            result = routes.main(['run', '--config', str(config_path), '--out', str(output),
+                                  '--smoke-first', '--progress', 'off'])
+        self.assertEqual(result, 1)
+        self.assertFalse((output / 'run.json').exists())
+        failed = [read_json(path) for path in (output / 'smoke' / 'units').glob('*.json')
+                  if read_json(path)['status'] == 'failed']
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]['kind'], 'timing_probe')
+        self.assertTrue(failed[0]['timing_only'])
+        self.assertEqual(failed[0]['metrics'], [])
+
     def test_full_pair_reads_request_only_scores(self):
         original_get = routes.Cache.get
         requested = []
