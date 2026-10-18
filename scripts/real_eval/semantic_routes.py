@@ -18,6 +18,7 @@ import sys
 import time
 
 import numpy as np
+from tqdm import tqdm
 
 from facade_change.methods.registry import ALL_METHODS, _EXTERNAL_ADAPTERS
 from facade_change.methods.remote import RemotePool
@@ -146,7 +147,15 @@ def method_source_identity(method):
 
 
 class Runner:
-    def __init__(self, config, out, *, smoke=False, resume=False, cache_dir=None, pairs_per_split=None):
+    def __init__(self, config, out, *, smoke=False, resume=False, cache_dir=None, pairs_per_split=None,
+                 progress='auto'):
+        if progress not in ('auto', 'on', 'off'):
+            raise ValueError('progress must be auto, on or off')
+        self.progress_enabled = progress == 'on' or (progress == 'auto' and sys.stderr.isatty())
+        self.queue_bar, self.stage_bar = None, None
+        self.display = {}
+        self.display_description = ''
+        self.display_updated = 0.
         self.config = copy.deepcopy(config)
         self.out = Path(out).expanduser().resolve()
         self.smoke = smoke
@@ -193,6 +202,69 @@ class Runner:
             'semantic_routes.py', 'semantic_geometry.py', 'semantic_report.py')}
         self.started = time.time()
 
+    def log(self, message):
+        if self.progress_enabled:
+            tqdm.write(message, file=sys.stderr)
+        else:
+            print(message, flush=True)
+
+    @staticmethod
+    def pair_label(pair):
+        sequence, frame, ref, mode = pair
+        return (f'{sequence["building_id"]} '
+                f'{sequence["frames"][ref]["year"]}->{sequence["frames"][frame]["year"]} {mode}')
+
+    def activity(self, *, task=None, action=None, source=None, failed=False):
+        """Display only: no changes to task identity, inference order or timing."""
+        if self.stage_bar is None:
+            return
+        if task is not None:
+            self.display['task'] = task
+        if action is not None:
+            self.display['action'] = action
+        if source:
+            key = 'computed' if source == 'measured' else source
+            self.display[key] = self.display.get(key, 0) + 1
+        if failed:
+            self.display['failed_units'] = self.display.get('failed_units', 0) + 1
+        detail = ' | '.join(f'{key}={value}' for key, value in self.display.items())
+        self.stage_bar.set_postfix_str(detail, refresh=self.progress_enabled)
+        if not self.progress_enabled and time.monotonic() - self.display_updated >= 30:
+            self.log(f'  {self.display_description}: {self.stage_bar.n}/{self.stage_bar.total} | {detail}')
+            self.display_updated = time.monotonic()
+
+    def track(self, items, description, unit, label):
+        """One stage at a time; failures/continues count as attempted items."""
+        total = len(items)
+        self.log(f'{description}: {total} {unit}')
+        self.display_description = description
+        self.display, self.display_updated = {}, time.monotonic()
+        completed = False
+        with tqdm(total=total, desc=description, unit=unit, file=sys.stderr,
+                  disable=not self.progress_enabled, dynamic_ncols=True, mininterval=.5,
+                  position=1 if self.queue_bar is not None else 0, leave=False) as bar:
+            self.stage_bar = bar
+            try:
+                for number, item in enumerate(items, 1):
+                    self.activity(task=label(item), action='prepare')
+                    yield item
+                    bar.update(1)
+                    if not self.progress_enabled:
+                        bar.n = number  # tqdm disables its own counters in plain-log mode.
+                    if not self.progress_enabled and (number == 1 or number % 5 == 0 or number == total):
+                        detail = ' | '.join(f'{k}={v}' for k, v in self.display.items())
+                        self.log(f'  {description}: {number}/{total} | {detail}')
+                        self.display_updated = time.monotonic()
+                completed = True
+            finally:
+                self.stage_bar = None
+                summary = ', '.join(f'{k}={v}' for k, v in self.display.items()
+                                    if k not in ('task', 'action'))
+                self.log(f'{description}: {"done" if completed else "interrupted"}'
+                         + (f' ({summary})' if summary else ''))
+        if completed and self.queue_bar is not None:
+            self.queue_bar.update(1)
+
     def event(self, kind, **fields):
         _event(self.out, kind, **fields)
 
@@ -225,6 +297,7 @@ class Runner:
         return record
 
     def fail(self, context, error):
+        self.activity(action='failed', failed=True)
         self.event('unit_failed', context=context, error=str(error))
         return self.record(context, status='failed', error=str(error))
 
@@ -356,6 +429,8 @@ class Runner:
             self.frames.clear()
 
     def observe(self, stage, record, context, source, shape, **extra):
+        if not extra.get('inventory'):
+            self.activity(action='ready', source=source)
         metadata = record.get('metadata', {})
         row = dict(stage=stage, method=context.get('method'), segmenter=context.get('segmenter'),
                    variant=context.get('native_variant'), split=context['split'], shape=list(shape),
@@ -373,6 +448,7 @@ class Runner:
             raise RuntimeError(self.blocked['change:' + method])
         contract = self.contracts[method]
         spec = self.change_spec(method, inputs)
+        self.activity(action=f'{method}: checking cache')
         saved = self.cache.get(spec)
         origin = 'cache'
         if saved is None:
@@ -383,10 +459,12 @@ class Runner:
             if saved is None:
                 self.sem_pool.release()
                 before = self.cd_pool.process
+                self.activity(action=f'{method}: model activation')
                 start = time.perf_counter()
                 actual = self.cd_pool.activate(method, contract['options'])
                 init = time.perf_counter()-start if self.cd_pool.process is not before else None
                 _verify_metadata(contract['expected_metadata'], actual, method)
+                self.activity(action=f'{method}: inference')
                 start = time.perf_counter()
                 native = self.cd_pool.score(method, contract['options'], **inputs)
                 elapsed = time.perf_counter()-start
@@ -408,11 +486,13 @@ class Runner:
         checked = self.preflights[name]
         vocabulary = self.config['vocabularies'][vocab_key]
         spec = self.segment_spec(name, vocab_key, rgb)
+        self.activity(action=f'{name}/{vocab_key}: checking cache')
         saved = self.cache.get(spec)
         origin = 'cache'
         if saved is None:
             self.cd_pool.release()
             before = self.sem_pool.process
+            self.activity(action=f'{name}/{vocab_key}: inference/model activation')
             native = self.sem_pool.predict(checked['config'], vocabulary, rgb)
             actual_provenance = native.get('metadata', {}).get('provenance', {})
             if any(actual_provenance.get(key) != checked.get(key)
@@ -484,10 +564,11 @@ class Runner:
         pairs = selected_pairs(self.manifest, split, self.modes, self.smoke, self.pairs_per_split)
         if not pairs:
             return
-        print(f'{split.upper()}: {len(pairs)} pairs; fixed settings; {len(self.methods)} change methods', flush=True)
+        self.log(f'{split.upper()}: {len(pairs)} pairs; fixed settings; {len(self.methods)} change methods')
         baseline, rerun_jobs = {}, []
         for method in self.methods:
-            for sequence, frame, ref, mode in pairs:
+            for sequence, frame, ref, mode in self.track(
+                    pairs, f'{split.upper()} CD {method}', 'pairs', self.pair_label):
                 context = self.context(sequence, frame, ref, mode, kind='change', method=method,
                                        segmenter=None, variant='baseline', route='baseline')
                 try:
@@ -505,7 +586,7 @@ class Runner:
         if self.routes and not baseline:
             self.blocked['routes:' + split] = 'Every baseline CD task failed; no requested route can run'
             self.frames.clear()
-            print(f'{split.upper()}: ни одна CD-пара не рассчитана; очередь остановлена до сегментации.', flush=True)
+            self.log(f'{split.upper()}: ни одна CD-пара не рассчитана; очередь остановлена до сегментации.')
             return False
         frames = {(s['sequence_id'], f): s for s, frame, ref, _ in pairs for f in (ref, frame)}
         for name, cfg in self.segmenters.items():
@@ -514,8 +595,9 @@ class Runner:
                 vocabulary = self.config['vocabularies'][vocab_key]
                 confidence = float(cfg.get('confidence', self.confidence))
                 full = {}
-                print(f'{split.upper()}: segmenter={name}, vocabulary={vocab_key}', flush=True)
-                for frame_number, ((seqid, frame), sequence) in enumerate(frames.items(), 1):
+                for (seqid, frame), sequence in self.track(
+                        frames.items(), f'{split.upper()} {name}/{vocab_key}', 'images',
+                        lambda item: f'{item[1]["building_id"]} {item[1]["frames"][item[0][1]]["year"]}'):
                     context = self.context(sequence, frame, kind='segmentation', method=None,
                                            segmenter=name, variant=vocab_key, route='baseline')
                     try:
@@ -532,10 +614,8 @@ class Runner:
                         for variant in selected_variants:
                             self.fail({**context, 'variant': variant}, exc)
                         self.blocked['segment:' + name] = str(exc)
-                    if frame_number == 1 or frame_number % 5 == 0 or frame_number == len(frames):
-                        print(f'  {name}/{vocab_key}: снимки {frame_number}/{len(frames)}', flush=True)
-                print(f'  {name}/{vocab_key}: оценка маршрутов для {len(pairs)} пар', flush=True)
-                for sequence, frame, ref, mode in pairs:
+                for sequence, frame, ref, mode in self.track(
+                        pairs, f'{split.upper()} routes {name}/{vocab_key}', 'pairs', self.pair_label):
                     if (sequence['sequence_id'], frame) not in full or (sequence['sequence_id'], ref) not in full:
                         for variant in selected_variants:
                             for method in self.methods:
@@ -573,6 +653,8 @@ class Runner:
                         full_values[index] = {v: semantic_prediction(native, vocabulary, v, confidence)
                                               for v in selected_variants}
                     for method in self.methods:
+                        self.activity(task=f'{self.pair_label((sequence, frame, ref, mode))} | CD={method}',
+                                      action='evaluate routes')
                         base = baseline.get((method, mode, sequence['sequence_id'], frame))
                         if base is None:
                             for variant in selected_variants:
@@ -591,7 +673,9 @@ class Runner:
                             try:
                                 for index, data in ((ref, reference), (frame, source)):
                                     roi_native[index] = []
-                                    for box in boxes:
+                                    for box_number, box in enumerate(boxes, 1):
+                                        self.activity(task=f'{sequence["building_id"]} | CD={method} | '
+                                                      f'{sequence["frames"][index]["year"]} | ROI {box_number}/{len(boxes)}')
                                         x0, y0, x1, y1 = box
                                         native, _ = self.segment(name, vocab_key, data['rgb'][y0:y1, x0:x1],
                                             self.context(sequence, frame, ref, mode, stage='segment_roi', method=None, segmenter=name))
@@ -599,6 +683,7 @@ class Runner:
                             except Exception as exc:
                                 roi_error = str(exc)
                         for variant in selected_variants:
+                            self.activity(action=f'{method}/{variant}: metrics and artifacts')
                             context = self.context(sequence, frame, ref, mode, kind='change', method=method,
                                                    segmenter=name, variant=variant)
                             old, new = full_values[ref][variant], full_values[frame][variant]
@@ -682,13 +767,20 @@ class Runner:
                 self.sem_pool.release()
         # Group RGB crop rescoring by CD method after every segmenter is released.
         for method in self.methods:
-            for context, sequence, frame, ref, boxes in (j for j in rerun_jobs if j[0]['method'] == method):
+            method_jobs = [job for job in rerun_jobs if job[0]['method'] == method]
+            for context, sequence, frame, ref, boxes in self.track(
+                    method_jobs, f'{split.upper()} semantic_first_rerun {method}', 'jobs',
+                    lambda job: f'{job[0]["segmenter"]}/{job[0]["variant"]} | '
+                                f'{self.pair_label((job[1], job[2], job[3], job[0]["mode"]))}'):
                 context = {**context, 'route': 'semantic_first_rerun'}
                 reference, source = self.frame(sequence, ref), self.frame(sequence, frame)
                 support = reference['support'] & source['support']
                 try:
                     parts = []
-                    for box in boxes:
+                    for box_number, box in enumerate(boxes, 1):
+                        self.activity(task=f'{context["segmenter"]}/{context["variant"]} | '
+                                      f'{self.pair_label((sequence, frame, ref, context["mode"]))} | '
+                                      f'ROI {box_number}/{len(boxes)}')
                         x0, y0, x1, y1 = box
                         local_support = support[y0:y1, x0:x1]
                         if not local_support.any():
@@ -721,6 +813,7 @@ class Runner:
         self.write_reports()
 
     def write_reports(self, final=False, status=None):
+        self.log(f'CPU report: {len(self.records)} units — {self.out}')
         atomic_json(self.out / 'timing_observations.json', self.observations)
         workload = self.workload()
         # Samples imported from another run have no measured timing. Count only
@@ -789,6 +882,9 @@ class Runner:
                     status=status or (('completed_with_failures' if failures else 'completed') if final else 'running'),
                     records=len(self.records), failed=failures,
                     blocked=self.blocked, cache_root=str(self.cache.root), fixed_settings=True))
+        self.log(f'CPU report ready: {self.out / "report.html"}')
+        if self.queue_bar is not None and status is None:
+            self.queue_bar.update(1)
 
     def expected_coverage(self):
         keys = ('kind', 'split', 'method', 'segmenter', 'variant', 'route', 'mode')
@@ -841,6 +937,14 @@ class Runner:
                     self.write_reports(status='blocked')
                     self.event('request_blocked', blocked=self.blocked)
                     return 2
+                native_variants = sum(len({vocabulary_key(v) for v in variants(cfg)})
+                                      for cfg in self.segmenters.values())
+                active_splits = sum(bool(selected_pairs(self.manifest, split, self.modes,
+                                                        self.smoke, self.pairs_per_split)) for split in self.splits)
+                stages = active_splits * (2 * len(self.methods) + 2 * native_variants + 1) + 1
+                self.queue_bar = tqdm(total=stages, desc='SMOKE' if self.smoke else 'FULL', unit='stage',
+                                      file=sys.stderr, disable=not self.progress_enabled, position=0,
+                                      dynamic_ncols=True, bar_format='{desc}: {n_fmt}/{total_fmt} stages [{elapsed}]')
                 for split in self.splits:
                     if self.run_split(split) is False:
                         self.write_reports(status='blocked')
@@ -850,9 +954,13 @@ class Runner:
             except KeyboardInterrupt:
                 self.write_reports(status='interrupted')
                 self.event('request_interrupted')
-                print(f'Прервано. Готовые результаты сохранены: {self.out}. Продолжение: --resume.', flush=True)
+                self.log(f'Прервано. Готовые результаты сохранены: {self.out}. Продолжение: --resume.')
                 return 130
             finally:
+                if self.stage_bar is not None:
+                    self.stage_bar.close()
+                if self.queue_bar is not None:
+                    self.queue_bar.close()
                 self.sem_pool.release()
                 self.cd_pool.release()
             failures = sum(row['status'] == 'failed' for row in self.records)
@@ -879,6 +987,8 @@ def main(argv=None):
         child.add_argument('--cache-dir')
         child.add_argument('--resume', action='store_true')
         child.add_argument('--pairs-per-split', type=int)
+        child.add_argument('--progress', choices=('auto', 'on', 'off'), default='auto',
+                           help='TTY progress bars (auto), force bars (on), or plain log lines (off)')
         if name == 'run':
             child.add_argument('--smoke-first', action='store_true',
                                help='Run all-route smoke under OUT/smoke, then the full fixed queue')
@@ -901,11 +1011,12 @@ def main(argv=None):
         config['segmenters'] = {name: config['segmenters'][name] for name in args.segmenters}
     if args.command == 'run' and args.smoke_first:
         smoke_status = Runner(config, Path(args.out) / 'smoke', smoke=True, resume=args.resume,
-                              cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split).run()
+                              cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split,
+                              progress=args.progress).run()
         if smoke_status in (2, 130):
             return smoke_status
     return Runner(config, args.out, smoke=args.command == 'smoke', resume=args.resume,
-                  cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split).run()
+                  cache_dir=args.cache_dir, pairs_per_split=args.pairs_per_split, progress=args.progress).run()
 
 
 if __name__ == '__main__':

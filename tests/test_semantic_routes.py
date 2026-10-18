@@ -4,7 +4,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -131,9 +131,13 @@ class SemanticRoutesIntegrationTests(unittest.TestCase):
         self.assertEqual(metric['fn'], 0)
         self.assertTrue(any(r['route'] == 'change_first_cached_clip' for r in full.records))
         before = len(TestOnlySegmenterPool.calls)
-        rerun = self.run_queue('full', resume=True)
+        display = io.StringIO()
+        with redirect_stderr(display):
+            rerun = self.run_queue('full', resume=True, progress='on')
         self.assertEqual(len(TestOnlySegmenterPool.calls), before)
         self.assertTrue(all(o['source'] == 'cache' for o in rerun.observations))
+        self.assertIn('semantic_first_rerun', display.getvalue())
+        self.assertEqual(rerun.queue_bar.n, rerun.queue_bar.total)
         self.assertTrue((rerun.out / 'report.html').is_file())
         self.assertTrue((rerun.out / 'estimate.json').is_file())
         self.assertEqual(read_json(rerun.out / 'run.json')['failed'], 0)
