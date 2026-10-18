@@ -24,6 +24,7 @@
 | Возобновляемый TRAIN/VAL: обучение MSDZip, семантическая DINO, пары и память | `python -m facade_change temporal-experiment` | [Запуск и восстановление](docs/2026-10-14_temporal_experiment.md) |
 | CPU-галерея реальных пар, фильтры GT → ручной выбор → устойчивость восьми методов к освещению | `python scripts/real_eval/real_robustness.py prepare/review/run/report` | [Просмотр, запуск и метрики](docs/2026-10-17_real_robustness.md) |
 | Аудит TRAIN/VAL/TEST → изменяющиеся фасады → пилот скорости → PREVIOUS/EARLIEST/HISTORY | `python scripts/real_eval/real_temporal_night.py audit/prepare/pilot/run/report` | [Ночная очередь и дальнейший план](docs/2026-10-17_real_temporal_night.md) |
+| SAM3, MaskCLIP/LPOSS и DINO: smoke всех маршрутов → VAL/TEST/TRAIN, общий кэш | `python -m scripts.real_eval.semantic_routes run --smoke-first --resume ...` | [OVS, маршруты и оценка времени](docs/2026-10-18-semantic-routes.md) |
 | Реальные GT-метрики, LOFO, классы, сочетания и повторный GeoSCD | `scripts/real_eval/` | [Перенесённые инструменты](docs/2026-10-17_real_eval_tools.md) |
 | Анализ готовых карт и потерь Recall | `python -m data_analysis` | [Анализ результатов](data_analysis/README.md) |
 | Оплаченные H0/H1 и контекст опоры | `python -m facade_change.research` | [Прототипы](docs/2026-10-11_paid_hypotheses_reference_context.md) |
