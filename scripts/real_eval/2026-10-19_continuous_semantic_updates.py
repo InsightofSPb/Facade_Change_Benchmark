@@ -22,6 +22,10 @@ atomic_json, atomic_npz = pilot.atomic_json, pilot.atomic_npz
 SCHEMA = '2026-10-19-continuous-events-v1'
 FEATURES = ('p_from', 'p_to', 'lpips', 'msdzip_abs')
 FEATURE_COUNTS = {'semantic': 2, 'semantic_lpips': 3, 'semantic_lpips_msdzip': 4}
+DELTA_FEATURES = ('p_to_minus_p_from', 'lpips', 'msdzip_abs')
+DELTA_FEATURE_COUNTS = {'semantic': 1, 'semantic_lpips': 2, 'semantic_lpips_msdzip': 3}
+FEATURE_DESIGNS = ('raw_pair', 'directed_delta')
+DELTA_SCHEMA = '2026-10-19-directed-delta-events-v1'
 VARIANTS = ('semantic_delta', 'lpips_only', *FEATURE_COUNTS)
 L2 = .01
 SEED = 20261019
@@ -44,6 +48,26 @@ NOTES = (
     'then equal facades; undefined AP remains N/A. Directed-event metrics are micro over '
     'class/direction within each pair, not class-macro.',
 )
+DELTA_NOTES = (
+    'Semantic features are directed p_to - p_from; no independent state-confidence feature.',
+    'Each fitted semantic slope must be strictly positive; an unsupported/nonpositive fit blocks the run.',
+    'The semantic-only model must match raw semantic_delta masks and AP in every evaluated pair. '
+    'Learned directed-delta scores retain float64 to avoid sigmoid float32 quantization.',
+    'This revision follows inspection of earlier VAL/TEST results and remains exploratory.',
+)
+
+
+def feature_spec(design):
+    if design not in FEATURE_DESIGNS:
+        raise ValueError(f'Unknown feature design: {design}')
+    return (DELTA_FEATURES, DELTA_FEATURE_COUNTS) if design == 'directed_delta' else (FEATURES, FEATURE_COUNTS)
+
+
+def fit_event_model(x, y, weight, features, design):
+    model = dict(fit_logistic(x, y, weight), features=list(features), feature_design=design)
+    if design == 'directed_delta' and model['coefficients'][0] <= 0:
+        raise ValueError('Directed-delta fit has no positive semantic slope; no sign flip or fallback applied')
+    return model
 
 
 def event_truth(pair):
@@ -159,6 +183,18 @@ def score_pair(pair, name, model=None):
     if name == 'semantic_delta':
         delta = new - old
         events = np.stack((np.maximum(delta, 0), np.maximum(-delta, 0)))
+    elif model.get('feature_design') == 'directed_delta':
+        weights = model['coefficients']
+        if weights[0] <= 0:
+            raise ValueError('Directed-delta inference requires a positive semantic slope')
+        # Subtract in the original float32 coordinate, exactly as semantic_delta does.
+        delta = (new - old).astype(np.float64)
+        shared = np.full(support.shape, model['intercept'], np.float64)
+        for i, method in enumerate(pilot.METHODS, 1):
+            if i < len(weights):
+                shared += weights[i] * np.where(support, pair['maps'][method]['scores'], 0).astype(np.float64)
+        events = np.stack((np.where(delta > 0, sigmoid(shared + weights[0] * delta), 0),
+                           np.where(delta < 0, sigmoid(shared - weights[0] * delta), 0)))
     else:
         weights = model['coefficients']
         shared = np.full(support.shape, model['intercept'], np.float64)
@@ -170,25 +206,30 @@ def score_pair(pair, name, model=None):
         # Resolve direction before thresholding; exact ties abstain. Classes may overlap.
         events = np.stack((np.where(gain > loss, sigmoid(gain), 0),
                            np.where(loss > gain, sigmoid(loss), 0)))
-    events = np.where(support[None, None], events, 0).astype(np.float32)
+    dtype = np.float64 if model and model.get('feature_design') == 'directed_delta' else np.float32
+    events = np.where(support[None, None], events, 0).astype(dtype)
     if not np.isfinite(events).all():
         raise ValueError('Nonfinite event scores')
     return events, events.max(axis=(0, 1))
 
 
-def fit_bundle(pairs, excluded=None):
+def fit_bundle(pairs, excluded=None, feature_design='raw_pair'):
+    features, feature_counts = feature_spec(feature_design)
     training = [p for p in pairs if p['context']['split'] == 'train'
                 and p['context']['building_id'] != excluded]
     x, y, weight, sample_audit = training_sample(training)
-    bundle = dict(excluded_building=excluded,
+    if feature_design == 'directed_delta':
+        delta = x[:, 1].astype(np.float32) - x[:, 0].astype(np.float32)
+        x = np.column_stack((delta, x[:, 2:]))
+    bundle = dict(excluded_building=excluded, feature_design=feature_design,
                   training_buildings=sorted({p['context']['building_id'] for p in training}),
                   samples=len(y), sample_audit=sample_audit, models={}, thresholds={})
     for name in VARIANTS:
         print(f'Fit/calibrate: {name}; excluded={excluded or "none"}', flush=True)
         model = None
-        if name in FEATURE_COUNTS:
-            size = FEATURE_COUNTS[name]
-            model = dict(fit_logistic(x[:, :size], y, weight), features=list(FEATURES[:size]))
+        if name in feature_counts:
+            size = feature_counts[name]
+            model = fit_event_model(x[:, :size], y, weight, features[:size], feature_design)
             bundle['models'][name] = model
         rows = []
         for pair in training:
@@ -202,6 +243,21 @@ def fit_bundle(pairs, excluded=None):
         bundle['thresholds'][name] = dict(choice, fitting_excluded_building=excluded,
                                           calibration_split='train', target='binary_change')
     return bundle
+
+
+def check_parity(reference, fitted):
+    """Check predictions over full support and AP over known labels, without refitting."""
+    before_rows, before_mask, before_events = reference
+    after_rows, after_mask, after_events = fitted
+    result = dict(binary_disagreements=int(np.count_nonzero(before_mask != after_mask)),
+                  event_disagreements=int(np.count_nonzero(before_events != after_events)))
+    for target, before, after in zip(('binary', 'directed'), before_rows[:2], after_rows[:2]):
+        a, b = before['average_precision'], after['average_precision']
+        result[target + '_ap_difference'] = None if a is None or b is None else float(b - a)
+        result[target + '_ap_matches'] = (a is None and b is None) or (a is not None and b is not None and abs(a - b) <= 1e-12)
+    result['passed'] = (result['binary_disagreements'] == result['event_disagreements'] == 0
+                        and result['binary_ap_matches'] and result['directed_ap_matches'])
+    return result
 
 
 def evaluate(pair, event_scores, scores, threshold, categories):
@@ -278,14 +334,14 @@ def audit_inputs(source, out):
     return pairs
 
 
-def report(out, summaries, articles):
+def report(out, summaries, articles, notes=NOTES):
     columns = ('split', 'variant', 'target', 'average_precision', 'f1', 'precision', 'recall', 'fpr', 'facades', 'pairs')
     primary = [r for r in summaries if r['class_name'] == '__all__' and r['protocol'] == 'all_frames']
     def cell(value):
         return 'N/A' if value is None else f'{value:.4f}' if isinstance(value, float) else str(value)
     table = '| ' + ' | '.join(columns) + ' |\n| ' + ' | '.join('---' for _ in columns) + ' |\n'
     table += '\n'.join('| ' + ' | '.join(cell(r.get(c)) for c in columns) + ' |' for r in primary)
-    (out / '2026-10-19_tables.md').write_text(table + '\n\n' + '\n'.join('- ' + x for x in NOTES), encoding='utf-8')
+    (out / '2026-10-19_tables.md').write_text(table + '\n\n' + '\n'.join('- ' + x for x in notes), encoding='utf-8')
     header = '<tr>' + ''.join('<th>' + c + '</th>' for c in columns) + '</tr>'
     body = ''.join('<tr>' + ''.join('<td>' + html.escape(cell(r.get(c))) + '</td>' for c in columns) + '</tr>' for r in primary)
     content = ('<!doctype html><html lang="en"><meta charset="utf-8"><title>Continuous semantic events</title>'
@@ -293,7 +349,7 @@ def report(out, summaries, articles):
                'td,th{padding:6px;border:1px solid #ccc}.grid{display:flex;flex-wrap:wrap}'
                'figure{width:300px;margin:8px}img{max-width:100%}figcaption{font-size:13px}</style>'
                '<h1>Continuous semantic event experiment</h1><ul>'
-               + ''.join('<li>' + html.escape(n) + '</li>' for n in NOTES) + '</ul><table>' + header + body
+               + ''.join('<li>' + html.escape(n) + '</li>' for n in notes) + '</ul><table>' + header + body
                + '</table><h2>All TRAIN fusion-OOF / VAL / TEST pairs</h2>'
                '<p>S panels show the original 0.5-threshold states for context; they do not gate event predictions. '
                'Binary overlays: green TP, red FP, blue FN, evaluated region only. These overlays do not verify event class/direction.</p>'
@@ -301,7 +357,10 @@ def report(out, summaries, articles):
     (out / '2026-10-19_report.html').write_text(content, encoding='utf-8')
 
 
-def run(semantic_run, change_run, out_path, audit_only=False):
+def run(semantic_run, change_run, out_path, audit_only=False, feature_design='raw_pair'):
+    features, feature_counts = feature_spec(feature_design)
+    schema = DELTA_SCHEMA if feature_design == 'directed_delta' else SCHEMA
+    notes = NOTES + DELTA_NOTES if feature_design == 'directed_delta' else NOTES
     out = Path(out_path).expanduser().resolve()
     protected = [Path(p).expanduser().resolve() for p in (semantic_run, change_run)]
     initial = pilot.read_json(protected[0] / 'run.json')
@@ -311,9 +370,9 @@ def run(semantic_run, change_run, out_path, audit_only=False):
         raise ValueError('Output must be separate from all input/cache directories')
     out.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
-    state = dict(kind='continuous_semantic_events', schema=SCHEMA, status='running',
+    state = dict(kind='continuous_semantic_events', schema=schema, feature_design=feature_design, status='running',
                  started_utc=datetime.now(timezone.utc).isoformat(), semantic_run=str(protected[0]),
-                 change_run=str(protected[1]), audit_only=audit_only, limitations=list(NOTES))
+                 change_run=str(protected[1]), audit_only=audit_only, limitations=list(notes))
     atomic_json(out / 'run.json', state)
     source = None
     try:
@@ -322,9 +381,10 @@ def run(semantic_run, change_run, out_path, audit_only=False):
         buildings = sorted({p['context']['building_id'] for p in pairs if p['context']['split'] == 'train'})
         git = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parents[2],
                              capture_output=True, text=True, check=False)
-        config = dict(schema=SCHEMA, variants=list(VARIANTS), feature_counts=FEATURE_COUNTS,
+        config = dict(schema=schema, feature_design=feature_design, variants=list(VARIANTS), feature_counts=feature_counts,
                       software=dict(python=platform.python_version(), numpy=np.__version__),
-                      features=list(FEATURES), l2=L2, seed=SEED, max_events_per_pair=MAX_EVENTS_PER_PAIR,
+                      features=list(features), l2=L2, seed=SEED, max_events_per_pair=MAX_EVENTS_PER_PAIR,
+                      positive_semantic_slope_required=feature_design == 'directed_delta',
                       target_binary_fpr=FPR_GOAL, mode='previous', threshold_operator='>',
                       event_directions=['gain', 'loss'], direction_policy='higher logit wins; equal logits abstain',
                       sampling='event-stratified; population-corrected weights; equal facades then pairs',
@@ -345,10 +405,10 @@ def run(semantic_run, change_run, out_path, audit_only=False):
         else:
             jobs = [(None, pairs)] + [(b, [p for p in pairs if p['context']['split'] == 'train'
                                            and p['context']['building_id'] == b]) for b in buildings]
-            rows, articles, artifacts, model_index = [], [], [], []
+            rows, articles, artifacts, model_index, parity_rows = [], [], [], [], []
             for excluded, evaluation in jobs:
                 fold = 'all_train' if excluded is None else 'holdout-' + pilot.digest(excluded)[:12]
-                bundle = fit_bundle(pairs, excluded)
+                bundle = fit_bundle(pairs, excluded, feature_design)
                 relative_model = f'models/2026-10-19-{fold}.json'
                 (out / 'models').mkdir(exist_ok=True)
                 atomic_json(out / relative_model, bundle)
@@ -356,13 +416,24 @@ def run(semantic_run, change_run, out_path, audit_only=False):
                 for i, pair in enumerate(evaluation, 1):
                     original = pair['context']
                     split = ('train_fusion_oof' if excluded else 'train_fit') if original['split'] == 'train' else original['split']
-                    context = dict(original, split=split, source_split=original['split'], fold=fold)
+                    context = dict(original, split=split, source_split=original['split'], fold=fold,
+                                   feature_design=feature_design)
                     print(f'Evaluate: {split} {i}/{len(evaluation)} {original["building_id"]}', flush=True)
                     arrays = dict(labels=pair['labels'], support=pair['support'])
                     panels = {}
+                    parity_reference = None
                     for name in VARIANTS:
                         events, scores = score_pair(pair, name, bundle['models'].get(name))
                         measured, mask, predicted = evaluate(pair, events, scores, bundle['thresholds'][name]['threshold'], source.categories)
+                        if feature_design == 'directed_delta':
+                            if name == 'semantic_delta':
+                                parity_reference = measured, mask, predicted
+                            elif name == 'semantic':
+                                check = check_parity(parity_reference, (measured, mask, predicted))
+                                parity_rows.append(dict(context, **check))
+                                if not check['passed']:
+                                    pilot.semantic_report._write_csv(out / '2026-10-19_parity.csv', parity_rows)
+                                    raise ValueError('Semantic-only delta parity failed; inspect 2026-10-19_parity.csv')
                         rows.extend(dict(context, variant=name, **r) for r in measured)
                         panels[name] = dict(C=mask)
                         arrays[name + '__change_score'] = scores
@@ -379,7 +450,10 @@ def run(semantic_run, change_run, out_path, audit_only=False):
             for name, values in (('per_pair', rows), ('per_facade', facades), ('summary', summaries)):
                 pilot.semantic_report._write_csv(out / (name + '.csv'), values)
             atomic_json(out / '2026-10-19_artifacts.json', dict(models=model_index, maps=artifacts))
-            report(out, summaries, articles)
+            if parity_rows:
+                pilot.semantic_report._write_csv(out / '2026-10-19_parity.csv', parity_rows)
+                state.update(parity_pairs=len(parity_rows), parity_passed=all(r['passed'] for r in parity_rows))
+            report(out, summaries, articles, notes)
             state.update(status='completed', pairs=len(pairs), temporal_train_facades=len(buildings), result_rows=len(rows))
     except KeyboardInterrupt:
         state.update(status='interrupted', error='KeyboardInterrupt')
@@ -401,8 +475,10 @@ def main(argv=None):
     parser.add_argument('--change-run', required=True)
     parser.add_argument('--out', required=True, help='New output directory, never overwritten')
     parser.add_argument('--audit-only', action='store_true')
+    parser.add_argument('--feature-design', choices=FEATURE_DESIGNS, default='raw_pair',
+                        help='directed_delta replaces the two state probabilities with their signed difference')
     args = parser.parse_args(argv)
-    state = run(args.semantic_run, args.change_run, args.out, args.audit_only)
+    state = run(args.semantic_run, args.change_run, args.out, args.audit_only, args.feature_design)
     return 0 if state['status'] in ('completed', 'audit_passed') else 130 if state['status'] == 'interrupted' else 2
 
 
