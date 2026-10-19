@@ -12,6 +12,7 @@
 | Задача | Команда | Подробности |
 |---|---|---|
 | Новый COCO / уточнение метаданных | `python scripts/prepare_dataset.py COCO IMAGES` | [Данные и split](docs/2026-10-11_two_path_dataset_preparation.md) |
+| Фасады, истории, годы наблюдений и длительность по COCO | `python data/dataset_statistics.py` | [Статистика набора](docs/2026-10-19_dataset_statistics.md) |
 | Оригинальные кропы + две аугментации | `python -m facade_change.segmentation --prepare-only` | [Сегментация](docs/2026-10-11_dino_semantic_training.md) |
 | Обучение головы DINOv2 | `python -m facade_change.segmentation --augmentations ...` | [Обучение и метрики](docs/2026-10-11_dino_semantic_training.md) |
 | Устойчивость готовой головы | `python -m facade_change.segmentation --evaluate-run ...` | [VAL и вероятности](docs/2026-10-11_dino_semantic_training.md) |
