@@ -92,10 +92,13 @@ class DirectedDeltaTests(unittest.TestCase):
             config = runner.pilot.read_json(root / 'out' / 'resolved_config.json')
             self.assertEqual(config['schema'], runner.DELTA_SCHEMA)
             self.assertEqual(config['features'], list(runner.DELTA_FEATURES))
+            self.assertEqual(config['parity_policy'], dict(ap_absolute_tolerance=runner.PARITY_AP_ATOL,
+                             ap_relative_tolerance=0., mask_max_disagreements=0))
             with (root / 'out' / '2026-10-19_parity.csv').open() as stream:
                 checks = list(csv.DictReader(stream))
             self.assertEqual(len(checks), 8)
             self.assertTrue(all(r['passed'] == 'True' for r in checks))
+            self.assertTrue(all(float(r['ap_absolute_tolerance']) == runner.PARITY_AP_ATOL for r in checks))
             self.assertEqual({r['split'] for r in checks}, {'train_fit', 'train_fusion_oof', 'val', 'test'})
             index = runner.pilot.read_json(root / 'out' / '2026-10-19_artifacts.json')
             for item in index['models']:
@@ -106,6 +109,53 @@ class DirectedDeltaTests(unittest.TestCase):
                 with np.load(root / 'out' / item['artifact_path'], allow_pickle=False) as data:
                     self.assertEqual(data['semantic__change_score'].dtype, np.float64)
                     np.testing.assert_array_equal(data['semantic__prediction'], data['semantic_delta__prediction'])
+
+    def test_float64_sigmoid_ties_need_small_absolute_ap_tolerance(self):
+        # Many negatives followed by two distinct tiny differences. Their
+        # float64 sigmoid scores tie, moving one positive by one rank near the
+        # tail. The former 1e-12 guard rejects this harmless numerical effect.
+        n = 200000
+        delta = np.r_[np.full(n, .75), 2e-20, 1e-20].astype(np.float32)
+        p = dict(support=np.ones((1, len(delta)), bool),
+                 reference=dict(probabilities=np.zeros((1, 1, len(delta)), np.float32)),
+                 source=dict(probabilities=delta.reshape(1, 1, -1)))
+        model = dict(feature_design='directed_delta', coefficients=[5.], intercept=-5.)
+        raw_events, raw = runner.score_pair(p, 'semantic_delta')
+        fitted_events, fitted = runner.score_pair(p, 'semantic', model)
+        self.assertGreater(raw[0, -2], raw[0, -1])
+        self.assertEqual(fitted[0, -2], fitted[0, -1])
+        event_labels = np.zeros_like(raw_events, np.uint8)
+        event_labels[0, 0, 0, n] = 1
+        labels = event_labels.any(axis=(0, 1))
+        def measured(events, scores, threshold):
+            rows = [dict(average_precision=runner.calibration.average_precision(x.ravel(), y.ravel()))
+                    for x, y in ((scores, labels), (events, event_labels))]
+            return rows, scores > threshold, events > threshold
+        before = measured(raw_events, raw, .5)
+        after = measured(fitted_events, fitted, float(runner.sigmoid(-5. + 5. * .5)))
+        check = runner.check_parity(before, after)
+        self.assertGreater(abs(check['directed_ap_difference']), 1e-12)
+        self.assertLess(abs(check['directed_ap_difference']), runner.PARITY_AP_ATOL)
+        self.assertEqual(check['binary_disagreements'], 0)
+        self.assertEqual(check['event_disagreements'], 0)
+        self.assertTrue(check['passed'])
+
+    def test_parity_still_rejects_mask_drift_and_larger_ap_drift(self):
+        reference = ([dict(average_precision=.2), dict(average_precision=.1)],
+                     np.zeros((1, 1), bool), np.zeros((2, 1, 1, 1), bool))
+        for index in (1, 2):
+            changed = copy.deepcopy(reference)
+            changed[index].flat[0] = True
+            self.assertFalse(runner.check_parity(reference, changed)['passed'])
+        for row in (0, 1):
+            for shift, passes in ((.5 * runner.PARITY_AP_ATOL, True),
+                                  (2 * runner.PARITY_AP_ATOL, False)):
+                changed = copy.deepcopy(reference)
+                changed[0][row]['average_precision'] += shift
+                self.assertEqual(runner.check_parity(reference, changed)['passed'], passes)
+            changed = copy.deepcopy(reference)
+            changed[0][row]['average_precision'] = None
+            self.assertFalse(runner.check_parity(reference, changed)['passed'])
 
 
 if __name__ == '__main__':

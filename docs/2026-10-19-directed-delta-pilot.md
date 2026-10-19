@@ -48,16 +48,20 @@ revision's design, so the results remain exploratory.
 
 ## Mandatory parity control
 
-Semantic-only sigmoid is a strictly increasing transform of positive difference.
-Consequently its binary and directed AP and its independently calibrated decisions
-must agree with `semantic_delta`. Both models are fitted/calibrated normally;
-the control does not copy the baseline threshold or predictions.
+In exact arithmetic, semantic-only sigmoid is a strictly increasing transform
+of positive difference. Consequently its binary and directed AP and its
+independently calibrated decisions agree with `semantic_delta`. Finite precision
+can merge tiny distinct differences into one sigmoid score, even in float64.
+Both models are fitted/calibrated normally; the control does not copy the
+baseline threshold or predictions.
 
 The code checks every evaluated pair, including TRAIN fitting and each held-out
 TRAIN facade. It compares binary and directed masks over the full common support
 and binary/directed AP over the known annotation region. Learned delta scores
-retain float64 to avoid collapsing distinct float32 differences after sigmoid.
-AP equality tolerance is 1e-12; binary/event mask disagreement tolerance is zero.
+retain float64 to reduce sigmoid quantization. AP absolute tolerance is **1e-9**
+on the 0-to-1 scale, with no relative tolerance; binary/event mask disagreement
+tolerance remains **zero**. The tolerance and both AP values are recorded in
+the parity CSV, and the policy is saved in `resolved_config.json`.
 The raw DINO difference is computed in the same float32 coordinate as before.
 
 Results are saved to `2026-10-19_parity.csv`. Any mismatch blocks the run before
@@ -85,8 +89,32 @@ The output includes the usual summary, per-facade and per-pair CSVs, models,
 thresholds, run/config/provenance JSON, maps, full TRAIN-OOF/VAL/TEST gallery and
 HTML, plus the parity CSV. Provide `summary.csv`, `per_facade.csv`, `run.json`,
 `resolved_config.json`, `2026-10-19_parity.csv`, and `models/` for comparison.
-If blocked, provide `run.json` and the parity CSV if present. Runtime and memory
-for this revision on the real data have not yet been measured.
+If blocked, provide `run.json` and the parity CSV if present. Runtime and peak
+memory for a completed real-data run have not yet been measured.
+
+## Numerical parity correction after the first real run
+
+The initial `directed-delta-eval-001` run at published commit `680e074` stopped
+after 207.54 seconds on the 74th check: Instrumentalnaya_3a, held-out fusion,
+frame 3 (2016 to 2019). All 74 checks had zero binary and directed-event mask
+disagreements and zero binary AP difference. The failing directed AP difference
+was -1.1255441023649837e-12, just beyond the original 1e-12 tolerance. All eight
+recorded code hashes match that revision. All three saved folds have positive
+semantic slopes, and their semantic-only/baseline calibration FPRs agree.
+
+A synthetic regression demonstrates the numerical mechanism: distinct float32
+differences 2e-20 and 1e-20 tie after a float64 sigmoid with slope 5 and intercept
+-5. With 200,000 preceding negatives, this changes AP by about 2.5e-11 while
+leaving both decision masks identical. The diagnostic archive contains no
+per-pixel arrays for the failing pair, so this is a reproduced mechanism, not
+an exact replay of that pair's ranking.
+
+The correction changes only validation tolerance and its audit fields. Scores,
+fitting, sampling, thresholds, metric computation and strict mask equality are
+unchanged. The 1e-9 absolute AP tolerance is three orders below six-decimal
+metric reporting; larger AP drift and any mask discrepancy still block the run.
+Use a new output directory such as `runs/2026-10-19-directed-delta-eval-002`.
+The first run remains blocked; no completed scientific comparison is claimed.
 
 ## Validation
 

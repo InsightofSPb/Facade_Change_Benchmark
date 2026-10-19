@@ -31,6 +31,9 @@ L2 = .01
 SEED = 20261019
 MAX_EVENTS_PER_PAIR = 8192
 FPR_GOAL = .05
+# Sigmoid may merge very small distinct differences even in float64. Keep the
+# decision masks exact; allow only a negligible absolute AP discrepancy.
+PARITY_AP_ATOL = 1e-9
 NOTES = (
     'TRAIN subset counts describe cached temporal sequences, not the full DINO training dataset.',
     'train_fit: fusion fitted and threshold calibrated on these same TRAIN facades; diagnostic only.',
@@ -51,8 +54,9 @@ NOTES = (
 DELTA_NOTES = (
     'Semantic features are directed p_to - p_from; no independent state-confidence feature.',
     'Each fitted semantic slope must be strictly positive; an unsupported/nonpositive fit blocks the run.',
-    'The semantic-only model must match raw semantic_delta masks and AP in every evaluated pair. '
-    'Learned directed-delta scores retain float64 to avoid sigmoid float32 quantization.',
+    'The semantic-only model must match raw semantic_delta masks exactly in every evaluated pair; '
+    f'AP uses absolute tolerance {PARITY_AP_ATOL:g}, with no relative tolerance. '
+    'Learned directed-delta scores retain float64, but sigmoid can still merge tiny differences.',
     'This revision follows inspection of earlier VAL/TEST results and remains exploratory.',
 )
 
@@ -249,12 +253,16 @@ def check_parity(reference, fitted):
     """Check predictions over full support and AP over known labels, without refitting."""
     before_rows, before_mask, before_events = reference
     after_rows, after_mask, after_events = fitted
-    result = dict(binary_disagreements=int(np.count_nonzero(before_mask != after_mask)),
+    result = dict(ap_absolute_tolerance=PARITY_AP_ATOL,
+                  binary_disagreements=int(np.count_nonzero(before_mask != after_mask)),
                   event_disagreements=int(np.count_nonzero(before_events != after_events)))
     for target, before, after in zip(('binary', 'directed'), before_rows[:2], after_rows[:2]):
         a, b = before['average_precision'], after['average_precision']
+        result[target + '_ap_reference'] = a
+        result[target + '_ap_fitted'] = b
         result[target + '_ap_difference'] = None if a is None or b is None else float(b - a)
-        result[target + '_ap_matches'] = (a is None and b is None) or (a is not None and b is not None and abs(a - b) <= 1e-12)
+        result[target + '_ap_matches'] = ((a is None and b is None)
+            or (a is not None and b is not None and abs(a - b) <= PARITY_AP_ATOL))
     result['passed'] = (result['binary_disagreements'] == result['event_disagreements'] == 0
                         and result['binary_ap_matches'] and result['directed_ap_matches'])
     return result
@@ -399,6 +407,9 @@ def run(semantic_run, change_run, out_path, audit_only=False, feature_design='ra
                                              Path(metrics.__file__), Path(pilot.semantic_geometry.__file__),
                                              Path(pilot.night_common.__file__), Path(pilot.night_report.__file__),
                                              Path(pilot.semantic_report.__file__))})
+        if feature_design == 'directed_delta':
+            config['parity_policy'] = dict(ap_absolute_tolerance=PARITY_AP_ATOL,
+                                          ap_relative_tolerance=0., mask_max_disagreements=0)
         atomic_json(out / 'resolved_config.json', config)
         if audit_only:
             state.update(status='audit_passed', pairs=len(pairs))
