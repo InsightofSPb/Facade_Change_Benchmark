@@ -99,7 +99,8 @@ def evaluate(before, update, old_gt, new_gt, support, categories):
 class Inputs:
     """Read-only readers; even corrupt source caches are never quarantined/edited."""
 
-    def __init__(self, semantic_run, change_run):
+    def __init__(self, semantic_run, change_run, *, retain_probabilities=False):
+        self.retain_probabilities = retain_probabilities
         self.semantic_root = Path(semantic_run).expanduser().resolve()
         self.change_root = Path(change_run).expanduser().resolve()
         self.evidence = {}
@@ -206,11 +207,13 @@ class Inputs:
             if metadata['score_kind'] != 'independent_sigmoid':
                 raise ValueError('Expected the saved independent sigmoid DINO head')
             native = dict(scores=arrays['scores'], **{k: metadata[k] for k in ('class_names', 'score_kind')})
-            _, predicted, names = semantic_geometry.semantic_prediction(
+            probabilities, predicted, names = semantic_geometry.semantic_prediction(
                 native, self.config['vocabularies']['domain'], 'fixed', .5)
             if set(names) != set(self.names) or predicted.shape[1:] != data['packed'].shape:
                 raise ValueError('DINO channels/grid differ from the explicit current ontology')
             data['semantic'] = pack(predicted[[names.index(name) for name in self.names]])
+            if self.retain_probabilities:
+                data['probabilities'] = probabilities[[names.index(name) for name in self.names]]
             self.frame_cache[key] = data
         return self.frame_cache[key]
 
