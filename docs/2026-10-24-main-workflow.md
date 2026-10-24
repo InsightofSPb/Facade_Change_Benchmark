@@ -24,7 +24,6 @@ split, методов и нового `--out` остаётся явным. Ко�
 
 | Стадия | Задачи | Вход → выход |
 |---|---|---|
-| prepare | statistics | Только COCO + правила имён/метаданные → фасадная статистика, годы и CSV; RGB не читаются |
 | prepare | dataset, align, crops | COCO + RGB + подтверждённые метаданные → dataset/split; RGB + manifest → alignment; сохранённая геометрия → crop dataset |
 | prepare | augmentations, synthetic, history | Подготовленный semantic dataset → фиксированные кропы/аугментации или пятикадровые истории; reviewed RGB crop dataset → контролируемые H0/H1 |
 | prepare | real-audit, real, robustness, transitions | Сохранённые реальные данные и геометрия → audit → подготовленные истории/варианты наблюдений/кандидаты переходов |
@@ -147,12 +146,30 @@ python -m facade_change workflow gallery atlas --serve runs/2026-10-24-atlas-001
 геометрию и GT; экспорт не запускает обучение или inference. Требования к
 подготовленным кропам и bundle сохранены в [atlas contract](2026-10-18-facade-atlas.md).
 
-## Локальные статистика, отчёт и галереи
+## Локальный скрипт статистики и выравнивания
+
+По уточнению владельца от 2026-10-24 `data/dataset_statistics.py` исключён из
+этого PR. Его новая локальная версия имеет режимы `--mode stats` и `--mode prepare`:
+статистика зданий/видов и инкрементальное попарное выравнивание SIFT/LoFTR/GeoSCD
+с проверкой cache, планом запуска и галереей для review. Она вызывает существующие
+`facade_change batch` и `facade_change geoscd`; эти команды сохраняются.
+
+Файл остаётся под локальным управлением владельца. В этом PR нет ни его копии
+в пакете, ни launcher-а, ни команды `prepare statistics`, ни связанных тестов
+старой версии. Правило игнорирования `data/` остаётся исходным. Новая локальная
+версия просмотрена как исходный код; её GPU-работоспособность здесь не проверялась.
+
+Пересечение с `prepare align` относится к запуску существующих методов
+выравнивания. Самостоятельный скрипт добавляет инкрементальный cache и выбор
+результата пары. Его `pairs.json` описывает кандидатов попарного выравнивания;
+это ещё не общий холст истории и не готовый crop dataset. Автоматического
+перехода из этого формата в `prepare crops` данный PR не добавляет.
+`prepare dataset`, `crops`, `synthetic`, `history`, `real` и `robustness` нужны
+для остальных этапов и остаются в workflow.
+
+## Локальные отчёт и галереи
 
 ```bash
-python -m facade_change workflow prepare statistics data/result_coco_402.json \
-  --out runs/2026-10-24-statistics-001
-
 python -m facade_change workflow benchmark temporal-snapshot \
   --run /path/to/temporal-experiment \
   --out runs/2026-10-24-temporal-snapshot-001
@@ -166,9 +183,6 @@ python -m facade_change workflow gallery lofo \
   --out runs/2026-10-24-lofo-gallery-001
 ```
 
-- `statistics` считает фотографии, фасады, различные годы и длительности историй.
-  Он не выравнивает снимки, не создаёт кропы и не меняет split. Автоматического
-  пересчёта только историй с новыми фотографиями эта команда не добавляет.
 - `temporal-snapshot` принимает составной temporal experiment, включая активный
   запуск. Фиксирует список записанных units, оценивает только полные synthetic VAL
   группы, калибрует scalar-пороги по VAL H0 и сравнивает PREVIOUS/HISTORY. Неполные
@@ -201,7 +215,7 @@ python -m facade_change workflow gallery lofo \
 | `build_facade_gallery.py` | Реализация в `facade_change/gallery/report_sheets.py`, команда `gallery sheets` |
 | `make_old_methods_gallery.py` | Реализация в `facade_change/gallery/lofo.py`, команда `gallery lofo`; одинаковые функции масок/метрик переиспользуются из владельцев |
 | `scripts/2026-10-17_temporal_quick_report.py` | Реализация в `facade_change/research/temporal_quick_report.py`, команда `benchmark temporal-snapshot` |
-| `data/dataset_statistics.py` | Реализация в `facade_change/dataset_statistics.py`, команда `prepare statistics`; прежний файл — launcher |
+| `data/dataset_statistics.py` | Исключён из PR; новая локальная версия владельца сохраняется без замены |
 | Корневой `2026-10-18-collect-prepared.py` | Та же реализация, что уже перенесена в `gallery/history_bundle.py`; добавлен только совместимый launcher |
 | Тесты | 11 dated-файлов переименованы по функции; убран ручной loader из test_scorers; проверки доступны обычному discovery |
 
@@ -217,10 +231,10 @@ tracked-файлов semantic adapters/config/routes, их тестов и ин�
 копия patch в корне не нужна. `HEAD.txt` и `changes.patch` — сведения о передаче,
 их содержимое учтено здесь и в Git, а не как новый рабочий код.
 
-Загруженная статистика совпадает с файлом коммита
-`b5bdb7b8680974a563bd871d01d813177e863ab1`. Из него также перенесены инструкция
-и 11 проверок статистики в `tests/test_dataset_statistics.py`, отдельно от dataset audit.
-Это перенос перечисленных файлов, а не слияние всей истории той ветки.
+Старая статистика из архива совпадала с файлом коммита
+`b5bdb7b8680974a563bd871d01d813177e863ab1`, но её перенос, инструкция и 11 тестов
+исключены из итогового PR по просьбе владельца: отдельная локальная версия уже
+содержит более новую подготовку выравниваний.
 Два локальных документа `2026-10-11_frozen_geoscd_fusion.md` и
 `2026-10-11_method_complementarity.md` сохранены с пометкой об исторических командах
 и ссылкой на действующий `data_analysis`.

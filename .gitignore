@@ -8,8 +8,7 @@ __pycache__/
 configs/local*.json
 configs/*.local.json
 runs/
-data/*
-!data/dataset_statistics.py
+data/
 datasets/
 weights/
 models/

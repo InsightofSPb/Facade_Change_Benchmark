@@ -29,7 +29,6 @@ ROBUSTNESS = "scripts.real_eval.real_robustness"
 
 COMMANDS = {
     "prepare": {
-        "statistics": Command("facade_change.dataset_statistics", "Count COCO facade histories without decoding RGB"),
         "dataset": Command("facade_change.dataset_setup", "COCO, reviewed identities and facade-disjoint splits"),
         "align": Command(CORE, "Align original RGB pairs; optionally export crops", ("batch",)),
         "crops": Command(CORE, "Export a crop dataset from saved alignment", ("crop-dataset",)),
