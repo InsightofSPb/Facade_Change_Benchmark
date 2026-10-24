@@ -30,6 +30,8 @@
 его завершённая сессия подключается к `prepare crops --alignment-session` и
 `prepare real-audit --alignment-session` без повторного выравнивания. Выбор метода,
 review, split и ссылки на Canny/cycle/drift сохраняются; синтетика работает как раньше.
+После отдельного quality rerun можно явно передать `--quality-report`: импорт
+проверяет сохранённые хеши и сохраняет исходный статус preparation без его правки.
 
 ## Данные и научный контракт
 

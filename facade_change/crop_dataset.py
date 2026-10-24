@@ -36,7 +36,7 @@ def _checked_pair_run(batch_run, batch_record, row, reference, source, manifest_
 
 def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
                          stride=128, min_valid_fraction=.8, controls=0, seed=42,
-                         alignment_session=None, split_file=None):
+                         alignment_session=None, split_file=None, quality_report=None):
     """Reuse accepted geometry and original RGB; preserve the existing gold split.
 
     ``controls`` is a total source-crop budget across this dataset. Procedural
@@ -44,6 +44,8 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
     """
     if (batch_run is None) == (alignment_session is None):
         raise ValueError("Choose exactly one of --batch-run and --alignment-session")
+    if quality_report is not None and alignment_session is None:
+        raise ValueError("--quality-report requires --alignment-session")
     if alignment_session is not None and methods is not None:
         raise ValueError("Session selection is authoritative; omit --methods (no fallback or reranking)")
     methods = list(("loftr", "sift") if methods is None else methods)
@@ -58,7 +60,7 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
     session = None
     if alignment_session is not None:
         from .alignment_session import load_session
-        session = load_session(alignment_session)
+        session = load_session(alignment_session, quality_report=quality_report)
         manifest_path = session.manifest_path
         manifest = session.manifest
         pairs = session.pairs
@@ -121,6 +123,7 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
                         "geometry_scope": "saved session geometry; no rematching" if session else "existing accepted homographies only; no rematching"}
     if session:
         config.update(alignment_session=str(session.path), quality_report=session.quality_report, method_priority=None,
+                      alignment_session_completion=session.completion,
                       selection_policy="exact saved selected_method; quality ranking advisory")
     record = run_record("crop_dataset", config)
     write_json(out / "run.json", record)
@@ -209,6 +212,7 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
                               "source_crop_count": control_sources, "examples": control_rows, "failures": control_failures}}
         if session:
             index.update(alignment_session=str(session.path), quality_report=session.quality_report,
+                         alignment_session_completion=session.completion,
                          image_selection="exact_completed_session_selection",
                          selection_status_counts=dict(Counter(p["selection_status"] for p in pairs)))
         write_json(out / index_name, index)

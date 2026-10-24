@@ -1,4 +1,4 @@
-"""Read the owner's completed incremental alignment sessions, without inference.
+"""Read frozen incremental alignment selections, without inference.
 
 Selection belongs to pairs.json. Quality rankings are advisory and never replace
 that selection. The immutable review.csv binds each decision to exact run bytes.
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +60,7 @@ class AlignmentSession:
     selected: dict
     fingerprints: dict
     quality_report: str | None
+    completion: dict
 
     def matches(self):
         found = defaultdict(list)
@@ -73,20 +75,102 @@ class AlignmentSession:
         return found, attempts
 
 
-def load_session(value, fingerprints=None):
+@contextmanager
+def _stopped_preparation(root):
+    """Read an existing cache lock; never create or rewrite preparation files."""
+    import fcntl
+
+    lock_path = root.parent.parent / ".preparation.lock"
+    if root.parent.name != "sessions" or not lock_path.is_file():
+        raise ValueError("Quality-backed import requires the original cache's .preparation.lock")
+    with lock_path.open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("Alignment preparation is still running; wait for its cache lock to be released") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _quality_snapshot(value, root, hashes, expected=None):
+    qroot = Path(value).expanduser().resolve()
+    if qroot.name == "quality_report.html":
+        qroot = qroot.parent
+    record = read_json(remember(qroot / "run.json", hashes, expected))
+    if (record.get("kind") != "alignment_quality_diagnostics"
+            or record.get("status") not in {"completed_exploratory", "completed_with_issues"}):
+        raise ValueError("Session quality report is incomplete or has the wrong kind")
+    for name in ("pairs.json", "inputs.json"):
+        digest = record.get("config", {}).get("session_sha256", {}).get(name)
+        if not digest:
+            raise ValueError("Quality report lacks preparation input hashes")
+        remember(root / name, hashes, digest)
+    for name in ("protocol.json", "quality_summary.json", "quality_ranking.json",
+                 "quality_cycles.json", "quality_drift.json"):
+        artifact(qroot, record, name, hashes)
+    return qroot, record
+
+
+def _quality_rows(qroot, record, name, hashes):
+    rows = read_json(artifact(qroot, record, name, hashes))
+    indexed = {}
+    for row in rows:
+        key = (row["pair_id"], row["method"])
+        if key in indexed:
+            raise ValueError(f"Duplicate pair/method in quality artifact: {name}")
+        indexed[key] = row
+    return indexed
+
+
+def load_session(value, fingerprints=None, quality_report=None):
     """Validate immutable metadata and selected geometry; do not decode RGB."""
+    root = resolve_session(value)
+    if quality_report is not None:
+        with _stopped_preparation(root):
+            return _load_session(root, fingerprints, quality_report)
+    return _load_session(root, fingerprints)
+
+
+def _load_session(root, fingerprints, quality_report=None):
     hashes = {} if fingerprints is None else fingerprints
     for name in ("alignment_session.py", "saved_geometry.py", "geoscd.py"):
         remember(Path(__file__).with_name(name), hashes)
-    root = resolve_session(value)
     record = read_json(remember(root / "run.json", hashes))
-    if (record.get("kind") != "incremental_alignment_preparation"
-            or record.get("status") not in {"completed_needs_review", "completed_with_issues", "completed"}
-            or record.get("config", {}).get("plan_only")):
-        raise ValueError("Alignment session is not completed; wait for preparation and quality evaluation to finish")
-    documents = {name: read_json(artifact(root, record, name + ".json", hashes))
-                 for name in ("inputs", "pairs", "summary")}
-    inputs, pairs, summary = (documents[name] for name in ("inputs", "pairs", "summary"))
+    status = record.get("status")
+    complete = status in {"completed_needs_review", "completed_with_issues", "completed"}
+    if record.get("kind") != "incremental_alignment_preparation" or record.get("config", {}).get("plan_only"):
+        raise ValueError("Expected a preparation session with real alignments, not a plan-only run")
+    if not complete and (quality_report is None or status not in {"failed", "interrupted", "running"}):
+        raise ValueError(f"Alignment session is not completed (status={status!r}): {root / 'run.json'}. "
+                         "If a separate quality evaluation finished, pass its exact directory with --quality-report; "
+                         "otherwise wait for preparation to finish")
+    completion = {"preparation_status": status,
+                  "basis": "preparation_record" if complete else "explicit_quality_snapshot"}
+    quality = qroot = qrecord = None
+    evidence, metrics = {}, {}
+    if quality_report is not None:
+        qroot, qrecord = _quality_snapshot(quality_report, root, hashes)
+        quality = str(qroot)
+    if complete:
+        documents = {name: read_json(artifact(root, record, name + ".json", hashes))
+                     for name in ("inputs", "pairs", "summary")}
+        inputs, pairs, summary = (documents[name] for name in ("inputs", "pairs", "summary"))
+        review_path = artifact(root, record, "review.csv", hashes)
+        if quality is None and summary.get("quality_report"):
+            qroot, qrecord = _quality_snapshot(summary["quality_report"], root, hashes, summary["quality_run_sha256"])
+            quality = str(qroot)
+    else:
+        # A separate --mode evaluate binds these inputs even when the parent
+        # failed before writing artifact_sha256. Never invent parent hashes or
+        # rewrite its status; bind each selected run to that quality snapshot.
+        inputs, pairs = (read_json(root / name) for name in ("inputs.json", "pairs.json"))
+        review_path = remember(root / "review.csv", hashes)
+        evidence = _quality_rows(qroot, qrecord, "alignment_provenance.json", hashes)
+        metrics = _quality_rows(qroot, qrecord, "quality_pairs.json", hashes)
+    if qroot is not None:
+        completion.update(quality_report=quality, quality_run_sha256=hashes[str(qroot / "run.json")])
     manifest_path = remember(inputs["manifest"], hashes, inputs["manifest_sha256"])
     if record["config"].get("manifest_sha256") != inputs["manifest_sha256"]:
         raise ValueError("Session manifest fingerprints disagree")
@@ -114,7 +198,6 @@ def load_session(value, fingerprints=None):
     validate_partitions([row for row in images.values() if row.get("metadata_status") == "reviewed"
                          and row.get("building_id") and row.get("view_id")])
     validate_partitions(list(current.values()))
-    review_path = artifact(root, record, "review.csv", hashes)
     with review_path.open(encoding="utf-8-sig", newline="") as stream:
         reviews = {}
         for row in csv.DictReader(stream):
@@ -157,6 +240,21 @@ def load_session(value, fingerprints=None):
                 or review.get("state") != entry["state"] or not review.get("alignment_run_sha256")):
             raise ValueError("Session selection lacks its hash-bound review record")
         path = Path(entry["path"]).expanduser().resolve()
+        if not complete:
+            proof, metric = evidence.get((pid, method), {}), metrics.get((pid, method), {})
+            required = {"run.json", "geometry.json"}
+            if method == "geoscd":
+                required.add("correspondences.npz")
+            if (Path(proof.get("path", "")).expanduser().resolve() != path
+                    or any(not proof.get("sha256", {}).get(name) for name in required)
+                    or proof["sha256"]["run.json"] != review["alignment_run_sha256"]
+                    or any(proof.get(k) != pair[k] for k in
+                           ("building_id", "view_id", "reference_year", "source_year"))
+                    or metric.get("state") != entry["state"] or metric.get("review", "") != entry.get("review", "")
+                    or metric.get("status") not in {"ok", "insufficient_edges"}):
+                raise ValueError(f"Selected alignment lacks matching completed quality evidence: {pid}/{method}")
+            for name in required:
+                remember(path / name, hashes, proof["sha256"][name])
         original_record = read_json(remember(path / "run.json", hashes, review["alignment_run_sha256"]))
         status = str(original_record.get("status", ""))
         if not status.startswith("completed"):
@@ -187,22 +285,15 @@ def load_session(value, fingerprints=None):
         # Cache reuse is content based: old COCO IDs/paths may differ. Preserve
         # the original run bytes, use verified current observations downstream.
         selection = {"session": str(root), "pair_id": pid, "method": method,
+                     "session_completion": completion,
                      "selection_status": pair["selection_status"], "review": decision,
                      "alignment_run_sha256": review["alignment_run_sha256"],
                      "observations": {"reference": reference, "source": source}}
         selected[pid] = {"path": path, "method": method, "selection": selection,
                          "record": {**original_record, "observations": selection["observations"]}}
-    quality = summary.get("quality_report")
-    if quality:
-        qroot = Path(quality).expanduser().resolve()
-        qrecord = read_json(remember(qroot / "run.json", hashes, summary["quality_run_sha256"]))
-        if not str(qrecord.get("status", "")).startswith("completed"):
-            raise ValueError("Session quality report is incomplete")
-        for name in ("pairs.json", "inputs.json"):
-            if qrecord["config"]["session_sha256"].get(name) != hashes[str(root / name)]:
-                raise ValueError("Quality report refers to another preparation selection")
-        for name in ("protocol.json", "quality_summary.json", "quality_ranking.json",
-                     "quality_cycles.json", "quality_drift.json"):
-            artifact(qroot, qrecord, name, hashes)
+    for name in ("run.json", "inputs.json", "pairs.json", "review.csv"):
+        remember(root / name, hashes)
+    if qroot is not None:
+        remember(qroot / "run.json", hashes)
     return AlignmentSession(root, manifest_path, {**manifest, "images": list(images.values())},
-                            pairs, selected, hashes, quality)
+                            pairs, selected, hashes, quality, completion)

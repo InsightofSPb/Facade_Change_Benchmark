@@ -47,6 +47,7 @@ def session_fixture(root, dense=False):
     write_json(data["dataset"] / "split.json", split)
     session = root / "aligned/sessions/report-1"
     session.mkdir(parents=True)
+    (root / "aligned/.preparation.lock").touch()
     rows, reviews = [], []
     for index, (pair, value) in enumerate(zip(manifest["pairs"], data["runs"])):
         path = Path(value)
@@ -90,6 +91,38 @@ def session_fixture(root, dense=False):
     record = run_record("incremental_alignment_preparation", {"manifest_sha256": sha256(manifest_path), "plan_only": False})
     finish_record(session, record, "completed_needs_review")
     return data, session
+
+
+def quality_fixture(session):
+    """Separate --mode evaluate: it finalizes only the quality run."""
+    quality = session / "quality/report-2"
+    quality.mkdir(parents=True)
+    rows = read_json(session / "pairs.json")
+    metrics, provenance = [], []
+    for row in rows:
+        for method, entry in row["methods"].items():
+            path = Path(entry["path"])
+            metadata = {k: row[k] for k in ("pair_id", "building_id", "view_id", "reference_year", "source_year")}
+            metrics.append({**metadata, "method": method, "state": entry["state"], "review": entry["review"],
+                            "status": "insufficient_edges" if not metrics else "ok"})
+            names = ["run.json", "geometry.json"] + (["correspondences.npz"] if method == "geoscd" else [])
+            provenance.append({**metadata, "method": method, "path": str(path),
+                               "sha256": {name: sha256(path / name) for name in names}})
+    request = {"session": str(session), "out": str(quality),
+               "session_sha256": {name: sha256(session / name) for name in ("pairs.json", "inputs.json")}}
+    write_json(quality / "request.json", request)
+    for name in ("protocol", "quality_summary", "quality_cycles", "quality_drift"):
+        write_json(quality / (name + ".json"), {})
+    write_json(quality / "quality_ranking.json", [])
+    write_json(quality / "quality_pairs.json", metrics)
+    write_json(quality / "alignment_provenance.json", provenance)
+    (quality / "quality_report.html").write_text("<html></html>")
+    finish_record(quality, run_record("alignment_quality_diagnostics", request), "completed_exploratory")
+    record = read_json(session / "run.json")
+    record.pop("artifact_sha256")
+    record.update(status="failed", error="RuntimeError: Quality worker exited 1; alignment outputs retained")
+    write_json(session / "run.json", record)
+    return quality
 
 
 class AlignmentSessionTests(unittest.TestCase):
@@ -246,6 +279,107 @@ class AlignmentSessionTests(unittest.TestCase):
         write_json(second / "run.json", record)
         with self.assertRaisesRegex(ValueError, "found 2"):
             load_session(self.root / "aligned")
+
+    def test_separate_quality_rerun_recovers_crops_without_rewriting_preparation(self):
+        quality = quality_fixture(self.session)
+        before = {p: sha256(p) for p in self.root.rglob("*") if p.is_file()}
+        with self.assertRaisesRegex(ValueError, "status='failed'.*--quality-report"):
+            load_session(self.session)
+        out = self.root / "recovered-crops"
+        with patch("facade_change.pipeline.SIFTMatcher", side_effect=AssertionError("rematching")), \
+                patch("facade_change.geoscd.OfficialGeometry", side_effect=AssertionError("model loaded")):
+            self.assertEqual(cli.main(["workflow", "prepare", "crops", "--alignment-session", str(self.session),
+                                       "--quality-report", str(quality / "quality_report.html"), "--tile-size", "16",
+                                       "--stride", "16", "--out", str(out)]), 0)
+        summary = read_json(out / "summary.json")
+        self.assertEqual(summary["pair_method_counts"], {"sift": 4, "geoscd": 4})
+        config = read_json(out / "run.json")["config"]
+        self.assertEqual(config["quality_report"], str(quality))
+        self.assertEqual(config["alignment_session_completion"]["preparation_status"], "failed")
+        self.assertEqual(config["alignment_session_completion"]["basis"], "explicit_quality_snapshot")
+        self.assertIn(str(quality / "alignment_provenance.json"), config["input_sha256"])
+        self.assertEqual(before, {p: sha256(p) for p in before})
+
+    def test_separate_quality_snapshot_feeds_real_audit_and_unlabelled_histories(self):
+        quality = quality_fixture(self.session)
+        report = audit(self.data["run"], self.data["snapshot"], self.root / "recovered-audit",
+                       alignment_session=self.session, quality_report=quality)
+        self.assertEqual(report["coverage"]["accepted_pairs"], 8)
+        self.assertIn(str(quality / "run.json"), report["metadata_sha256"])
+        inputs = importlib.import_module("facade_change.research.2026-10-14_temporal_inputs")
+        sequences, provenance, _ = inputs.load_sequences({
+            "dataset": str(self.data["dataset"]), "alignment_runs": [str(self.session)],
+            "alignment_quality_report": str(quality), "real_tile_size": 16, "real_stride": 16})
+        self.assertTrue(sequences)
+        self.assertFalse(provenance["semantic_labels_loaded"])
+        for sequence in sequences:
+            for frame in sequence["frames"][1:]:
+                self.assertEqual(frame["alignment_selection"]["session_completion"]["preparation_status"], "failed")
+
+    def test_quality_recovery_rejects_incomplete_or_mismatched_snapshot(self):
+        quality = quality_fixture(self.session)
+        record = read_json(quality / "run.json")
+        for update in ({"status": "running"}, {"status": "failed"}, {"kind": "other"}):
+            with self.subTest(update=update):
+                write_json(quality / "run.json", {**record, **update})
+                with self.assertRaisesRegex(ValueError, "incomplete or has the wrong kind"):
+                    load_session(self.session, quality_report=quality)
+        write_json(quality / "run.json", record)
+        for name in ("pairs.json", "inputs.json"):
+            path = self.session / name
+            original = path.read_bytes()
+            path.write_bytes(original + b"\n")
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "hash mismatch"):
+                load_session(self.session, quality_report=quality)
+            path.write_bytes(original)
+        (quality / "alignment_provenance.json").write_text("[]")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            load_session(self.session, quality_report=quality)
+
+    def test_recovery_requires_quality_evidence_for_each_selected_pair(self):
+        quality = quality_fixture(self.session)
+        provenance = read_json(quality / "alignment_provenance.json")
+        write_json(quality / "alignment_provenance.json", provenance[1:])
+        finish_record(quality, read_json(quality / "run.json"), "completed_exploratory")
+        with self.assertRaisesRegex(ValueError, "lacks matching completed quality evidence"):
+            load_session(self.session, quality_report=quality)
+        write_json(quality / "alignment_provenance.json", provenance)
+        metrics = read_json(quality / "quality_pairs.json")
+        metrics[0]["status"] = "error"
+        write_json(quality / "quality_pairs.json", metrics)
+        finish_record(quality, read_json(quality / "run.json"), "completed_with_issues")
+        with self.assertRaisesRegex(ValueError, "lacks matching completed quality evidence"):
+            load_session(self.session, quality_report=quality)
+
+    def test_quality_snapshot_prevents_rebinding_review_to_changed_child(self):
+        quality = quality_fixture(self.session)
+        path = Path(self.data["runs"][0]) / "run.json"
+        old = sha256(path)
+        path.write_bytes(path.read_bytes() + b"\n")
+        review = self.session / "review.csv"
+        review.write_text(review.read_text().replace(old, sha256(path)))
+        with self.assertRaisesRegex(ValueError, "lacks matching completed quality evidence"):
+            load_session(self.session, quality_report=quality)
+
+    def test_active_preparation_is_blocked_but_stale_running_record_can_be_imported(self):
+        import fcntl
+
+        quality = quality_fixture(self.session)
+        record = read_json(self.session / "run.json")
+        record["status"] = "running"
+        write_json(self.session / "run.json", record)
+        with (self.root / "aligned/.preparation.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(ValueError, "still running"):
+                load_session(self.session, quality_report=quality)
+        session = load_session(self.session, quality_report=quality)
+        self.assertEqual(len(session.selected), 8)
+        self.assertEqual(session.completion["preparation_status"], "running")
+        self.assertEqual(read_json(self.session / "run.json")["status"], "running")
+        record["config"]["plan_only"] = True
+        write_json(self.session / "run.json", record)
+        with self.assertRaisesRegex(ValueError, "plan-only"):
+            load_session(self.session, quality_report=quality)
 
     def test_hash_bound_selection_and_dense_review_cannot_be_bypassed(self):
         pair = Path(self.data["runs"][1]) / "run.json"

@@ -152,8 +152,10 @@ def _dataset(path, fingerprints):
     return rows, manifest.get("pairs", []), split
 
 
-def _alignments(paths, fingerprints):
+def _alignments(paths, fingerprints, quality_report=None):
     found, attempts = defaultdict(list), []
+    if quality_report is not None and len(paths) != 1:
+        raise ValueError("A quality report requires exactly one alignment session")
     for value in paths:
         root = Path(value).expanduser().resolve()
         if (root / "sessions").is_dir():
@@ -161,13 +163,15 @@ def _alignments(paths, fingerprints):
             root = resolve_session(root)
         record = read_json(_remember(root / "run.json", fingerprints))
         status = str(record.get("status", ""))
-        if not status.startswith("completed") and status not in {"interrupted", "failed"}:
-            raise ValueError("Alignment input must be terminal, not still running")
         if record.get("kind") == "incremental_alignment_preparation":
             if len(paths) != 1:
                 raise ValueError("Use the selected alignment session alone; mixing runs would override its exclusions")
             from facade_change.alignment_session import load_session
-            return load_session(root, fingerprints).matches()
+            return load_session(root, fingerprints, quality_report=quality_report).matches()
+        if quality_report is not None:
+            raise ValueError("A quality report requires an incremental alignment session")
+        if not status.startswith("completed") and status not in {"interrupted", "failed"}:
+            raise ValueError("Alignment input must be terminal, not still running")
         if record.get("kind") == "pair_alignment":
             candidates = [(root, record, record.get("config", {}).get("method", "unknown"))]
         elif record.get("kind") == "alignment_and_data_batch":
@@ -201,7 +205,8 @@ def _alignments(paths, fingerprints):
 
 def _real(config, fingerprints):
     images, pairs, split = _dataset(config["dataset"], fingerprints)
-    alignments, attempts = _alignments(config.get("alignment_runs", []), fingerprints)
+    alignments, attempts = _alignments(config.get("alignment_runs", []), fingerprints,
+                                       quality_report=config.get("alignment_quality_report"))
     pair_keys = {(str(p["reference_id"]), str(p["source_id"])) for p in pairs}
     groups, excluded = defaultdict(list), []
     for row in images:

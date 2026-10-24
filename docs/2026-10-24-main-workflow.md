@@ -178,10 +178,34 @@ conda run --no-capture-output -n lposs310 python -B -m facade_change workflow pr
 `data/aligned` разрешается только при наличии ровно одной сессии. При нескольких
 передайте конкретный путь из строки `Reports:`, например
 `data/aligned/sessions/report-2`; выбор «самой свежей» не выполняется.
-Незавершённая/failed/plan-only сессия отклоняется. Новый каталог `data/crops`
+Без дополнительного подтверждения незавершённая/failed сессия отклоняется;
+plan-only отклоняется всегда. Новый каталог `data/crops`
 должен отсутствовать. Если рядом с manifest нет `split.json`, добавьте
 `--split-file /path/to/existing/prepared/split.json`: принадлежность здания
 должна совпадать с manifest; новый split не создаётся.
+
+Если preparation упал во время quality worker, отдельный `--mode evaluate`
+завершает свой quality-отчёт, но **не завершает родительский `run.json`**.
+Для этого случая передайте точный завершённый отчёт явно:
+
+```bash
+python -B -m facade_change workflow prepare crops \
+  --alignment-session data/aligned/sessions/report-1 \
+  --quality-report data/aligned/sessions/report-1/quality/report-2 \
+  --out data/crops
+```
+
+Можно указать и напечатанный путь к `quality_report.html`. Импорт проверяет
+завершение quality run, его хеши `pairs.json`/`inputs.json`, качество обработки
+каждой выбранной пары и сохранённые хеши её run/геометрии. Недостаток Canny-границ
+допустим; ошибка обработки или отсутствие provenance выбранной пары — отказ.
+Исходные решения review сопоставляются с проверенными pairs и run-хешами quality.
+Существующий `.preparation.lock` должен быть свободен: активный prepare не
+импортируется. Оставшийся после остановки статус `running` допустим только при
+этих же проверках. Статус исходной сессии и её файлы **не переписываются**;
+новый экспорт сохраняет `alignment_session_completion` с исходным статусом,
+основанием `explicit_quality_snapshot` и хешем выбранного quality run.
+Самый новый отчёт автоматически не выбирается. Повторный alignment не нужен.
 
 Результат: `run.json`, `summary.json`, `split.json`, индекс JSON/CSV с путём в
 `summary.json`, `excluded_pairs.csv`, RGB-кропы, маски геометрической поддержки,
@@ -225,6 +249,8 @@ PREVIOUS/EARLIEST/HISTORY, real gallery и atlas bundle. Модели и пор�
 Неразмеченный research loader также принимает путь сессии единственным элементом
 `alignment_runs` в temporal config; он выбирает кропы по геометрической поддержке,
 не загружает semantic GT и не меняет синтетическую ветвь.
+Для отдельного quality rerun `prepare real-audit` принимает тот же
+`--quality-report`; research config использует `alignment_quality_report`.
 
 Правила подключения:
 

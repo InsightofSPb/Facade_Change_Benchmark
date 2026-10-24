@@ -182,11 +182,13 @@ def _parents(images, pairs, alignments, fingerprints, splits, strict_alignment_p
 
 
 def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None,
-          splits=("train", "val", "test"), dataset=None, alignment_session=None):
+          splits=("train", "val", "test"), dataset=None, alignment_session=None, quality_report=None):
     """Freeze metadata/geometry and expose missing coverage without decoding RGB/GT."""
     splits = tuple(splits)
     if not splits or len(set(splits)) != len(splits) or not set(splits) <= {"train", "val", "test"}:
         raise ValueError("Нужны различные split из train, val, test")
+    if quality_report is not None and alignment_session is None:
+        raise ValueError("--quality-report requires --alignment-session")
     context = _context(run_path, snapshot_path)
     out = _new_output(out_path, [Path(context[key]) for key in ("source_run", "snapshot")])
     inputs = importlib.import_module("facade_change.research.2026-10-14_temporal_inputs")
@@ -206,7 +208,7 @@ def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None
     alignments, attempts, loaded = defaultdict(list), [], []
     for path in paths:
         try:
-            found, run_attempts = inputs._alignments([path], fingerprints)
+            found, run_attempts = inputs._alignments([path], fingerprints, quality_report=quality_report)
         except (ValueError, KeyError, TypeError, OSError) as error:
             if path in configured:
                 raise

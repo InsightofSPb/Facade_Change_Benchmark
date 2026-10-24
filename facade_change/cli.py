@@ -85,6 +85,7 @@ def parser():
     crop_input = dataset_crops.add_mutually_exclusive_group(required=True)
     crop_input.add_argument("--batch-run")
     crop_input.add_argument("--alignment-session", help="Completed dataset_statistics session (or an unambiguous cache root)")
+    dataset_crops.add_argument("--quality-report", help="Explicit completed quality report for a separate evaluation or interrupted preparation")
     dataset_crops.add_argument("--split-file", help="Existing reviewed split.json if not beside the alignment manifest")
     dataset_crops.add_argument("--out", required=True)
     dataset_crops.add_argument("--methods", nargs="+", choices=["loftr", "sift", "cascade"],
