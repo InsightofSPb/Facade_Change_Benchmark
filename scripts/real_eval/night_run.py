@@ -215,6 +215,7 @@ def run(prepared_path, out_path, methods=None, history_methods=None,
                     preflight_failures["history/"+method] = f"{type(error).__name__}: {error}"
     jobs = _jobs(manifest, methods, history_methods, modes, pilot, pilot_pairs, pilot_history_frames)
     paths = [Path(__file__), Path(night_common.__file__), Path(__file__).with_name("robustness_run.py"),
+             Path(__file__).with_name("source_unit_metadata.py"),
              Path(__file__).with_name("geoscd_real_retry.py"),
              Path(__file__).parents[2]/"facade_change/research/2026-10-14_temporal_history.py"]
     contract = {"schema_version": 1, "prepared_path": str(prepared / "manifest.json"),
@@ -256,11 +257,13 @@ def _process(prepared, manifest, out, contract, cached, retry_failed, pool_facto
     sequences = {s["sequence_id"]: s for s in manifest["sequences"]}
     TemporalMemory = importlib.import_module("facade_change.research.2026-10-14_temporal_history").TemporalMemory
     rows, method_failures, blocked_sequences = [], {}, set()
+    scheduled_groups = {(mode, method) for method, mode, _, _ in jobs}
     for key, error in contract["preflight_failures"].items():
         groups = ([tuple(key.split("/"))] if "/" in key
                   else [(mode, key) for mode in contract["modes"]])
         for group in groups:
-            method_failures[group] = error
+            if group in scheduled_groups:
+                method_failures[group] = error
         _event(out, "preflight_method_failed", method=key, error=error)
     status, fatal, pool, active_key, active_metadata = "completed", None, None, None, None
     memory, history_key, previous_hash = None, None, None
@@ -475,6 +478,18 @@ def _process(prepared, manifest, out, contract, cached, retry_failed, pool_facto
             if not timing["unmeasured"]:
                 print(f"Оценка всей очереди до переиспользования: {timing['estimated_hours_low']:.2f}–"
                       f"{timing['estimated_hours_high']:.2f} ч; это ориентир, не гарантия.", flush=True)
+        print(f"Итог: {status}; готово {summary['completed']}/{summary['total']}; "
+              f"ошибок расчёта {failed}; не обработано {summary['unprocessed']}.", flush=True)
+        if method_failures:
+            grouped_failures = defaultdict(list)
+            for group, error in method_failures.items():
+                grouped_failures[error].append("/".join(group))
+            print("Отказы методов; не начатые расчёты учтены в «не обработано»:", flush=True)
+            for error, groups in grouped_failures.items():
+                print(f"  {', '.join(groups)}: {error}", flush=True)
+        if fatal:
+            print("Ошибка проверки: "+fatal, flush=True)
+        print(f"Подробности: {out/'summary.json'}", flush=True)
         run_record.update(status=status, finished_at=time.time())
         atomic_json(out/"run.json", run_record)
         _event(out, status, completed=summary["completed"], failed=failed, unprocessed=summary["unprocessed"])

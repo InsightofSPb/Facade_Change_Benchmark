@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def main():
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--dataset", help="Completed preparation directory or dataset.json; required for preparation/training")
     parser.add_argument("--prepare-only", action="store_true", help="Save every TRAIN crop plus two augmentations; VAL originals only; no model/GPU")
@@ -36,7 +37,7 @@ def main():
     parser.add_argument("--cutout-prob", type=float, help="Preparation only; default 0.125")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Short training check using an already complete augmentation snapshot")
-    arguments = vars(parser.parse_args())
+    arguments = vars(parser.parse_args(argv))
     if arguments["out"] is None:
         tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         suffix = (("-semantic-originals" if arguments["evaluation_mode"] == "originals" else "-semantic-robustness") if arguments["evaluate_run"] else "-semantic-augmentations"
@@ -54,7 +55,7 @@ def main():
             allowed = {"--evaluate-run", "--augmentations", "--device", "--batch-size",
                        "--out", "--smoke", "--no-amp", "--export-probabilities",
                        "--evaluation-mode", "--splits"}
-            explicit = {value.split("=", 1)[0] for value in sys.argv[1:] if value.startswith("--")}
+            explicit = {value.split("=", 1)[0] for value in argv if value.startswith("--")}
             rejected = sorted(explicit - allowed)
             if rejected:
                 parser.error("--evaluate-run uses the saved training settings; incompatible options: "
@@ -69,7 +70,7 @@ def main():
                                          smoke=arguments["smoke"], no_amp=arguments["no_amp"], **options)
             print(f"\nEvaluation ({evaluation_mode}): {result['out']}", flush=True)
             return
-        if splits is not None or any(value.split("=", 1)[0] == "--evaluation-mode" for value in sys.argv[1:]):
+        if splits is not None or any(value.split("=", 1)[0] == "--evaluation-mode" for value in argv):
             parser.error("--evaluation-mode/--splits require --evaluate-run")
         if export:
             parser.error("--export-probabilities requires --evaluate-run")
@@ -78,7 +79,7 @@ def main():
         if prepare_only:
             if arguments["smoke"] or arguments["augmentations"]:
                 parser.error("--prepare-only creates a complete snapshot; do not combine with --smoke/--augmentations")
-            if any(value.split("=", 1)[0] == "--train-eval-fraction" for value in sys.argv[1:]):
+            if any(value.split("=", 1)[0] == "--train-eval-fraction" for value in argv):
                 parser.error("--train-eval-fraction applies to training only")
             from .prepared import prepare_augmentations
             result = prepare_augmentations(arguments["dataset"], arguments["out"], seed=arguments["seed"],

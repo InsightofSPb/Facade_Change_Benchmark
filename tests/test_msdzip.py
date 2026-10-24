@@ -379,7 +379,7 @@ class OriginalMSDZipTests(unittest.TestCase):
     def test_actual_temporal_runner_trains_scores_reports_and_resumes_both_representations(self):
         from facade_change.io import read_json
         spec = importlib.util.spec_from_file_location(
-            "msdzip_temporal_fixture", Path(__file__).with_name("test_2026-10-14_temporal_inputs.py"))
+            "msdzip_temporal_fixture", Path(__file__).with_name("test_temporal_inputs.py"))
         fixtures = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fixtures)
         fixture = fixtures.TemporalInputsTests()

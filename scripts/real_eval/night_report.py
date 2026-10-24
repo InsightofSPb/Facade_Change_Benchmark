@@ -192,7 +192,11 @@ def _html(tables, coverage, comparisons, warnings):
              'summary{cursor:pointer;font-weight:bold}td:first-child{text-align:left}</style>',
              '<h1>Реальные временные изменения — выбранные кропы</h1>',
              '<p>Метрики в таблицах — %. В CSV — доли. Рабочая точка 0.01 / 0.05 обозначает целевой FPR '
-             'на исходной synthetic VAL H0 при выборе фиксированного порога; реальный FPR не ограничен этим числом.</p>']
+             'на исходной synthetic VAL H0 при выборе фиксированного порога; реальный FPR не ограничен этим числом.</p>',
+             '<p>Сочетания: &amp; = AND, подтверждение обоими сигналами; | = OR, срабатывание любого сигнала. '
+             'В каждом случае объединяются PREVIOUS и HISTORY с целью нового события. '
+             'Сравнение fusion/... использует PREVIOUS как базу, fusion/.../vs_history — HISTORY; '
+             'обе базы и сочетание оцениваются на одинаковых парах и пикселях.</p>']
     parts += ['<p>' + html.escape(warning) + '</p>' for warning in warnings]
     cols = ('predictor', 'point', 'training_scope', 'precision', 'recall', 'f1', 'iou', 'fpr',
             'marked_fraction', 'facades', 'evaluated_pairs', 'positive_pairs', 'tp', 'fp', 'fn', 'tn')
@@ -333,8 +337,8 @@ def report(run_path, out_path=None, budgets=(.01, .05)):
                         result = append_result(rows, prediction, value['support'], reference, current, header, True)
                         coverage['evaluable_pairs'] += bool(result['valid_pixels'])
                         predictions[(method, mode, point)] = (prediction, value['support'])
-            # History has a step-event target. It can gate PREVIOUS predictions;
-            # it must not silently gate an EARLIEST state mask with that target.
+            # History has a step-event target. AND and OR can combine it with
+            # PREVIOUS; an EARLIEST state mask has a different target.
             for gate in history_methods:
                 for point in budgets:
                     historical = predictions.get((gate, 'history', point))
@@ -346,18 +350,28 @@ def report(run_path, out_path=None, budgets=(.01, .05)):
                         if original is None:
                             continue
                         shared = original[1] & historical[1]
-                        predictor = baseline + '&' + gate + '_history'
                         exposure = _exposure([baseline, gate], sequence['building_id'], origins)
-                        header = dict(key_header, mode='history', target='step_event', comparison='previous_plus_history',
-                                      predictor=predictor, point=point, training_exposure=exposure)
-                        append_result(rows, original[0] & historical[0], shared, previous, current, header, True)
-                        comparison = 'fusion/' + predictor
-                        base_header = dict(header, comparison=comparison, predictor=baseline, role='baseline')
-                        test_header = dict(header, comparison=comparison, role='candidate')
-                        append_result(matched_rows, original[0], shared, previous, current,
-                                      base_header, matched_classes=True)
-                        append_result(matched_rows, original[0] & historical[0], shared, previous, current,
-                                      test_header, matched_classes=True)
+                        for operation, combined in (('&', original[0] & historical[0]),
+                                                    ('|', original[0] | historical[0])):
+                            predictor = baseline + operation + gate + '_history'
+                            header = dict(key_header, mode='history', target='step_event',
+                                          comparison='previous_plus_history', predictor=predictor,
+                                          point=point, training_exposure=exposure)
+                            append_result(rows, combined, shared, previous, current, header, True)
+                            # Keep the PREVIOUS comparison ID stable. The second
+                            # contrast makes any gain over the stronger component
+                            # visible without comparing different standalone cohorts.
+                            for suffix, component, component_name in (
+                                    ('', original[0], baseline),
+                                    ('/vs_history', historical[0], gate + '_history')):
+                                comparison = 'fusion/' + predictor + suffix
+                                base_header = dict(header, comparison=comparison,
+                                                   predictor=component_name, role='baseline')
+                                test_header = dict(header, comparison=comparison, role='candidate')
+                                append_result(matched_rows, component, shared, previous, current,
+                                              base_header, matched_classes=True)
+                                append_result(matched_rows, combined, shared, previous, current,
+                                              test_header, matched_classes=True)
                     original = predictions.get((gate, 'previous', point))
                     if original is not None:
                         shared = original[1] & historical[1]
@@ -410,6 +424,7 @@ def report(run_path, out_path=None, budgets=(.01, .05)):
         'Счётчики — суммы пиксельных наблюдений; перекрывающиеся кропы могут учитывать одно место несколько раз. Это не оценка целого фасада без повторов.',
         'Доля отмеченных пикселей измеряется только внутри оцениваемой области; она не измеряет время эксперта.',
         'Основные строки используют доступные результаты: покрытие может различаться. Дельты сравнений рассчитаны на одинаковых парах и поддержке.',
+        'AND и OR сравниваются отдельно с PREVIOUS-компонентом и HISTORY-компонентом на общей поддержке; для обеих сторон действует совместная принадлежность обучению. OR не ограничен FPR рабочей точки скалярной ветви.',
         'verified_unseen означает подтверждённое отсутствие фасада в проектном обучении компонента; неизвестное происхождение не считается unseen. Внешнее предобучение не аудировалось.',
         'В классовых срезах класс задан аннотацией; бинарный детектор сам не предсказывает тип повреждения. Интервалы неопределённости и статистическая значимость не рассчитаны.'
     ]
@@ -420,6 +435,8 @@ def report(run_path, out_path=None, budgets=(.01, .05)):
                       inference_status=run.get('status', 'unknown'),
                       thresholds=[dict(method=k[0], mode=k[1], point=k[2], threshold=v) for k, v in thresholds.items()],
                       history_update_thresholds=contract.get('history_thresholds', {}),
+                      fusion_operations={'&': 'AND', '|': 'OR'},
+                      fusion_comparison_bases=['previous_component', 'history_component'],
                       training_exposure=origins, boundary_tolerance=tolerance, no_model_inference=True,
                       metrics_csv_units='fractions', selected_gt_enriched_cohort=True, warnings=warnings)
     out.parent.mkdir(parents=True, exist_ok=True)

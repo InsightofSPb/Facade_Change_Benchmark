@@ -120,9 +120,9 @@ The first run remains blocked; no completed scientific comparison is claimed.
 
 ```bash
 PYTHONPATH=tests python -m unittest \
-  test_2026-10-19_directed_delta_updates \
-  test_2026-10-19_continuous_semantic_updates \
-  test_2026-10-19_semantic_updates \
+  test_directed_delta_updates \
+  test_continuous_semantic_updates \
+  test_semantic_updates \
   test_real_gt_calibration test_semantic_geometry -v
 ```
 

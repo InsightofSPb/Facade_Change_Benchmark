@@ -20,4 +20,4 @@ segmentation = ["torch>=2.1", "pycocotools==2.0.11"]
 facade = "facade_change.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["facade_change*", "data_analysis*"]
+include = ["facade_change*", "data_analysis*", "scripts.real_eval*"]

@@ -144,6 +144,77 @@ class RealTemporalReportTests(unittest.TestCase):
         self.assertEqual((fusion['facades'], fusion['evaluated_pairs']), (1, 2))
         self.assertFalse(any(row['mode'] == 'earliest' and '&' in row['predictor'] for row in result['tables']))
 
+    def test_or_and_and_compare_both_components_on_shared_support(self):
+        # Complementary predictions: PREVIOUS marks [0,1], HISTORY [0,0].
+        # A PREVIOUS false positive at [1,0] lies outside HISTORY support and
+        # must be excluded from every component and combination comparison.
+        for frame in (1, 2):
+            unit = self.run / 'units' / f'B-{frame}-previous-rgb_diff.json'
+            record = read_json(unit)
+            path = self.run / record['artifact_path']
+            with np.load(path, allow_pickle=False) as archive:
+                arrays = {key: archive[key].copy() for key in archive.files}
+            arrays['scores'] = np.array([[0., 1.], [1., 0.]], np.float32)
+            record['artifact_sha256'] = atomic_npz(path, arrays)
+            atomic_json(unit, record)
+        with patch('subprocess.Popen', side_effect=AssertionError('Reporting must not infer')):
+            result = night_report.report(self.run)
+        union = 'rgb_diff|msdzip_abs_history'
+        intersection = 'rgb_diff&msdzip_abs_history'
+        for predictor, counts in ((union, (3, 1, 0, 0)), (intersection, (0, 0, 3, 1))):
+            for suffix, baseline, base_counts in (
+                    ('', 'rgb_diff', (1, 1, 2, 0)),
+                    ('/vs_history', 'msdzip_abs_history', (2, 0, 1, 1))):
+                row = select(result['comparisons'], comparison='fusion/' + predictor + suffix,
+                             split_scope='test', training_scope='all', point=.01, region='overall')
+                self.assertEqual(row['baseline'], baseline)
+                self.assertEqual((row['evaluated_pairs'], row['valid_pixels']), (2, 4))
+                self.assertEqual(tuple(row['baseline_' + name] for name in ('tp', 'fp', 'fn', 'tn')), base_counts)
+                self.assertEqual(tuple(row['candidate_' + name] for name in ('tp', 'fp', 'fn', 'tn')), counts)
+                self.assertEqual(row['baseline_valid_pixels'], row['candidate_valid_pixels'])
+        vs_previous = select(result['comparisons'], comparison='fusion/' + union,
+                             split_scope='test', training_scope='all', point=.01, region='overall')
+        vs_history = select(result['comparisons'], comparison='fusion/' + union + '/vs_history',
+                            split_scope='test', training_scope='all', point=.01, region='overall')
+        self.assertAlmostEqual(vs_previous['delta_f1'], .5)
+        self.assertAlmostEqual(vs_history['delta_f1'], 0.)
+        self.assertEqual((vs_history['baseline_fpr'], vs_history['candidate_fpr']), (0., 1.))
+        self.assertFalse(any(row['mode'] == 'earliest' and '|' in row['predictor'] for row in result['tables']))
+        for training_scope, split_scope in (('seen', 'train'), ('verified_unseen', 'test')):
+            for predictor in (union, intersection):
+                row = select(result['tables'], predictor=predictor, mode='history', point=.01,
+                             split_scope=split_scope, training_scope=training_scope)
+                self.assertEqual((row['facades'], row['evaluated_pairs']), (1, 2))
+        provenance = read_json(self.run / 'reports' / 'provenance.json')
+        self.assertEqual(provenance['fusion_operations'], {'&': 'AND', '|': 'OR'})
+        self.assertEqual(provenance['fusion_comparison_bases'], ['previous_component', 'history_component'])
+
+    def test_or_class_comparisons_keep_joint_training_exposure_and_missing_cohort(self):
+        # One native result is missing. The history component comparison must
+        # use the same remaining pair, not its full two-pair standalone cohort.
+        (self.run / 'units' / 'B-1-previous-geoscd.json').unlink()
+        result = night_report.report(self.run)
+        for operator in ('&', '|'):
+            for suffix in ('', '/vs_history'):
+                row = select(result['comparisons'],
+                             comparison=f'fusion/geoscd{operator}msdzip_abs_history{suffix}',
+                             split_scope='test', training_scope='verified_unseen', point=.01,
+                             region='class', class_name='damage', direction='change')
+                self.assertEqual((row['facades'], row['evaluated_pairs']), (1, 1))
+                self.assertEqual((row['baseline_valid_pixels'], row['candidate_valid_pixels']), (2, 2))
+                self.assertEqual(row['baseline_positive_pixels'], row['candidate_positive_pixels'])
+                seen = select(result['comparisons'],
+                              comparison=f'fusion/geoscd{operator}msdzip_abs_history{suffix}',
+                              split_scope='train', training_scope='seen', point=.01,
+                              region='class', class_name='damage', direction='change')
+                self.assertEqual((seen['facades'], seen['evaluated_pairs']), (1, 2))
+        with (self.run / 'reports' / 'per_class.csv').open() as stream:
+            import csv
+            classes = list(csv.DictReader(stream))
+        union = select(classes, predictor='geoscd|msdzip_abs_history', mode='history', point='0.01',
+                       split_scope='test', training_scope='verified_unseen', class_name='damage', direction='change')
+        self.assertEqual((union['evaluated_pairs'], union['tp'], union['fn']), ('1', '2', '0'))
+
     def test_class_deltas_use_history_support_for_both_masks(self):
         # Make this a surface-to-damage transition rather than merely adding
         # the damage bit. Both membership directions then belong to the

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#153c3d">
+  <title>Атлас фасадов · Санкт-Петербург</title>
+  <meta name="description" content="История наблюдений исторических фасадов Санкт-Петербурга: фотографии по годам, GT-разметка и журнал изменений.">
+  <link rel="stylesheet" href="2026-10-18-style.css">
+</head>
+<body>
+<header class="header">
+  <a class="brand" href="#" aria-label="Атлас фасадов — главная"><svg viewBox="0 0 36 36" aria-hidden="true"><path d="M4 31V13L18 4l14 9v18M2 32h32M11 31V16h5v15m5 0V16h5v15M6 13h24M15 10h6"/></svg><span>АТЛАС ФАСАДОВ<small>САНКТ-ПЕТЕРБУРГ</small></span></a>
+  <div class="header-caption">История, которую можно увидеть</div>
+  <div class="header-actions"><span class="prototype-badge"><i></i>Исследовательский прототип</span><button id="about-button" class="icon-button" aria-label="О данных и методике">?</button></div>
+</header>
+<main id="app" class="app" aria-busy="true">
+  <aside class="sidebar" aria-label="Карта и список фасадов">
+    <div class="sidebar-title"><h1>Фасады города</h1><span id="facade-count" class="count">—</span></div>
+    <div id="map" class="map" role="region" aria-label="Карта фасадов Санкт-Петербурга"><div id="map-tiles" class="map-tiles"></div><div id="map-markers" class="map-markers"></div><div class="map-controls"><button id="map-plus" aria-label="Приблизить карту">+</button><button id="map-minus" aria-label="Отдалить карту">−</button><button id="map-fit" aria-label="Показать все объекты">⌖</button></div><div id="map-status" class="map-status">Проверка адресов…</div><a class="map-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap</a></div>
+    <div class="sidebar-tools"><label class="search"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8" cy="8" r="5.5"/><path d="m12 12 5 5"/></svg><input id="search" type="search" placeholder="Найти адрес…" aria-label="Поиск фасада"></label><div class="list-toolbar"><span id="list-summary">Загрузка наблюдений…</span><select id="sort" aria-label="Порядок фасадов"><option value="address">По адресу</option><option value="history">По длине истории</option><option value="latest">По последнему году</option></select></div></div>
+    <div id="facade-list" class="facade-list"></div>
+    <div class="sidebar-foot"><span class="status-dot"></span>Реальные фотографии и GT-разметка<br><small>Точки обозначают здания, не положение камеры</small></div>
+  </aside>
+  <section id="workspace" class="workspace" aria-label="Карточка фасада">
+    <div id="loading" class="loading"><span class="loader"></span><h2>Собираем историю фасадов</h2><p>Загружаем фотографии и данные наблюдений.</p></div>
+    <div id="workspace-content" hidden>
+      <div class="breadcrumbs">Санкт-Петербург <span>/</span> Наблюдения <span>/</span> <span id="facade-number"></span></div>
+      <div class="facade-heading"><div><div class="eyebrow">ИСТОРИЯ ФАСАДА</div><h2 id="facade-title"></h2><div id="facade-subtitle" class="facade-subtitle"></div></div><button id="report-button" class="primary-button"><span>↗</span> Предварительный отчёт</button></div>
+      <div class="summary-row"><div><span id="stat-years" class="stat-value">—</span><span>период наблюдений</span></div><div><span id="stat-photos" class="stat-value">—</span><span>фотографий в истории</span></div><div><span id="stat-region" class="stat-value">1 участок</span><span>с числовой GT-разметкой</span></div><div class="summary-status"><span class="review-label">Требует интерпретации</span><span>Кандидаты изменений разметки</span></div></div>
+      <div class="work-grid">
+        <section class="viewer-card" aria-label="Сравнение фотографий">
+          <div class="viewer-toolbar"><div class="segmented" aria-label="Масштаб просмотра"><button id="view-full" class="active" aria-pressed="true">Общий кадр</button><button id="view-crop" aria-pressed="false">Участок GT</button></div><button id="original-button" class="text-button">Исходные фото ↗</button></div>
+          <div class="pair-controls"><label>Базовый год<select id="year-before" aria-label="Базовый год"></select></label><span class="pair-arrow">↔</span><label>Год сравнения<select id="year-after" aria-label="Год сравнения"></select></label><div class="pair-step"><button id="pair-prev" aria-label="Предыдущая соседняя пара">←</button><button id="pair-next" aria-label="Следующая соседняя пара">→</button></div></div>
+          <div id="viewer-scroll" class="viewer-scroll"><div id="image-stage" class="image-stage">
+            <img id="image-before" class="photo-layer" alt="Фасад в базовом году"><img id="image-after" class="photo-layer after-layer" alt="Фасад в году сравнения">
+            <canvas id="mask-before" class="overlay-layer"></canvas><canvas id="mask-after" class="overlay-layer after-layer"></canvas><canvas id="difference-layer" class="overlay-layer"></canvas>
+            <div id="crop-boundary" class="crop-boundary"><span>Анализируемый участок</span></div><div id="event-boundary" class="event-boundary" hidden></div>
+            <div id="slider-line" class="slider-line"><span>‹ ›</span></div><div class="photo-year before-year" id="before-badge"></div><div class="photo-year after-year" id="after-badge"></div>
+          </div></div>
+          <div class="slider-control"><span>Раньше</span><input id="compare-slider" type="range" min="0" max="100" value="50" aria-label="Положение шторки сравнения"><span>Позже</span><button id="reset-view" class="text-button" aria-label="Вернуть шторку в центр и убрать выделение">Сброс</button></div>
+          <div class="layer-toolbar"><span class="field-caption">Слой</span><div class="segmented small"><button data-layer="none" class="active" aria-pressed="true">Фото</button><button data-layer="gt" aria-pressed="false">GT-разметка</button><button data-layer="change" aria-pressed="false">Изменения GT</button></div><button class="unavailable" disabled title="Предсказания моделей не входят в этот архив">Предсказания — нет данных</button></div>
+          <div id="class-filters" class="class-filters" hidden></div>
+          <div id="viewer-note" class="viewer-note"></div>
+          <div class="timeline-header"><h3>Доступная история</h3><span>Нажмите год, чтобы сравнить с базовым</span></div><div id="timeline" class="timeline"></div><div id="missing-years" class="missing-years"></div>
+        </section>
+        <aside class="inspector" aria-label="Журнал изменений и оценка">
+          <div class="journal-head"><div><div class="eyebrow">НАБЛЮДЕНИЯ</div><h3>Журнал изменений</h3></div><span id="journal-count" class="count">0</span></div>
+          <p class="journal-help">Выберите запись, чтобы увидеть её расположение на фотографии.</p>
+          <div class="journal-filters"><select id="journal-scope" aria-label="Период журнала"><option value="pair">Выбранная пара</option><option value="history">Вся история</option></select><select id="journal-category" aria-label="Класс в журнале"><option value="all">Все классы</option></select></div>
+          <div id="journal" class="journal"></div>
+          <div class="risk-card"><div class="eyebrow">ОЦЕНКА ПОСЛЕДСТВИЙ</div><div><span>Люди и имущество</span><strong>Не оценено</strong></div><div><span>Исторический материал</span><strong>Не оценено</strong></div><p>Фотографии и разметка — материалы для экспертной оценки. Различие меток само по себе не определяет опасность.</p></div>
+        </aside>
+      </div>
+      <section class="notes-card"><div><h3>Комментарий к наблюдению</h3><p>Записи сохраняются в этом браузере и включаются в экспорт. Автор и дата относятся к вашей записи.</p></div><form id="note-form"><input id="note-author" placeholder="Автор записи" aria-label="Автор записи" required maxlength="100"><textarea id="note-text" placeholder="Что заметили и что нужно проверить на месте?" aria-label="Текст комментария" required maxlength="3000" rows="2"></textarea><button class="secondary-button" type="submit">Сохранить</button></form><div id="saved-notes"></div></section>
+      <footer class="workspace-footer"><span>Наблюдение → подтверждающие материалы → экспертная проверка</span><button class="text-button" id="data-button">О данных и ограничениях ↗</button></footer>
+    </div>
+  </section>
+</main>
+<dialog id="about-dialog"><div class="dialog-header"><h2>О данных и методике</h2><button class="icon-button" data-close aria-label="Закрыть">×</button></div><div class="dialog-body prose"><p>В прототипе используются <strong id="about-counts">загруженные истории и классы GT-разметки</strong>. Это диагностическая выборка с заметными изменениями, а не репрезентативная оценка состояния города.</p><h3>Фасад и область наблюдения</h3><p>Общий кадр показывает доступный вид фасада. Числовая разметка покрывает выделенный участок 512 × 512 пикселей. За его пределами состояние не оценивалось. Совмещённые фотографии используют сохранённые преобразования; ошибки геометрии, перекрытия и различия условий съёмки могут влиять на сравнение.</p><h3>Что означает изменение</h3><p>Журнал показывает добавление или исчезновение меток класса в сопоставимых размеченных областях. Это кандидаты для проверки, не подтверждённые события повреждения или ремонта. Нулевая маска означает отсутствие известной разметки. Геометрическая область поддержки не исключает деревья и другие перекрытия.</p><p>В журнал включены связные области от 64 пикселей. Для произвольной пары лет доступен визуальный слой изменений; записи журнала подготовлены для соседних наблюдений. Размеры областей указаны в пикселях, не в квадратных метрах.</p><h3>Структура материалов</h3><p>При организации ведомости приняты за ориентир ГОСТ 31937-2024, п. 5.1.10, и ГОСТ Р 56198-2014, п. 7.2.1. Экспорт собирает расположение участков, описание наблюдений и фотографии. Это предварительные материалы, требующие проверки специалистом.</p><h3>Предварительный отчёт</h3><p>Текст создаёт шаблонная заглушка. Qwen не запускалась. Демо-приоритет означает необходимость просмотреть изменения разметки; последствия для людей, имущества и наследия остаются неоценёнными.</p><h3>Карта и сохранение</h3><p>Точки привязаны к найденным адресам зданий. Направление фасада и положение камеры не определены. Источник координат указан в карточке; неоднозначные объекты остаются без точки. Комментарии хранятся локально в браузере — для переноса используйте экспорт отчёта.</p></div></dialog>
+<dialog id="report-dialog" class="wide-dialog"><div class="dialog-header"><div><span class="eyebrow">ПРЕДВАРИТЕЛЬНЫЕ МАТЕРИАЛЫ</span><h2 id="report-title">Ведомость наблюдений</h2></div><button class="icon-button" data-close aria-label="Закрыть">×</button></div><div id="report-content" class="dialog-body"></div><div class="dialog-footer"><span class="prototype-badge">Шаблонная заглушка · без Qwen</span><button id="report-download" class="secondary-button">Скачать JSON</button><button id="report-print" class="primary-button">Печать / PDF</button></div></dialog>
+<dialog id="original-dialog" class="wide-dialog"><div class="dialog-header"><h2>Исходные фотографии</h2><button class="icon-button" data-close aria-label="Закрыть">×</button></div><div id="original-content" class="dialog-body originals"></div></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+<noscript>Для просмотра истории и масок включите JavaScript в браузере.</noscript>
+<script type="module" src="2026-10-18-app.js"></script>
+</body></html>

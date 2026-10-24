@@ -269,13 +269,18 @@ def run(args):
     return summary
 
 
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', required=True)
     parser.add_argument('--units', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--budgets', type=float, nargs='+', default=[.01])
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if len(set(args.budgets)) != len(args.budgets) or any(x not in (.01, .05) for x in args.budgets):
         parser.error('Use unique saved budgets: 0.01 and/or 0.05')
     run(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

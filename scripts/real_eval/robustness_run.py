@@ -17,6 +17,7 @@ import numpy as np
 
 from .robustness_common import atomic_json, atomic_npz, digest, load_pair, read_json, safe_path, sha256
 from .geoscd_real_retry import RECOVERABLE_SCORE_ERROR, WorkerProgress, make_geoscd_pool, stable_metadata
+from .source_unit_metadata import source_rows as _source_rows
 
 
 DEFAULT_METHODS = ("rgb_diff", "ssim", "lpips", "dinov2", "semantic_dino", "anychange", "geoscd", "msdzip_abs")
@@ -80,15 +81,6 @@ def _file_hashes(metadata):
     return found
 
 
-def _source_rows(manifest):
-    rows = manifest.get("source_records", [])
-    if isinstance(rows, dict):
-        rows = list(rows.values())
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise ValueError("source_records должен содержать сохранённые метаданные единиц")
-    return rows
-
-
 def _method_contract(method, manifest, source, device):
     config = manifest["source_config"]
     if not isinstance(config, dict):
@@ -97,14 +89,26 @@ def _method_contract(method, manifest, source, device):
     rows = [r for r in _source_rows(manifest) if r.get("method") == method
             and r.get("status") == "completed" and r.get("variant", "frozen") ==
             ("current_train" if method.startswith("msdzip_") else "frozen")]
-    provenance_path = source / "method_provenance" / f"full_{method}.json"
-    provenance = read_json(provenance_path) if provenance_path.is_file() else None
-    if provenance is None:
-        provenance = next((r["method_metadata"] for r in rows if r.get("method_metadata")), {})
+    # temporal-experiment writes inference_<variant>.json. Older consumers used
+    # full_<method>.json; keep that layout compatible, but never use smoke weights.
+    provenance_files = []
+    for stage in ("inference", "full"):
+        path = source / "method_provenance" / f"{stage}_{method}.json"
+        if path.is_file():
+            value = read_json(path)
+            if not isinstance(value, dict) or not value:
+                raise ValueError(f"{method}: пустое или некорректное происхождение модели: {path}")
+            provenance_files.append((path, value))
+    provenance_path, provenance = (provenance_files[0] if provenance_files else
+        (None, next((r["method_metadata"] for r in rows if r.get("method_metadata")), {})))
+    for path, value in provenance_files[1:]:
+        if model_identity(value) != model_identity(provenance):
+            raise ValueError(f"{method}: противоречивое происхождение модели: {provenance_path} и {path}")
     configured = [r["method_metadata"]["configured_options"] for r in rows
                   if r.get("method_metadata", {}).get("configured_options") is not None]
-    if provenance.get("configured_options") is not None:
-        configured.append(provenance["configured_options"])
+    for value in [provenance, *(value for _, value in provenance_files[1:])]:
+        if value.get("configured_options") is not None:
+            configured.append(value["configured_options"])
     if configured:
         if any(value != configured[0] for value in configured):
             raise ValueError(f"{method}: исходные единицы имеют разные настройки")
@@ -143,8 +147,9 @@ def _method_contract(method, manifest, source, device):
         if not actual_path.is_file() or sha256(actual_path) != expected:
             raise ValueError(f"{method}: исходный файл модели отсутствует или изменился: {actual_path}")
     return {"options": options, "expected_metadata": provenance, "model_files_sha256": artifacts,
-            "provenance_file": str(provenance_path) if provenance_path.is_file() else None,
-            "provenance_sha256": sha256(provenance_path) if provenance_path.is_file() else None}
+            "provenance_file": str(provenance_path) if provenance_path is not None else None,
+            "provenance_sha256": sha256(provenance_path) if provenance_path is not None else None,
+            "provenance_files_sha256": {str(path): sha256(path) for path, _ in provenance_files}}
 
 
 def task_arrays(pair, hypothesis, condition):
@@ -284,6 +289,7 @@ def run(prepared_path, selection_path, out_path, methods=None, geoscd_run=None,
         model_contracts[method] = _method_contract(method, manifest, source, device)
     cached, overlay_contract = _cache_records(manifest, geoscd_run, source)
     relevant_paths = [Path(__file__), Path(__file__).with_name("robustness_common.py"),
+                      Path(__file__).with_name("source_unit_metadata.py"),
                       Path(__file__).with_name("geoscd_real_retry.py")]
     relevant_paths += [path for path in (repo / "facade_change").rglob("*.py")
                        if _inference_source(path.relative_to(repo / "facade_change").as_posix())]

@@ -31,8 +31,9 @@ def alignment_options(command):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Facade data inventory and native-RGB pair alignment")
+    p = argparse.ArgumentParser(description="Facade change research: prepare -> train -> benchmark -> gallery")
     sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("workflow", help="Main workflow: prepare, train, benchmark, gallery")
     sub.add_parser("doctor", help="Report installed packages and GPU availability")
     demo = sub.add_parser("demo", help="Run CPU SIFT on a procedural synthetic pair")
     demo.add_argument("--out", required=True)
@@ -284,6 +285,10 @@ def parser():
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["workflow"]:
+        from .workflow import main as workflow_main
+        return workflow_main(argv[1:])
     args = vars(parser().parse_args(argv))
     command = args.pop("command")
     try:
