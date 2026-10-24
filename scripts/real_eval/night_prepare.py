@@ -132,37 +132,34 @@ def _parents(images, pairs, alignments, fingerprints, splits, strict_alignment_p
                     if mismatch:
                         break
                 if mismatch:
-                    if any(match["path"] == root or root in match["path"].parents for root in strict_alignment_paths):
+                    if match.get("selection") or any(match["path"] == root or root in match["path"].parents for root in strict_alignment_paths):
                         raise ValueError(mismatch)
                     attempt.update(reason="incompatible_current_metadata", error=mismatch)
                 else:
                     compatible.append(match)
             accepted = [match for match in compatible if
                         str(match["record"].get("status", "")).startswith("completed")
-                        and match["record"].get("quality_gate", {}).get("passed") is True]
+                        and (match.get("selection") or match["record"].get("quality_gate", {}).get("passed") is True)]
             if not accepted:
                 pair["status"] = "rejected_or_failed_alignment" if matches else "missing_alignment"
                 continue
-            chosen, path, matrix = None, None, None
+            chosen, frame_info = None, None
             for candidate in accepted:
                 try:
-                    candidate_path = inputs._artifact(candidate["path"], candidate["record"], "geometry.json", fingerprints)
-                    candidate_matrix = np.asarray(read_json(candidate_path)["source_to_reference"], dtype=float)
-                    expanded_canvas((reference["height"], reference["width"]),
-                                    (source["height"], source["width"]), candidate_matrix)
+                    from facade_change.saved_geometry import frame_geometry
+                    candidate_info = frame_geometry(candidate, fingerprints)
                 except (ValueError, KeyError, TypeError, OSError) as error:
-                    if any(candidate["path"] == root or root in candidate["path"].parents for root in strict_alignment_paths):
+                    if candidate.get("selection") or any(candidate["path"] == root or root in candidate["path"].parents for root in strict_alignment_paths):
                         raise
                     next(attempt for attempt in pair["attempts"] if attempt["path"] == str(candidate["path"])).update(
                         reason="invalid_discovered_geometry", error=f"{type(error).__name__}: {error}")
                     continue
-                chosen, path, matrix = candidate, candidate_path, candidate_matrix
+                chosen, frame_info = candidate, candidate_info
                 break
             if chosen is None:
                 pair["status"] = "invalid_alignment_geometry"
                 continue
-            frames.append({**source, "source_to_reference": matrix.tolist(), "frame": len(frames),
-                           "alignment_run": str(chosen["path"]), "geometry_sha256": fingerprints[str(path)]})
+            frames.append({**source, **frame_info, "frame": len(frames)})
             pair.update(status="accepted", selected_alignment=str(chosen["path"]))
         report["usable_observations"] = len(frames)
         if len(frames) < 2:
@@ -185,7 +182,7 @@ def _parents(images, pairs, alignments, fingerprints, splits, strict_alignment_p
 
 
 def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None,
-          splits=("train", "val", "test"), dataset=None):
+          splits=("train", "val", "test"), dataset=None, alignment_session=None):
     """Freeze metadata/geometry and expose missing coverage without decoding RGB/GT."""
     splits = tuple(splits)
     if not splits or len(set(splits)) != len(splits) or not set(splits) <= {"train", "val", "test"}:
@@ -197,6 +194,11 @@ def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None
     dataset_path = Path(dataset or context["source_config"]["dataset"]).expanduser().resolve()
     dataset_path = dataset_path / "dataset.json" if dataset_path.is_dir() else dataset_path
     images, pairs, split = inputs._dataset(dataset_path, fingerprints)
+    if alignment_session is not None:
+        if alignment_runs is not None or runs_root is not None:
+            raise ValueError("--alignment-session cannot be mixed with alignment discovery or --alignment-runs")
+        from facade_change.alignment_session import resolve_session
+        alignment_runs = [str(resolve_session(alignment_session))]
     discovered, excluded_runs = _discover(runs_root)
     configured = context["source_config"].get("alignment_runs", []) if alignment_runs is None else alignment_runs
     configured = list(dict.fromkeys(str(Path(path).expanduser().resolve()) for path in configured))
@@ -284,16 +286,15 @@ def _warp(data, sequence, frame, crop=None, include_rgb=False):
     rgb, packed, opaque = data.load_image(frame["image_id"])
     height, width = sequence["shape"]
     x, y, width, height = crop if crop is not None else (0, 0, width, height)
-    shift = np.array([[1., 0, -x], [0, 1., -y], [0, 0, 1.]])
-    matrix = shift @ np.asarray(frame["source_to_reference"], dtype=float)
-    warp = lambda value, flags: cv2.warpPerspective(value, matrix, (width, height), flags=flags,
-                                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    support = warp(opaque.astype(np.float32), cv2.INTER_LINEAR) >= 1 - 1e-6
-    bits = warp(packed, cv2.INTER_NEAREST)
+    from facade_change.saved_geometry import FrameSampler
+    sampler = FrameSampler(frame)
+    box = (x, y, width, height)
+    support = sampler.support(opaque, box)
+    bits = sampler.warp(packed, box, nearest=True)
     bits[~support] = 0
     result = dict(support=support, packed=bits)
     if include_rgb:
-        result["rgb"] = warp(rgb, cv2.INTER_LINEAR)
+        result["rgb"] = sampler.warp(rgb, box)
     return result
 
 

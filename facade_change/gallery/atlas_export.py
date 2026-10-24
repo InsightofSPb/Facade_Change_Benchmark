@@ -210,10 +210,18 @@ def export(source: Path, dist: Path, min_pixels=64):
             require(original["sha256"] == frame["image_sha256"] == af["sha256"], "Original image hashes differ")
             require(checked[original["artifact_path"]] == original["sha256"], "Original SHA missing")
             require(checked[frame["artifact_path"]] == frame["artifact_sha256"], "Frame artifact SHA differs")
-            matrix = np.asarray(original["source_to_reference"], dtype=np.float64)
-            require(matrix.shape == (3, 3) and np.isfinite(matrix).all() and abs(np.linalg.det(matrix)) > 1e-12,
-                    f"Invalid homography: {sid}:{index}")
-            require(np.array_equal(matrix, np.asarray(af["source_to_reference"])), "Audit homography mismatch")
+            dense = original.get("dense_geometry")
+            if dense:
+                require({key: value for key, value in dense.items() if key != "artifact_path"}
+                        == af.get("dense_geometry"), "Audit dense geometry mismatch")
+                require(checked.get(dense["artifact_path"]) == dense["sha256"], "Dense field hash missing")
+                require(dense["reference_shape"] == list(reference_size[::-1]), "Dense reference grid mismatch")
+                require(dense["source_shape"] == [original["height"], original["width"]], "Dense source grid mismatch")
+            else:
+                matrix = np.asarray(original["source_to_reference"], dtype=np.float64)
+                require(matrix.shape == (3, 3) and np.isfinite(matrix).all() and abs(np.linalg.det(matrix)) > 1e-12,
+                        f"Invalid homography: {sid}:{index}")
+                require(np.array_equal(matrix, np.asarray(af["source_to_reference"])), "Audit homography mismatch")
             with np.load(inside(source, frame["artifact_path"]), allow_pickle=False) as loaded:
                 rgb, support, packed = loaded["rgb"].copy(), loaded["support"].copy(), loaded["packed"].copy()
             require(rgb.dtype == np.uint8 and rgb.shape == (height, width, 3), "RGB dtype/shape mismatch")
@@ -224,7 +232,12 @@ def export(source: Path, dist: Path, min_pixels=64):
             require(image.size == (original["width"], original["height"]) == (af["width"], af["height"]),
                     f"Original dimensions mismatch: {sid}:{index}")
             image = image.convert("RGB")
-            aligned = saved_warp(image, matrix, reference_size)
+            if dense:
+                from facade_change.saved_geometry import FrameSampler
+                sampler = FrameSampler({"dense_geometry": {**dense, "path": str(inside(source, dense["artifact_path"]))}})
+                aligned = Image.fromarray(sampler.warp(np.asarray(image), (0, 0, *reference_size)))
+            else:
+                aligned = saved_warp(image, matrix, reference_size)
             crop_pixels = np.asarray(aligned)[y:y+height, x:x+width]
             error = np.abs(crop_pixels.astype(np.float32) - rgb.astype(np.float32))[support]
             checks.append({"sequence_id": sid, "index": index, "year": year,
@@ -254,7 +267,8 @@ def export(source: Path, dist: Path, min_pixels=64):
                 "mask_url": mask_path.relative_to(dist).as_posix(),
                 "source_width": image.width, "source_height": image.height,
                 "aligned_width": dimensions["aligned"][0], "aligned_height": dimensions["aligned"][1],
-                "source_to_reference": original["source_to_reference"],
+                "source_to_reference": original.get("source_to_reference"),
+                "geometry_type": "dense_reference_grid" if dense else "homography",
                 "known_pixels": int(known.sum()), "support_pixels": int(support.sum()),
                 "class_pixels": {str(category["id"]): int((support & ((packed & (1 << category["channel"])) != 0)).sum())
                                  for category in categories},
@@ -288,7 +302,7 @@ def export(source: Path, dist: Path, min_pixels=64):
                                  "connectivity": 8, "minimum_component_pixels": min_pixels, "morphology": "none", "cap": None,
                                  "meaning": "per-class additions/removals of annotation bits; candidates requiring review"},
             "changed_fraction": "different complete packed class sets divided by jointly supported and labelled pixels; not facade risk or full-facade damage percentage",
-            "alignment": "saved source_to_reference homography applied for visualization; no new estimation or dense alignment quality claim",
+            "alignment": "saved homography or reviewed GeoSCD field applied to original RGB for visualization; no new estimation or accuracy claim",
             "full_image_coverage": "whole source photograph of the selected view, not proof of complete facade coverage",
         },
     }
@@ -331,4 +345,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     raise SystemExit(main())

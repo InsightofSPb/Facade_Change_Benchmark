@@ -34,14 +34,19 @@ def _checked_pair_run(batch_run, batch_record, row, reference, source, manifest_
     return path
 
 
-def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=256,
-                         stride=128, min_valid_fraction=.8, controls=0, seed=42):
+def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
+                         stride=128, min_valid_fraction=.8, controls=0, seed=42,
+                         alignment_session=None, split_file=None):
     """Reuse accepted geometry and original RGB; preserve the existing gold split.
 
     ``controls`` is a total source-crop budget across this dataset. Procedural
     state/nuisance and sham examples are separate from real temporal labels.
     """
-    methods = list(methods)
+    if (batch_run is None) == (alignment_session is None):
+        raise ValueError("Choose exactly one of --batch-run and --alignment-session")
+    if alignment_session is not None and methods is not None:
+        raise ValueError("Session selection is authoritative; omit --methods (no fallback or reranking)")
+    methods = list(("loftr", "sift") if methods is None else methods)
     if not methods or len(set(methods)) != len(methods) or any(name not in {"sift", "loftr", "cascade"} for name in methods):
         raise ValueError("Crop method priority must contain unique sift/loftr/cascade methods")
     if isinstance(controls, bool) or not isinstance(controls, int) or controls < 0:
@@ -50,32 +55,55 @@ def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=25
         raise ValueError("Crops require tile_size >=8 and 0 < stride <= tile_size")
     if not 0 < min_valid_fraction <= 1:
         raise ValueError("min_valid_fraction must be in (0, 1]")
-    batch_run = Path(batch_run).expanduser().resolve()
-    batch_hash = sha256(batch_run / "run.json")
-    batch_record = read_json(batch_run / "run.json")
-    if batch_record.get("status") not in {"completed_needs_review", "completed_with_issues", "interrupted"}:
-        raise ValueError("Input batch must be completed or interrupted before exporting crops")
-    manifest_path = Path(batch_record["config"]["manifest_path"]).expanduser()
-    manifest_path = (manifest_path if manifest_path.is_absolute() else batch_run / manifest_path).resolve()
-    split_path = manifest_path.parent / "split.json"
-    input_paths = {"batch_run": batch_run / "run.json", "results": batch_run / "results.json",
-                   "selected_pairs": batch_run / "selected_pairs.json", "manifest": manifest_path,
-                   "split": split_path}
-    hashes = {key: sha256(path) for key, path in input_paths.items()}
-    hashes["batch_run"] = batch_hash
-    if batch_record["config"].get("manifest_sha256") != hashes["manifest"]:
-        raise ValueError("Prepared manifest changed since the alignment batch")
-    for name in ("results", "selected_pairs"):
-        if batch_record.get("artifact_sha256", {}).get(input_paths[name].name) != hashes[name]:
-            raise ValueError(f"Batch {name} changed or its provenance hash is absent")
-    manifest, split = read_json(manifest_path), read_json(split_path)
-    validate_partitions(manifest["images"])
-    if split.get("mode") != "reviewed" or split.get("development_only") is not False:
-        raise ValueError("Crop datasets require an existing reviewed train/val/test split")
-    for image in manifest["images"]:
-        if image.get("split") in {"train", "val", "test"} and split["building_assignments"].get(image["building_id"]) != image["split"]:
-            raise ValueError("Prepared manifest and split building assignments disagree")
-    pairs, results = read_json(input_paths["selected_pairs"]), read_json(input_paths["results"])
+    session = None
+    if alignment_session is not None:
+        from .alignment_session import load_session
+        session = load_session(alignment_session)
+        manifest_path = session.manifest_path
+        manifest = session.manifest
+        pairs = session.pairs
+        split_path = Path(split_file).expanduser().resolve() if split_file else manifest_path.parent / "split.json"
+        if not split_path.is_file():
+            raise ValueError("No split.json beside the alignment manifest; pass --split-file from the existing prepared dataset")
+        split = read_json(split_path)
+        if split.get("mode", "reviewed") != "reviewed" or split.get("development_only", False):
+            raise ValueError("Crop datasets require an existing reviewed train/val/test split")
+        used = {str(row[k]) for row in pairs for k in ("reference_id", "source_id")}
+        manifest = {**manifest, "images": [row for row in manifest["images"] if str(row["image_id"]) in used]}
+        for row in manifest["images"]:
+            if split.get("building_assignments", {}).get(row["building_id"]) != row["split"]:
+                raise ValueError("Session manifest and split building assignments disagree")
+        input_paths = {key: Path(key) for key in session.fingerprints}
+        input_paths["split"] = split_path
+        hashes = {**session.fingerprints, "split": sha256(split_path)}
+        results = []
+    else:
+        batch_run = Path(batch_run).expanduser().resolve()
+        batch_hash = sha256(batch_run / "run.json")
+        batch_record = read_json(batch_run / "run.json")
+        if batch_record.get("status") not in {"completed_needs_review", "completed_with_issues", "interrupted"}:
+            raise ValueError("Input batch must be completed or interrupted before exporting crops")
+        manifest_path = Path(batch_record["config"]["manifest_path"]).expanduser()
+        manifest_path = (manifest_path if manifest_path.is_absolute() else batch_run / manifest_path).resolve()
+        split_path = Path(split_file).expanduser().resolve() if split_file else manifest_path.parent / "split.json"
+        input_paths = {"batch_run": batch_run / "run.json", "results": batch_run / "results.json",
+                       "selected_pairs": batch_run / "selected_pairs.json", "manifest": manifest_path,
+                       "split": split_path}
+        hashes = {key: sha256(path) for key, path in input_paths.items()}
+        hashes["batch_run"] = batch_hash
+        if batch_record["config"].get("manifest_sha256") != hashes["manifest"]:
+            raise ValueError("Prepared manifest changed since the alignment batch")
+        for name in ("results", "selected_pairs"):
+            if batch_record.get("artifact_sha256", {}).get(input_paths[name].name) != hashes[name]:
+                raise ValueError(f"Batch {name} changed or its provenance hash is absent")
+        manifest, split = read_json(manifest_path), read_json(split_path)
+        validate_partitions(manifest["images"])
+        if split.get("mode") != "reviewed" or split.get("development_only") is not False:
+            raise ValueError("Crop datasets require an existing reviewed train/val/test split")
+        for image in manifest["images"]:
+            if image.get("split") in {"train", "val", "test"} and split["building_assignments"].get(image["building_id"]) != image["split"]:
+                raise ValueError("Prepared manifest and split building assignments disagree")
+        pairs, results = read_json(input_paths["selected_pairs"]), read_json(input_paths["results"])
     pair_ids = [pair["pair_id"] for pair in pairs]
     if len(set(pair_ids)) != len(pair_ids):
         raise ValueError("Duplicate selected pair IDs")
@@ -86,11 +114,15 @@ def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=25
             raise ValueError("Duplicate or unselected batch result")
         lookup[key] = row
     out = new_directory(out)
-    record = run_record("crop_dataset", {"batch_run": str(batch_run), "manifest_path": str(manifest_path),
+    config = {"batch_run": str(batch_run) if batch_run is not None else None, "manifest_path": str(manifest_path),
                         "input_sha256": hashes, "method_priority": methods, "tile_size": tile_size,
                         "stride": stride, "min_valid_fraction": min_valid_fraction,
                         "controls_total_source_crop_budget": controls, "seed": seed,
-                        "geometry_scope": "existing accepted homographies only; no rematching"})
+                        "geometry_scope": "saved session geometry; no rematching" if session else "existing accepted homographies only; no rematching"}
+    if session:
+        config.update(alignment_session=str(session.path), quality_report=session.quality_report, method_priority=None,
+                      selection_policy="exact saved selected_method; quality ranking advisory")
+    record = run_record("crop_dataset", config)
     write_json(out / "run.json", record)
     try:
         shutil.copyfile(split_path, out / "split.json")
@@ -99,12 +131,15 @@ def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=25
         derivative_failures = 0
         for pair in pairs:
             pair_id = pair["pair_id"]
-            chosen = next((lookup[(pair_id, method)] for method in methods
-                           if lookup.get((pair_id, method), {}).get("status") == "passed"), None)
+            chosen = (session.selected.get(pair_id) if session else
+                      next((lookup[(pair_id, method)] for method in methods
+                            if lookup.get((pair_id, method), {}).get("status") == "passed"), None))
             if chosen is None:
-                excluded.append({"pair_id": pair_id, "reason": "no_passed_requested_method",
-                                 "method_statuses": ";".join(f"{name}:{lookup.get((pair_id, name), {}).get('status', 'not_attempted')}"
-                                                           for name in methods)})
+                excluded.append({"pair_id": pair_id, "reason": "unresolved_session_selection" if session else "no_passed_requested_method",
+                                 "method_statuses": (";".join(f"{name}:{entry['state']}:{entry.get('review', '')}"
+                                                             for name, entry in pair["methods"].items()) if session else
+                                                     ";".join(f"{name}:{lookup.get((pair_id, name), {}).get('status', 'not_attempted')}"
+                                                              for name in methods))})
                 continue
             try:
                 reference, source = select_pair(manifest, pair["reference_id"], pair["source_id"])
@@ -119,18 +154,19 @@ def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=25
                     raise ValueError("Selected pair contains identical original image bytes")
                 if pair_id != f"{reference['image_id']}-{source['image_id']}":
                     raise ValueError("Selected pair ID disagrees with its observations")
-                pair_run = _checked_pair_run(batch_run, batch_record, chosen, reference, source, hashes["manifest"])
+                pair_run = (chosen["path"] if session else
+                            _checked_pair_run(batch_run, batch_record, chosen, reference, source, hashes["manifest"]))
                 crop_root = Path("pairs") / f"pair-{pair_id}" / "crops"
                 crop_summary = build_crops(pair_run, out / crop_root, tile_size=tile_size, stride=stride,
                                            min_valid_fraction=min_valid_fraction, split=reference["split"],
-                                           group_id=reference["building_id"])
+                                           group_id=reference["building_id"], selection=chosen.get("selection"))
                 document = read_json(out / crop_root / "crops.json")
                 if not document["crops"]:
                     raise ValueError("No crops met the requested geometric overlap fraction")
                 for crop in document["crops"]:
                     path = crop_root / crop["path"]
                     crops.append({**crop, "pair_id": pair_id, "dataset_crop_id": pair_id + "/" + crop["crop_id"],
-                                  "alignment_method": chosen["method"], "source_pair_path": chosen["path"],
+                                  "alignment_method": chosen["method"], "source_pair_path": str(chosen["path"]),
                                   "path": path.as_posix(),
                                   **{name: (path / filename).as_posix() for name, filename in (
                                       ("reference_rgb", "reference_rgb.png"), ("source_rgb", "source_rgb.png"),
@@ -146,7 +182,7 @@ def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=25
             except Exception as exc:
                 derivative_failures += 1
                 excluded.append({"pair_id": pair_id, "reason": f"{type(exc).__name__}: {exc}",
-                                 "method_statuses": chosen["method"] + ":passed"})
+                                 "method_statuses": chosen["method"] + ":" + (pair["selection_status"] if session else "passed")})
                 continue
             remaining = controls - control_sources
             if remaining:
@@ -165,12 +201,16 @@ def prepare_crop_dataset(batch_run, out, methods=("loftr", "sift"), tile_size=25
         index_name = record["started_utc"][:10] + "_dataset_index.json"
         csv_name = record["started_utc"][:10] + "_dataset_index.csv"
         index = {"schema_version": 1, "image_selection": "existing_batch_selected_pairs_only",
-                 "batch_run": str(batch_run), "input_sha256": hashes, "split": split,
+                 "batch_run": str(batch_run) if batch_run is not None else None, "input_sha256": hashes, "split": split,
                  "source_annotations": manifest.get("source", {}), "categories": manifest.get("categories", []),
                  "semantic_masks": {"rasterized": False}, "temporal_ground_truth": "not_created",
                  "pairs": exported, "excluded_pairs": excluded, "crops": crops,
                  "controls": {"label_scope": "procedural edit only; no real damage ground truth",
                               "source_crop_count": control_sources, "examples": control_rows, "failures": control_failures}}
+        if session:
+            index.update(alignment_session=str(session.path), quality_report=session.quality_report,
+                         image_selection="exact_completed_session_selection",
+                         selection_status_counts=dict(Counter(p["selection_status"] for p in pairs)))
         write_json(out / index_name, index)
         crop_fields = ["dataset_crop_id", "pair_id", "alignment_method", "split", "building_id", "view_id",
                        "reference_id", "source_id", "reference_year", "source_year", "reference_file_name", "source_file_name",

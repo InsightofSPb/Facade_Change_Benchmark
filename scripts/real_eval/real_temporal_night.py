@@ -35,6 +35,7 @@ def main(argv=None):
     audit.add_argument('--snapshot', required=True)
     audit.add_argument('--dataset', help='По умолчанию dataset исходного запуска')
     audit.add_argument('--alignment-runs', nargs='+', help='Явный список сохранённых alignment; иначе обнаружение')
+    audit.add_argument('--alignment-session', help='Завершённая сессия dataset_statistics; только её выбранные пары')
     audit.add_argument('--runs-root', help='Корень runs для обнаружения существующих совмещений')
     audit.add_argument('--splits', nargs='+', choices=('train', 'val', 'test'), default=['test', 'val', 'train'])
     audit.add_argument('--out', required=True)
@@ -90,7 +91,8 @@ def main(argv=None):
     if args.command == 'audit':
         from scripts.real_eval.night_prepare import audit
         result = audit(args.run, args.snapshot, args.out, alignment_runs=args.alignment_runs,
-                       runs_root=args.runs_root, splits=tuple(args.splits), dataset=args.dataset)
+                       runs_root=args.runs_root, splits=tuple(args.splits), dataset=args.dataset,
+                       alignment_session=args.alignment_session)
         print(f'Аудит: {Path(args.out).resolve() / "audit.json"}', flush=True)
     elif args.command == 'prepare':
         from scripts.real_eval.night_prepare import prepare

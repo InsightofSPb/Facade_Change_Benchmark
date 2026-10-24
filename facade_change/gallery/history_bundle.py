@@ -182,14 +182,24 @@ def collect(prepared, output, include_originals=False):
             by_id = {str(row["image_id"]): row for row in parent["frames"]}
             for frame in sequence["frames"]:
                 original = by_id.get(str(frame["image_id"]))
-                required(original, ["image_path", "sha256", "year", "source_to_reference", "width", "height"], f"audit image {frame['image_id']}")
+                required(original, ["image_path", "sha256", "year", "width", "height"], f"audit image {frame['image_id']}")
                 if original["sha256"] != frame["image_sha256"] or original["year"] != frame["year"]:
                     raise ValueError(f"Audit/prepared image identity mismatch: {frame['image_id']}")
-                matrix = original["source_to_reference"]
-                if (not isinstance(matrix, list) or len(matrix) != 3 or any(
+                matrix = original.get("source_to_reference")
+                dense = original.get("dense_geometry")
+                if dense:
+                    if matrix is not None or dense.get("type") != "dense_reference_grid":
+                        raise ValueError("Ambiguous original dense geometry")
+                    field = Path(dense["path"])
+                    relative_field = f"geometry/{dense['sha256']}.npz"
+                    add(field, relative_field, dense["sha256"])
+                    geometry_fields = {"dense_geometry": {**dense, "artifact_path": relative_field}}
+                elif (not isinstance(matrix, list) or len(matrix) != 3 or any(
                         not isinstance(row, list) or len(row) != 3 or any(
                             type(value) not in (int, float) or not math.isfinite(value) for value in row) for row in matrix)):
                     raise ValueError(f"Invalid 3×3 source_to_reference: image {frame['image_id']}")
+                else:
+                    geometry_fields = {"source_to_reference": matrix}
                 source = Path(original["image_path"]).expanduser()
                 if not source.is_absolute():
                     raise ValueError(f"Original path is not absolute: {source}")
@@ -202,7 +212,7 @@ def collect(prepared, output, include_originals=False):
                                   "frame": frame["frame"], "image_id": frame["image_id"], "year": frame["year"],
                                   "artifact_path": relative, "sha256": original["sha256"],
                                   "width": original["width"], "height": original["height"],
-                                  "source_to_reference": matrix, "crop_xywh": sequence["crop_xywh"]})
+                                  **geometry_fields, "crop_xywh": sequence["crop_xywh"]})
     else:
         warnings.append("Original full photographs are not included; use --include-originals to collect the selected histories' originals")
 

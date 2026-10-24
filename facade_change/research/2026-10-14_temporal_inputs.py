@@ -156,10 +156,18 @@ def _alignments(paths, fingerprints):
     found, attempts = defaultdict(list), []
     for value in paths:
         root = Path(value).expanduser().resolve()
+        if (root / "sessions").is_dir():
+            from facade_change.alignment_session import resolve_session
+            root = resolve_session(root)
         record = read_json(_remember(root / "run.json", fingerprints))
         status = str(record.get("status", ""))
         if not status.startswith("completed") and status not in {"interrupted", "failed"}:
             raise ValueError("Alignment input must be terminal, not still running")
+        if record.get("kind") == "incremental_alignment_preparation":
+            if len(paths) != 1:
+                raise ValueError("Use the selected alignment session alone; mixing runs would override its exclusions")
+            from facade_change.alignment_session import load_session
+            return load_session(root, fingerprints).matches()
         if record.get("kind") == "pair_alignment":
             candidates = [(root, record, record.get("config", {}).get("method", "unknown"))]
         elif record.get("kind") == "alignment_and_data_batch":
@@ -237,21 +245,14 @@ def _real(config, fingerprints):
                             raise ValueError(f"Alignment/current dataset {role}.{field} mismatch")
             accepted = [match for match in matches if
                         str(match["record"].get("status", "")).startswith("completed")
-                        and match["record"].get("quality_gate", {}).get("passed") is True]
+                        and (match.get("selection") or match["record"].get("quality_gate", {}).get("passed") is True)]
             if not accepted:
                 pair["status"] = "rejected_or_failed_alignment" if matches else "missing_alignment"
                 continue
             # Configuration order gives deterministic priority among reusable runs.
             chosen = accepted[0]
-            geometry_path = _artifact(chosen["path"], chosen["record"], "geometry.json", fingerprints)
-            geometry = read_json(geometry_path)
-            matrix = np.asarray(geometry["source_to_reference"], dtype=float)
-            # Reuse the existing safety/horizon checks without allocating a canvas.
-            expanded_canvas((reference["height"], reference["width"]),
-                            (source["height"], source["width"]), matrix)
-            frames.append({**source, "source_to_reference": matrix.tolist(),
-                           "frame": len(frames) + 1, "alignment_run": str(chosen["path"]),
-                           "geometry_sha256": fingerprints[str(geometry_path)]})
+            from facade_change.saved_geometry import frame_geometry
+            frames.append({**source, **frame_geometry(chosen, fingerprints), "frame": len(frames) + 1})
             pair.update(status="accepted", selected_alignment=str(chosen["path"]))
         report["usable_observations"] = len(frames)
         if len(frames) < 2:
@@ -331,10 +332,10 @@ def load_sequences(config):
         for frame in sequence["frames"]:
             native_rgb, support = _native(frame)
             del native_rgb
-            for index, (x, y, w, h) in enumerate(boxes):
-                shift = np.array([[1., 0, -x], [0, 1., -y], [0, 0, 1.]])
-                transform = shift @ np.asarray(frame["source_to_reference"])
-                intersections[index] &= _warp(support.astype(np.float32), transform, w, h) >= 1 - 1e-6
+            from facade_change.saved_geometry import FrameSampler
+            sampler = FrameSampler(frame)
+            for index, box in enumerate(boxes):
+                intersections[index] &= sampler.support(support, box)
         accepted = 0
         for (x, y, w, h), support in zip(boxes, intersections):
             fraction = float(support.mean())
@@ -365,11 +366,12 @@ def load_frame(sequence, index):
     frame = sequence["frames"][index]
     if sequence["domain"] == "real":
         rgb, support = _native(frame)
-        x, y, width, height = sequence["crop_xywh"]
-        shift = np.array([[1., 0, -x], [0, 1., -y], [0, 0, 1.]])
-        matrix = shift @ np.asarray(frame["source_to_reference"])
-        return {"rgb": _warp(rgb, matrix, width, height),
-                "support": _warp(support.astype(np.float32), matrix, width, height) >= 1 - 1e-6,
+        from facade_change.saved_geometry import FrameSampler
+        sampler = FrameSampler(frame)
+        crop = sequence["crop_xywh"]
+        width, height = crop[2:]
+        return {"rgb": sampler.warp(rgb, crop),
+                "support": sampler.support(support, crop),
                 "event_labels": np.full((height, width), 255, np.uint8),
                 "event": "unknown", "nuisance": "unknown"}
     output = {}

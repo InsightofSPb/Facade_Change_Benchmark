@@ -159,13 +159,103 @@ python -m facade_change workflow gallery atlas --serve runs/2026-10-24-atlas-001
 старой версии. Правило игнорирования `data/` остаётся исходным. Новая локальная
 версия просмотрена как исходный код; её GPU-работоспособность здесь не проверялась.
 
-Пересечение с `prepare align` относится к запуску существующих методов
-выравнивания. Самостоятельный скрипт добавляет инкрементальный cache и выбор
-результата пары. Его `pairs.json` описывает кандидатов попарного выравнивания;
-это ещё не общий холст истории и не готовый crop dataset. Автоматического
-перехода из этого формата в `prepare crops` данный PR не добавляет.
-`prepare dataset`, `crops`, `synthetic`, `history`, `real` и `robustness` нужны
-для остальных этапов и остаются в workflow.
+Подключение от 2026-10-24 читает **завершённую сессию** этого скрипта через
+`--alignment-session`. `data/dataset_statistics.py` по-прежнему не копируется
+в пакет и не меняется. Повторный поиск соответствий и загрузка моделей для
+экспорта не нужны. Дождитесь окончания текущего расчёта и quality worker, затем
+обновите рабочую ветку: не меняйте исходники посреди запущенных subprocess.
+
+```bash
+cd /home/sasha/Facade_Change_Benchmark
+git pull --ff-only
+
+conda run --no-capture-output -n lposs310 python -B -m facade_change workflow prepare crops \
+  --alignment-session data/aligned \
+  --tile-size 256 --stride 128 --min-valid-fraction 0.8 \
+  --out data/crops
+```
+
+`data/aligned` разрешается только при наличии ровно одной сессии. При нескольких
+передайте конкретный путь из строки `Reports:`, например
+`data/aligned/sessions/report-2`; выбор «самой свежей» не выполняется.
+Незавершённая/failed/plan-only сессия отклоняется. Новый каталог `data/crops`
+должен отсутствовать. Если рядом с manifest нет `split.json`, добавьте
+`--split-file /path/to/existing/prepared/split.json`: принадлежность здания
+должна совпадать с manifest; новый split не создаётся.
+
+Результат: `run.json`, `summary.json`, `split.json`, индекс JSON/CSV с путём в
+`summary.json`, `excluded_pairs.csv`, RGB-кропы, маски геометрической поддержки,
+`gallery.html`. Он принимается прежней командой синтетики без конвертации:
+
+```bash
+python -m facade_change workflow prepare synthetic \
+  --crop-run data/crops --config configs/2026-10-04_h0h1_controls.json \
+  --out data/synthetic
+python -m facade_change workflow benchmark synthetic \
+  --dataset-run data/synthetic --methods rgb_diff ssim \
+  --out data/synthetic_benchmark
+```
+
+Для **реальных историй** подключите ту же сессию к существующему аудиту.
+`--run` и `--snapshot` — сохранённый temporal experiment и его соответствующий
+снимок калибровки; пути ниже обозначают входы, их нужно заменить своими.
+`--dataset` — текущий semantic dataset.json с COCO и reviewed split.
+Это не файл `pairs.json` и не результат экспорта RGB-кропов.
+
+```bash
+python -m facade_change workflow prepare real-audit \
+  --run /path/to/existing/temporal-experiment \
+  --snapshot /path/to/its/temporal-snapshot \
+  --dataset /path/to/current/dataset.json \
+  --alignment-session data/aligned \
+  --splits train val --out data/history_audit
+python -m facade_change workflow prepare real \
+  --audit data/history_audit --out data/real_histories
+```
+
+Полученный `data/real_histories/manifest.json` имеет прежний контракт
+`real_temporal_prepared`: пригоден для `benchmark real --prepared data/real_histories`,
+PREVIOUS/EARLIEST/HISTORY, real gallery и atlas bundle. Модели и пороги
+берутся из указанного frozen experiment/snapshot; переход к новым весам или
+перекалибровка не подразумевается. Существующий отбор real-кропов по разметке
+сохраняется и явно остаётся GT-enriched diagnostic subset. TEST включается
+только явно в `--splits`, без подбора порогов. Стадия `prepare real` уже создаёт
+`gallery.html`. Atlas по-прежнему требует 512×512 и одну историю на здание.
+
+Неразмеченный research loader также принимает путь сессии единственным элементом
+`alignment_runs` в temporal config; он выбирает кропы по геометрической поддержке,
+не загружает semantic GT и не меняет синтетическую ветвь.
+
+Правила подключения:
+
+- `selected_method` и `selection_status` сохраняются. `--methods` для такого
+  crop export не используется: нельзя незаметно заменить выбранный метод.
+  Неопределённые пары попадают в исключения. Нельзя смешивать сессию со списком
+  старых alignment-запусков или автопоиском для подстановки альтернатив.
+- GeoSCD переносится как **плотное поле**, без подмены гомографией. Нужен `accept`
+  в hash-bound review; SIFT/LoFTR с пройденным gate сохраняют статус provisional.
+  Явный `accept` может принять отклонённую gate гомографию, но исходный статус
+  остаётся в provenance. Для изменения решения используйте копию `review.csv`
+  и новый вызов исходного скрипта с `--reuse-existing --review-csv ...`.
+  Не редактируйте завершённую сессию на месте.
+- Сохраняются ссылки и хеши Canny/cycle/drift-отчёта. Его рейтинг рекомендательный
+  и **не меняет** метод автоматически; это не независимая геометрическая GT.
+- Все межгодовые пары доступны для парных RGB-кропов. Истории используют только
+  прямые преобразования к самому раннему наблюдению того же вида. Отсутствующие
+  даты отмечаются; выравнивание через цепочку не подставляется. Несколько кадров
+  одного года остаются прежним блокером `ambiguous_same_year_observations`.
+- Homography-кропы сохраняют native union canvas; GeoSCD — native reference grid.
+  RGB интерполируется из оригиналов один раз на кроп, alpha и границы входят в
+  поддержку. Предсказанная окклюзия GeoSCD не заменяет геометрическую поддержку.
+  Истории обеих геометрий лежат на native earliest-reference grid.
+- Пары проверяются по SHA-256, зданию, виду, годам, размеру и split. При допустимом
+  cache reuse старые пути/COCO ID в исходном run не переписываются; используются
+  проверенные текущие наблюдения из manifest. Session, review, geometry и dense
+  field имеют проверяемые хеши. Изменённые входы отклоняются.
+
+Это соединение стадий, а не автоматический запуск обучения и всех benchmark.
+`prepare dataset`, `synthetic`, `history`, `real` и `robustness` сохраняют прежние
+форматы и научные протоколы.
 
 ## Локальные отчёт и галереи
 
@@ -260,6 +350,7 @@ Source hashes старых frozen evaluations не ослабляются. Дл�
 
 ```bash
 python -B -m unittest discover -s tests -p 'test_workflow.py' -v
+python -B -m unittest discover -s tests -p 'test_alignment_session.py' -v
 python -B -m unittest discover -s tests -v
 ```
 
@@ -273,3 +364,10 @@ Torch/pycocotools; их отсутствие не подтверждает ра�
 конфликте хронологий и совпадение масок сохранённой LOFO-калибровки без изменения
 входов. `test_temporal_quick_report.py` проверяет полное/неполное покрытие,
 пороговые метрики, PREVIOUS/HISTORY и отказ при повреждённом cache.
+
+`test_alignment_session.py` проверяет смешанные homography/dense сессии, точные
+RGB и alpha, неизменность входов, отказ при изменении hash/review/split,
+запрет переопределения выбора и незавершённых сессий. Сквозные fixtures проходят
+через синтетический benchmark с настоящим RGB-DIFF и через real preparation,
+PREVIOUS/EARLIEST/HISTORY с подменой только модельного адаптера, bundle и atlas
+export. Это CPU-контрактные проверки, не измерение качества настоящих моделей.

@@ -117,6 +117,8 @@ def prepare_site(archive, output, repository=None):
     template_root = repository / "web/facade_atlas"
     locations = repository / "configs" / f"{DATE}-facade-atlas-locations.json"
     sources = [exporter, Path(__file__).resolve(), locations, *(template_root / name for name in TEMPLATES)]
+    sources.extend(repository / "facade_change" / name for name in
+                   ("saved_geometry.py", "alignment_session.py", "geoscd.py", "geometry.py", "io.py"))
     for source in sources:
         require(source.is_file(), f"Не найден исходник прототипа: {source}")
     archive_digest = file_sha256(archive)

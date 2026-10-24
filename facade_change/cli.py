@@ -82,10 +82,13 @@ def parser():
     crop.add_argument("--split", choices=["dev", "train", "val", "test"], default="dev")
     crop.add_argument("--group-id")
     dataset_crops = sub.add_parser("crop-dataset", help="Export accepted existing batch geometry; preserve prepared splits")
-    dataset_crops.add_argument("--batch-run", required=True)
+    crop_input = dataset_crops.add_mutually_exclusive_group(required=True)
+    crop_input.add_argument("--batch-run")
+    crop_input.add_argument("--alignment-session", help="Completed dataset_statistics session (or an unambiguous cache root)")
+    dataset_crops.add_argument("--split-file", help="Existing reviewed split.json if not beside the alignment manifest")
     dataset_crops.add_argument("--out", required=True)
-    dataset_crops.add_argument("--methods", nargs="+", choices=["loftr", "sift", "cascade"], default=["loftr", "sift"],
-                               help="Priority order; at most one accepted alignment per pair")
+    dataset_crops.add_argument("--methods", nargs="+", choices=["loftr", "sift", "cascade"],
+                               help="Batch priority (default loftr sift); omit for authoritative session selections")
     dataset_crops.add_argument("--tile-size", type=int, default=256)
     dataset_crops.add_argument("--stride", type=int, default=128)
     dataset_crops.add_argument("--min-valid-fraction", type=float, default=.8)
