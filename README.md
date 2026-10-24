@@ -14,16 +14,18 @@
 
 | Стадия | Команда | Что входит |
 |---|---|---|
-| Подготовка | `python -m facade_change workflow prepare --help` | Реальные/синтетические данные, split, RGB alignment, кропы, аугментации, истории |
+| Подготовка | `python -m facade_change workflow prepare --help` | Статистика COCO, реальные/синтетические данные, split, RGB alignment, кропы, аугментации, истории |
 | Обучение | `python -m facade_change workflow train --help` | Семантическая голова, MSDZip, ArIB, BCM; готовые модели переиспользуются |
 | Бенчмаркинг | `python -m facade_change workflow benchmark --help` | Синтетика, реальные пары, PREVIOUS/EARLIEST/HISTORY, robustness, сохранённые метрики, LOFO и fusion |
-| Галерея | `python -m facade_change workflow gallery --help` | Истории, сравнения, ошибки, отчёты и локальный atlas |
+| Галерея | `python -m facade_change workflow gallery --help` | Истории, сравнения, ошибки, листы для слайдов, сохранённый LOFO и локальный atlas |
 
 [Основная инструкция, входы/выходы и план переноса кода](docs/2026-10-24-main-workflow.md).
 Каждая стадия запускается отдельно; `STAGE TASK --help` показывает её параметры.
 Сохранённые данные, модели и карты позволяют продолжать с нужной стадии.
 Прежние команды остаются совместимыми. Составной `temporal-experiment`
 сохраняет [прежний контракт обучения и resume](docs/2026-10-14_temporal_experiment.md).
+`prepare statistics data/result_coco_402.json` считает фасады и годы без чтения RGB;
+[его отчёты](docs/2026-10-19_dataset_statistics.md) не заменяют подготовку или выравнивание.
 
 ## Данные и научный контракт
 
@@ -94,11 +96,14 @@ zstd/LZMA, MSDZip, JPEG-LS/H.264, ArIB-BPS и BCM-Net. Метрики разны
 
 | Каталог | Назначение |
 |---|---|
-| `facade_change/` | Подготовка, геометрия, benchmark; `methods/` — адаптеры, `segmentation/` — семантика, `research/` — исследовательские прототипы, `gallery/` — atlas и экспорт |
+| `facade_change/` | Подготовка, геометрия, benchmark; `methods/` — адаптеры, `segmentation/` — семантика, `research/` — исследовательские прототипы и temporal snapshot, `gallery/` — atlas, экспорт и сохранённые галереи |
 | `data_analysis/` | Анализ уже вычисленных карт без повторного inference |
 | `scripts/` | Установка, настройка, аудит и совместимые входы; real_eval переносится поэтапно |
 | `configs/`, `docs/`, `tests/` | Контракты, инструкции и проверки действующего кода |
 | `data/`, `weights/`, `models/`, `third_party/`, `runs/` | Локальные данные, зависимости и результаты вне Git |
+
+Единственное исключение внутри `data/` — короткий совместимый launcher
+`dataset_statistics.py`; его реализация находится в `facade_change/`.
 
 Дата в имени не означает ненужность: `2026-10-04_msdzip_h0.py` используется
 MSDZip, обучением ArIB/BCM и исследовательскими командами. Датированные scripts

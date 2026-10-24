@@ -29,6 +29,7 @@ ROBUSTNESS = "scripts.real_eval.real_robustness"
 
 COMMANDS = {
     "prepare": {
+        "statistics": Command("facade_change.dataset_statistics", "Count COCO facade histories without decoding RGB"),
         "dataset": Command("facade_change.dataset_setup", "COCO, reviewed identities and facade-disjoint splits"),
         "align": Command(CORE, "Align original RGB pairs; optionally export crops", ("batch",)),
         "crops": Command(CORE, "Export a crop dataset from saved alignment", ("crop-dataset",)),
@@ -64,11 +65,15 @@ COMMANDS = {
         "final-fpr": Command("scripts.real_eval.real_final_fpr", "Compare components and AND/OR at final FPR budgets",
                              legacy_process=True),
         "fusion": Command("scripts.real_eval.temporal_fusion", "Frozen component-threshold fusion on synthetic VAL"),
+        "temporal-snapshot": Command("facade_change.research.temporal_quick_report",
+                                     "CPU metrics and coverage from a snapshot of saved synthetic VAL units"),
         "semantic-updates": Command("scripts.real_eval.2026-10-19_semantic_updates", "Cache-only reconstructable C,V updates"),
         "continuous-updates": Command("scripts.real_eval.2026-10-19_continuous_semantic_updates",
                                       "Cache-only raw-pair or directed-delta event fusion"),
     },
     "gallery": {
+        "sheets": Command("facade_change.gallery.report_sheets", "Compose pair and chronology sheets from saved report panels"),
+        "lofo": Command("facade_change.gallery.lofo", "Render saved real-VAL LOFO decisions with mask/count verification"),
         "histories": Command(CORE, "Review saved synthetic and real transition histories", ("review-transitions",)),
         "real": Command(REAL, "Rebuild the real-history HTML report and tables", ("report",)),
         "real-crops": Command("scripts.real_eval.real_temporal_gallery", "Build the saved real-VAL crop gallery"),
