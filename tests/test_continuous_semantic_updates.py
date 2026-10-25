@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 continuous = importlib.import_module('scripts.real_eval.2026-10-19_continuous_semantic_updates')
-old = importlib.import_module('test_2026-10-19_semantic_updates')
+old = importlib.import_module('test_semantic_updates')
 pilot = continuous.pilot
 
 

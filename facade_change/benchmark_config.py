@@ -30,22 +30,26 @@ def benchmark_arguments(arguments):
     if not options.get("dataset_run") or not options.get("out"):
         raise ValueError("h0h1-benchmark requires dataset_run and out via flags or --config")
     if methods_config:
-        methods_file = Path(methods_config).expanduser().resolve()
-        method_data = read_json(methods_file)
-        if not isinstance(method_data, dict) or set(method_data) != {"methods"} or not isinstance(method_data["methods"], dict):
-            raise ValueError("Methods configuration must contain one 'methods' object")
-        local_methods = {}
-        for method, values in method_data["methods"].items():
-            if not isinstance(values, dict):
-                raise ValueError(f"Method options must be an object: {method}")
-            local_methods[method] = {
-                key: _path(value, methods_file.parent) if key in {
-                    "worker_python", "source_root", "checkpoint_path", "dino_root", "dino_checkpoint",
-                    "py_utils_root", "sam_checkpoint", "backbone_checkpoint", "calibration_checkpoint",
-                    "training_run", "model_config"
-                } and value else value for key, value in values.items()}
-        options["method_options"] = {**local_methods, **options.get("method_options", {})}
+        options["method_options"] = {**load_method_options(methods_config), **options.get("method_options", {})}
     return options
+
+
+def load_method_options(path):
+    """The same local source/weight/worker options for legacy and crop runners."""
+    methods_file = Path(path).expanduser().resolve()
+    method_data = read_json(methods_file)
+    if not isinstance(method_data, dict) or set(method_data) != {"methods"} or not isinstance(method_data["methods"], dict):
+        raise ValueError("Methods configuration must contain one 'methods' object")
+    result = {}
+    for method, values in method_data["methods"].items():
+        if not isinstance(values, dict):
+            raise ValueError(f"Method options must be an object: {method}")
+        result[method] = {key: _path(value, methods_file.parent) if key in {
+            "worker_python", "source_root", "checkpoint_path", "dino_root", "dino_checkpoint",
+            "py_utils_root", "sam_checkpoint", "backbone_checkpoint", "calibration_checkpoint",
+            "training_run", "model_config"
+        } and value else value for key, value in values.items()}
+    return result
 
 
 def _path(value, directory):

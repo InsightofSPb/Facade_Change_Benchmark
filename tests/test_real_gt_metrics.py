@@ -182,7 +182,7 @@ class RealGTLabelTests(unittest.TestCase):
         repository = Path(__file__).resolve().parents[1]
         if str(repository) not in sys.path:
             sys.path.insert(0, str(repository))
-        source = repository / "tests/test_2026-10-14_temporal_inputs.py"
+        source = repository / "tests/test_temporal_inputs.py"
         source_spec = importlib.util.spec_from_file_location("real_gt_input_fixture", source)
         source_module = importlib.util.module_from_spec(source_spec)
         source_spec.loader.exec_module(source_module)

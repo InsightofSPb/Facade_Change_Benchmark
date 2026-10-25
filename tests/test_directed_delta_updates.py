@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-base = importlib.import_module('test_2026-10-19_continuous_semantic_updates')
+base = importlib.import_module('test_continuous_semantic_updates')
 runner = base.continuous
 
 

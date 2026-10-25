@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from facade_change.derived import _starts
 from facade_change.geometry import expanded_canvas
@@ -132,37 +133,34 @@ def _parents(images, pairs, alignments, fingerprints, splits, strict_alignment_p
                     if mismatch:
                         break
                 if mismatch:
-                    if any(match["path"] == root or root in match["path"].parents for root in strict_alignment_paths):
+                    if match.get("selection") or any(match["path"] == root or root in match["path"].parents for root in strict_alignment_paths):
                         raise ValueError(mismatch)
                     attempt.update(reason="incompatible_current_metadata", error=mismatch)
                 else:
                     compatible.append(match)
             accepted = [match for match in compatible if
                         str(match["record"].get("status", "")).startswith("completed")
-                        and match["record"].get("quality_gate", {}).get("passed") is True]
+                        and (match.get("selection") or match["record"].get("quality_gate", {}).get("passed") is True)]
             if not accepted:
                 pair["status"] = "rejected_or_failed_alignment" if matches else "missing_alignment"
                 continue
-            chosen, path, matrix = None, None, None
+            chosen, frame_info = None, None
             for candidate in accepted:
                 try:
-                    candidate_path = inputs._artifact(candidate["path"], candidate["record"], "geometry.json", fingerprints)
-                    candidate_matrix = np.asarray(read_json(candidate_path)["source_to_reference"], dtype=float)
-                    expanded_canvas((reference["height"], reference["width"]),
-                                    (source["height"], source["width"]), candidate_matrix)
+                    from facade_change.saved_geometry import frame_geometry
+                    candidate_info = frame_geometry(candidate, fingerprints)
                 except (ValueError, KeyError, TypeError, OSError) as error:
-                    if any(candidate["path"] == root or root in candidate["path"].parents for root in strict_alignment_paths):
+                    if candidate.get("selection") or any(candidate["path"] == root or root in candidate["path"].parents for root in strict_alignment_paths):
                         raise
                     next(attempt for attempt in pair["attempts"] if attempt["path"] == str(candidate["path"])).update(
                         reason="invalid_discovered_geometry", error=f"{type(error).__name__}: {error}")
                     continue
-                chosen, path, matrix = candidate, candidate_path, candidate_matrix
+                chosen, frame_info = candidate, candidate_info
                 break
             if chosen is None:
                 pair["status"] = "invalid_alignment_geometry"
                 continue
-            frames.append({**source, "source_to_reference": matrix.tolist(), "frame": len(frames),
-                           "alignment_run": str(chosen["path"]), "geometry_sha256": fingerprints[str(path)]})
+            frames.append({**source, **frame_info, "frame": len(frames)})
             pair.update(status="accepted", selected_alignment=str(chosen["path"]))
         report["usable_observations"] = len(frames)
         if len(frames) < 2:
@@ -185,11 +183,13 @@ def _parents(images, pairs, alignments, fingerprints, splits, strict_alignment_p
 
 
 def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None,
-          splits=("train", "val", "test"), dataset=None):
+          splits=("train", "val", "test"), dataset=None, alignment_session=None, quality_report=None):
     """Freeze metadata/geometry and expose missing coverage without decoding RGB/GT."""
     splits = tuple(splits)
     if not splits or len(set(splits)) != len(splits) or not set(splits) <= {"train", "val", "test"}:
         raise ValueError("Нужны различные split из train, val, test")
+    if quality_report is not None and alignment_session is None:
+        raise ValueError("--quality-report requires --alignment-session")
     context = _context(run_path, snapshot_path)
     out = _new_output(out_path, [Path(context[key]) for key in ("source_run", "snapshot")])
     inputs = importlib.import_module("facade_change.research.2026-10-14_temporal_inputs")
@@ -197,6 +197,11 @@ def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None
     dataset_path = Path(dataset or context["source_config"]["dataset"]).expanduser().resolve()
     dataset_path = dataset_path / "dataset.json" if dataset_path.is_dir() else dataset_path
     images, pairs, split = inputs._dataset(dataset_path, fingerprints)
+    if alignment_session is not None:
+        if alignment_runs is not None or runs_root is not None:
+            raise ValueError("--alignment-session cannot be mixed with alignment discovery or --alignment-runs")
+        from facade_change.alignment_session import resolve_session
+        alignment_runs = [str(resolve_session(alignment_session))]
     discovered, excluded_runs = _discover(runs_root)
     configured = context["source_config"].get("alignment_runs", []) if alignment_runs is None else alignment_runs
     configured = list(dict.fromkeys(str(Path(path).expanduser().resolve()) for path in configured))
@@ -204,7 +209,7 @@ def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None
     alignments, attempts, loaded = defaultdict(list), [], []
     for path in paths:
         try:
-            found, run_attempts = inputs._alignments([path], fingerprints)
+            found, run_attempts = inputs._alignments([path], fingerprints, quality_report=quality_report)
         except (ValueError, KeyError, TypeError, OSError) as error:
             if path in configured:
                 raise
@@ -270,7 +275,7 @@ def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None
 
 
 def _verify_hashes(hashes):
-    for path, expected in hashes.items():
+    for path, expected in tqdm(hashes.items(), desc="Verify real history inputs", unit="file", dynamic_ncols=True):
         if sha256(path) != expected:
             raise ValueError(f"Изменился вход после аудита: {path}")
 
@@ -284,16 +289,15 @@ def _warp(data, sequence, frame, crop=None, include_rgb=False):
     rgb, packed, opaque = data.load_image(frame["image_id"])
     height, width = sequence["shape"]
     x, y, width, height = crop if crop is not None else (0, 0, width, height)
-    shift = np.array([[1., 0, -x], [0, 1., -y], [0, 0, 1.]])
-    matrix = shift @ np.asarray(frame["source_to_reference"], dtype=float)
-    warp = lambda value, flags: cv2.warpPerspective(value, matrix, (width, height), flags=flags,
-                                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    support = warp(opaque.astype(np.float32), cv2.INTER_LINEAR) >= 1 - 1e-6
-    bits = warp(packed, cv2.INTER_NEAREST)
+    from facade_change.saved_geometry import FrameSampler
+    sampler = FrameSampler(frame)
+    box = (x, y, width, height)
+    support = sampler.support(opaque, box)
+    bits = sampler.warp(packed, box, nearest=True)
     bits[~support] = 0
     result = dict(support=support, packed=bits)
     if include_rgb:
-        result["rgb"] = warp(rgb, cv2.INTER_LINEAR)
+        result["rgb"] = sampler.warp(rgb, box)
     return result
 
 
@@ -489,9 +493,9 @@ def prepare(audit_path, out_path, max_facades=12, crops_per_facade=1, tile_size=
                  audit_path=str(path), audited_views=len(parents), processed_views=0)
     atomic_json(out / "run.json", state)
     try:
-        for index, parent in enumerate(parents, 1):
-            print(f"CPU [{index}/{len(parents)}] {parent['building_id']} · {parent['split']}: "
-                  f"разметка {len(parent['frames'])} дат", flush=True)
+        for index, parent in enumerate(tqdm(parents, desc="Inspect real histories", unit="view", dynamic_ncols=True), 1):
+            tqdm.write(f"CPU [{index}/{len(parents)}] {parent['building_id']} · {parent['split']}: "
+                       f"разметка {len(parent['frames'])} дат")
             rows, stats = _rank_view(data, parent, tile_size, stride, min_support, min_known_pixels)
             candidates.extend(rows)
             view_rows.append(stats)
@@ -507,9 +511,9 @@ def prepare(audit_path, out_path, max_facades=12, crops_per_facade=1, tile_size=
             raise ValueError("Нет кропов с достаточной поддержкой, известной разметкой и изменениями")
         parent_index = {row["sequence_id"]: row for row in parents}
         sequences = []
-        for index, row in enumerate(selected, 1):
+        for index, row in enumerate(tqdm(selected, desc="Export real histories", unit="history", dynamic_ncols=True), 1):
             parent = parent_index[row["parent_sequence_id"]]
-            print(f"CPU сохраняем [{index}/{len(selected)}] {row['building_id']} · {row['sequence_id']}", flush=True)
+            tqdm.write(f"CPU сохраняем [{index}/{len(selected)}] {row['building_id']} · {row['sequence_id']}")
             frames, previews, previous = [], [], None
             for frame_number, frame in enumerate(parent["frames"]):
                 arrays = _warp(data, parent, frame, row["crop_xywh"], include_rgb=True)

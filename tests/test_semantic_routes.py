@@ -189,6 +189,23 @@ class SemanticRoutesIntegrationTests(unittest.TestCase):
         self.assertIn('rgb_diff', runner.contracts)
         self.assertEqual(TestOnlySegmenterPool.calls, [])
 
+    def test_repair_cli_explicitly_enables_existing_lposs_checkpoint(self):
+        config = copy.deepcopy(self.config)
+        config['segmenters']['lposs_stock'] = {
+            'kind': 'stock_lposs', 'source_root': '/existing/stock',
+            'dino_source_root': '/existing/dino', 'dino_checkpoint': '/existing/dino.pth'}
+        source, target = self.root / 'old-config.json', self.root / 'new-config.json'
+        atomic_json(source, config)
+        with redirect_stdout(io.StringIO()):
+            status = routes.main(['repair-config', '--config', str(source), '--out', str(target),
+                                  '--trust-lposs-checkpoint'])
+        self.assertEqual(status, 0)
+        repaired = read_json(target)
+        self.assertTrue(repaired['segmenters']['lposs_stock']['trust_checkpoint'])
+        self.assertEqual(repaired['segmenters']['frozen'], config['segmenters']['frozen'])
+        self.assertEqual(repaired['segmenters']['lposs_stock']['dino_checkpoint'], '/existing/dino.pth')
+        self.assertEqual(TestOnlySegmenterPool.calls, [])
+
     def test_partial_smoke_failure_is_visible_and_prevents_full_queue(self):
         config = copy.deepcopy(self.config)
         config['splits'] = ['val']

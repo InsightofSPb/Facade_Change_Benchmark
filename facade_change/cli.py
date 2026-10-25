@@ -31,8 +31,9 @@ def alignment_options(command):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Facade data inventory and native-RGB pair alignment")
+    p = argparse.ArgumentParser(description="Facade change research: prepare -> train -> benchmark -> gallery")
     sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("workflow", help="Main workflow: prepare, train, benchmark, gallery")
     sub.add_parser("doctor", help="Report installed packages and GPU availability")
     demo = sub.add_parser("demo", help="Run CPU SIFT on a procedural synthetic pair")
     demo.add_argument("--out", required=True)
@@ -81,10 +82,14 @@ def parser():
     crop.add_argument("--split", choices=["dev", "train", "val", "test"], default="dev")
     crop.add_argument("--group-id")
     dataset_crops = sub.add_parser("crop-dataset", help="Export accepted existing batch geometry; preserve prepared splits")
-    dataset_crops.add_argument("--batch-run", required=True)
+    crop_input = dataset_crops.add_mutually_exclusive_group(required=True)
+    crop_input.add_argument("--batch-run")
+    crop_input.add_argument("--alignment-session", help="Completed dataset_statistics session (or an unambiguous cache root)")
+    dataset_crops.add_argument("--quality-report", help="Explicit completed quality report for a separate evaluation or interrupted preparation")
+    dataset_crops.add_argument("--split-file", help="Existing reviewed split.json if not beside the alignment manifest")
     dataset_crops.add_argument("--out", required=True)
-    dataset_crops.add_argument("--methods", nargs="+", choices=["loftr", "sift", "cascade"], default=["loftr", "sift"],
-                               help="Priority order; at most one accepted alignment per pair")
+    dataset_crops.add_argument("--methods", nargs="+", choices=["loftr", "sift", "cascade"],
+                               help="Batch priority (default loftr sift); omit for authoritative session selections")
     dataset_crops.add_argument("--tile-size", type=int, default=256)
     dataset_crops.add_argument("--stride", type=int, default=128)
     dataset_crops.add_argument("--min-valid-fraction", type=float, default=.8)
@@ -95,6 +100,9 @@ def parser():
     hypotheses.add_argument("--crop-run", required=True)
     hypotheses.add_argument("--config", required=True, dest="config_path")
     hypotheses.add_argument("--out", required=True)
+    hypotheses.add_argument("--statistics-run", help="Completed crop_statistics run for annotation-balanced-v1 selection")
+    hypotheses.add_argument("--plan-only", action="store_true", help="Freeze pair selection and count outputs; generate no RGB")
+    hypotheses.add_argument("--selection-plan", help="Use a completed frozen selection run without reranking")
     history = sub.add_parser("prepare-history", help="CPU five-frame synthetic histories with matched no-event controls")
     history.add_argument("--dataset", required=True)
     history.add_argument("--out", required=True)
@@ -284,6 +292,10 @@ def parser():
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["workflow"]:
+        from .workflow import main as workflow_main
+        return workflow_main(argv[1:])
     args = vars(parser().parse_args(argv))
     command = args.pop("command")
     try:

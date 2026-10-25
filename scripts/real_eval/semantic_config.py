@@ -126,14 +126,16 @@ def _asset_diagnostics(segmenters):
     return result
 
 
-def repair_config(config_path, out, stock_root=None):
-    """Copy a configuration, repairing only verified stock checkout references.
+def repair_config(config_path, out, stock_root=None, *, trust_lposs_checkpoint=False):
+    """Copy a configuration, repairing stock paths or explicitly trusting local DINO weights.
 
     Custom settings, trained checkpoint roots, vocabularies and cache roots are
     retained verbatim. The source config is never overwritten. Explicit roots
     recorded by configure remain explicit; a new stock_root argument is an
     intentional override. Legacy configs are auto-repaired only when the stock
-    root equals the trained LPOSS root, the earlier configure default.
+    root equals the trained LPOSS root, the earlier configure default. A trust-
+    only repair preserves every root and other setting; root discovery runs
+    only when requested by stock_root or when no trust-only action was supplied.
     """
     source = Path(config_path).expanduser().resolve(strict=True)
     destination = Path(out).expanduser().resolve()
@@ -144,11 +146,21 @@ def repair_config(config_path, out, stock_root=None):
     segmenters = updated.get("segmenters", {})
     if not isinstance(segmenters, dict):
         raise ValueError("Конфигурация не содержит словарь segmenters")
+    trust_repairs = []
+    if trust_lposs_checkpoint:
+        for name, spec in segmenters.items():
+            if spec.get("kind") == "stock_lposs":
+                trust_repairs.append({"segmenter": name, "previous": spec.get("trust_checkpoint"),
+                                      "trust_checkpoint": True})
+                spec["trust_checkpoint"] = True
+        if not trust_repairs:
+            raise ValueError("В конфигурации нет stock_lposs для --trust-lposs-checkpoint")
+    repair_roots = stock_root is not None or not trust_lposs_checkpoint
     legacy_roots = {str(Path(spec["source_root"]).expanduser().resolve()) for spec in segmenters.values()
                     if spec.get("kind") == "finetuned_maskclip" and spec.get("source_root")}
     prior = updated.get("source", {}).get("stock_root_resolution", {})
     repairs = []
-    for name, spec in segmenters.items():
+    for name, spec in (segmenters.items() if repair_roots else ()):
         if spec.get("kind") not in {"stock_maskclip", "stock_lposs"}:
             continue
         original = spec.get("source_root")
@@ -171,10 +183,16 @@ def repair_config(config_path, out, stock_root=None):
         if selected != current:
             spec["source_root"] = str(selected)
         repairs.append({"segmenter": name, "old_root": original, "new_root": spec["source_root"], **resolution})
-    updated["configure_diagnostics"] = _asset_diagnostics(segmenters)
-    updated.setdefault("source", {})["stock_root_repair"] = {
-        "source_config": str(source), "source_config_sha256": sha256(source), "models": repairs,
-    }
+    if repair_roots:
+        updated["configure_diagnostics"] = _asset_diagnostics(segmenters)
+        updated.setdefault("source", {})["stock_root_repair"] = {
+            "source_config": str(source), "source_config_sha256": sha256(source), "models": repairs,
+        }
+    if trust_repairs:
+        updated.setdefault("source", {})["checkpoint_trust_repair"] = {
+            "source_config": str(source), "source_config_sha256": sha256(source), "models": trust_repairs,
+            "scope": "explicit legacy loading of existing local stock LPOSS DINO weights; no download",
+        }
     if stock_root is not None:
         updated["source"]["stock_root_resolution"] = {"explicit": True, "status": "explicit_repair",
                                                        "selected_root": str(Path(stock_root).expanduser().resolve())}
@@ -183,6 +201,8 @@ def repair_config(config_path, out, stock_root=None):
     print(f"Конфигурация: {destination}")
     for row in repairs:
         print(f"{row['segmenter']}: {row['status']}; {row.get('new_root', '')}")
+    for row in trust_repairs:
+        print(f"{row['segmenter']}: trust_checkpoint=true для существующих локальных весов DINO")
     return updated
 
 def add_configure_parser(subparsers):
@@ -193,6 +213,8 @@ def add_configure_parser(subparsers):
     parser.add_argument("--lposs-root", default="/home/sasha/LPOSS")
     parser.add_argument("--lposs-python")
     parser.add_argument("--stock-root", help="Отдельный checkout с ovs_heritage, если нужен")
+    parser.add_argument("--trust-lposs-checkpoint", action="store_true",
+                        help="Разрешить legacy-загрузку существующих локальных весов DINO для stock LPOSS")
     parser.add_argument("--sam3-python", default="/home/sasha/miniconda3/envs/sam3_facades_20260907/bin/python")
     parser.add_argument("--sam3-checkpoint", default="models/sam3.pt")
     parser.add_argument("--expanded-vocabulary", help="Точный пользовательский словарь JSON/YAML")
@@ -347,6 +369,8 @@ def configure(args):
                             "clip_checkpoint": "auto", "softmax_scale": 100., "variants": variants.copy()}
         if kind == "stock_lposs":
             segmenters[name].update(dino_source_root="auto", dino_checkpoint="auto")
+            if getattr(args, "trust_lposs_checkpoint", False):
+                segmenters[name]["trust_checkpoint"] = True
     segmenters["sam3"] = {"kind": "sam3", "worker_python": _absolute(args.sam3_python),
                            "checkpoint": _absolute(args.sam3_checkpoint, repo), "device": device,
                            "confidence_threshold": .25, "mask_threshold": .5, "precision": "bfloat16",

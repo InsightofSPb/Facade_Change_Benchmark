@@ -124,7 +124,7 @@ cd /home/sasha/Facade_Change_Benchmark
 Датированное имя модуля с дефисами требует явного запуска unittest:
 
 ```bash
-PYTHONPATH=tests python -m unittest test_2026-10-19_semantic_updates -v
+PYTHONPATH=tests python -m unittest test_semantic_updates -v
 ```
 
 Проверяются неправильное направление при верном CD, многоклассовое восстановление

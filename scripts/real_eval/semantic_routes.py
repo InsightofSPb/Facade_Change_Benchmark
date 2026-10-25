@@ -994,6 +994,8 @@ def main(argv=None):
     repair.add_argument('--config', required=True)
     repair.add_argument('--out', required=True)
     repair.add_argument('--stock-root')
+    repair.add_argument('--trust-lposs-checkpoint', action='store_true',
+                        help='Allow legacy torch.load for the existing local LPOSS DINO checkpoint')
     for name in ('smoke', 'run'):
         child = sub.add_parser(name)
         child.add_argument('--config', required=True)
@@ -1014,7 +1016,8 @@ def main(argv=None):
         configure(args)
         return 0
     if args.command == 'repair-config':
-        repair_config(args.config, args.out, stock_root=args.stock_root)
+        repair_config(args.config, args.out, stock_root=args.stock_root,
+                      trust_lposs_checkpoint=args.trust_lposs_checkpoint)
         return 0
     config = read_json(Path(args.config).expanduser().resolve())
     if args.splits:
