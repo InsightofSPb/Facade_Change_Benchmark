@@ -481,6 +481,8 @@ def load_tests(loader, standard_tests, pattern):
     import importlib
     models = importlib.import_module("test_2026-10-25_history_models")
     standard_tests.addTests(loader.loadTestsFromModule(models))
+    targets = importlib.import_module("test_2026-10-25_history_targets")
+    standard_tests.addTests(loader.loadTestsFromModule(targets))
     return standard_tests
 
 

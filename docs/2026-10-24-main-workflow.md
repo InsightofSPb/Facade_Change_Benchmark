@@ -43,6 +43,8 @@ split, методов и нового `--out` остаётся явным. Ко�
 |---|---|---|
 | prepare | dataset, align, crops | COCO + RGB + подтверждённые метаданные → dataset/split; RGB + manifest → alignment; сохранённая геометрия → crop dataset |
 | prepare | crop-histories, history-features | Сохранённая сессия alignment → общая сетка RGB-историй → frozen DINOv2 по датам и реальные интервалы лет |
+| prepare | history-targets | Существующие целевые COCO-маски + геометрия историй → автоматические метки различий, неизвестные области и галерея |
+| train / benchmark | history-models | Готовые DINO-признаки + проверенные или явно разрешённые автоматические метки → pair/pooled/GRU/Transformer и сравнение |
 | prepare | augmentations, synthetic, history | Подготовленный semantic dataset → фиксированные кропы/аугментации или пятикадровые истории; reviewed RGB crop dataset → контролируемые H0/H1 |
 | prepare | real-audit, real, robustness, transitions | Сохранённые реальные данные и геометрия → audit → подготовленные истории/варианты наблюдений/кандидаты переходов |
 | train | segmentation, msdzip, arib, bcm | TRAIN и отдельный VAL → training run, checkpoint и метрики; готовые модели можно переиспользовать |
@@ -130,6 +132,9 @@ RGB-DIFF/SSIM запуска. Его [контракт](../data_analysis/README.
 - `prepare crop-histories` → `prepare history-features` собирает новые
   [канонические истории RGB-кропов и frozen DINOv2](2026-10-25_history_features.md)
   с кэшем, альтернативными снимками одного года и явными пропусками дат.
+- `prepare history-targets` переносит [целевые маски в эти истории](2026-10-25_history_targets.md)
+  без повторного DINO. `train history-models` обучает модели по пригодным меткам;
+  неразмеченное не становится отрицательным классом.
 - `prepare history` строит синтетические истории из semantic dataset.
 - `prepare transitions` использует готовое выравнивание; `gallery histories`
   объединяет сохранённые synthetic/real истории для просмотра.

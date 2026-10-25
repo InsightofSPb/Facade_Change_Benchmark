@@ -382,7 +382,7 @@ class TrainingTests(unittest.TestCase):
             row.update(review_status="unreviewed", label="")
         hm.write_csv(self.labels, self.label_rows, hm.LABEL_FIELDS)
         out = self.root / "not-created"
-        with mock.patch.object(hm, "torch_runtime") as runtime, self.assertRaisesRegex(ValueError, "reviewed positive"):
+        with mock.patch.object(hm, "torch_runtime") as runtime, self.assertRaisesRegex(ValueError, "usable positive"):
             hm.train_models(self.arguments(out))
         runtime.assert_not_called()
         self.assertFalse(out.exists())

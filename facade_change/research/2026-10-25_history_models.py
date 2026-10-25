@@ -178,11 +178,11 @@ def write_csv(path, rows, fields):
         writer.writerows(rows)
 
 
-def read_labels(data, path, min_years=3):
+def read_labels(data, path, min_years=3, allow_derived=False):
     """Labels apply to fixed year-pooled prefixes; unknown and occluded stay unlabelled."""
     data.fingerprints.add(path)
     lookup = {row["event_id"]: row for row in data.samples}
-    accepted, seen, reasons = [], set(), Counter()
+    accepted, seen, reasons, derived_runs = [], set(), Counter(), {}
     with Path(path).open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if not set(LABEL_FIELDS).issubset(reader.fieldnames or []):
@@ -206,13 +206,42 @@ def read_labels(data, path, min_years=3):
                 if label[field] != str(row[field]):
                     raise ValueError(f"Stale or mismatched event label ({field}): {key}")
             status = label["review_status"].strip()
-            if status not in {"", "unreviewed", "accepted", "excluded"}:
+            if status not in {"", "unreviewed", "accepted", "excluded", "derived"}:
                 raise ValueError(f"Invalid review_status: {status}")
-            if status != "accepted":
+            if status == "derived" and not allow_derived:
+                raise ValueError("Annotation-derived targets require --allow-derived-labels; "
+                                 "they are not reviewed temporal ground truth")
+            if status not in {"accepted", "derived"}:
                 reasons[status or "unreviewed"] += 1
                 continue
-            if label["comparable"] != "yes" or label["label"] not in {"0", "1"}:
+            if status == "derived":
+                root = Path(label.get("annotation_run", "")).expanduser().resolve()
+                if str(root) not in derived_runs:
+                    record_path = root / "run.json"
+                    data.fingerprints.add(record_path)
+                    record = read_json(record_path)
+                    expected = record.get("artifact_sha256", {}).get("index.json")
+                    if record.get("status") != "completed" or not expected:
+                        raise ValueError("Derived labels need a completed, hash-bound annotation run")
+                    data.fingerprints.add(root / "index.json", expected)
+                    index = read_json(root / "index.json")
+                    if index.get("kind") != "history_annotation_targets":
+                        raise ValueError("Wrong annotation-derived reference kind")
+                    derived_runs[str(root)] = {r["event_id"]: r for r in index["events"]}
+                original = derived_runs[str(root)].get(key)
+                bound = ("prefix_sha256", "label", "review_status", "comparable", "target_scope",
+                         "target_path", "target_sha256", "event_type", "history_start_year",
+                         "review_source", "label_kind")
+                if original is None or any(str(original[k]) != label.get(k) for k in bound):
+                    raise ValueError(f"Derived label differs from its source artifact: {key}")
+                target = _inside(root, original["target_path"])
+                data.fingerprints.add(target, original["target_sha256"])
+                if label["comparable"] != "annotation_support_only":
+                    raise ValueError("Derived labels must declare annotation_support_only comparability")
+            elif label["comparable"] != "yes":
                 raise ValueError("Accepted labels need comparable=yes and binary label=0/1")
+            if label["label"] not in {"0", "1"}:
+                raise ValueError("Usable event labels must have binary label=0/1")
             if not label["review_source"].strip():
                 raise ValueError("Accepted event labels need reviewer/evidence in review_source")
             kind = label["event_type"].strip()
@@ -237,11 +266,17 @@ def read_labels(data, path, min_years=3):
             years = sample["years"][:-1]
             sample["time"] = np.column_stack((np.diff(years, prepend=years[0]), years-years[0])).astype(np.float32)
             sample.update(label=int(label["label"]), event_type=kind or "unspecified",
-                          history_start_year=start_year, review_source=label["review_source"])
+                          history_start_year=start_year, review_source=label["review_source"],
+                          review_status=status, comparable=label["comparable"],
+                          target_scope=label.get("target_scope", "reviewed event"),
+                          label_kind="annotation_derived" if status == "derived" else "reviewed")
             accepted.append(sample)
     coverage = {"accepted": len(accepted), "excluded_or_unreviewed": dict(reasons),
                 "missing_rows": len(set(lookup) - seen),
                 "by_split": dict(Counter(s["split"] for s in accepted)),
+                "label_kinds": dict(Counter(s["label_kind"] for s in accepted)),
+                "reference_by_split": {part: dict(Counter(s["label_kind"] for s in accepted if s["split"] == part))
+                                       for part in data.coverage["splits"]},
                 "buildings": len({s["building_id"] for s in accepted})}
     repairs = {}
     for sample in accepted:
@@ -310,6 +345,9 @@ def select_threshold(samples, scores, budget):
 
 def report_metrics(samples, scores, threshold, bootstrap=0, seed=42):
     result = metric_values(samples, scores, threshold)
+    result["reference_kinds"] = dict(Counter(s.get("label_kind", "reviewed") for s in samples))
+    result["reference_scope"] = ("contains annotation-derived targets; not an independent temporal-event test"
+                                 if "annotation_derived" in result["reference_kinds"] else "reviewed event labels")
     labels = np.array([s["label"] for s in samples])
     scores = np.asarray(scores)
     result["event_types"] = {}
@@ -576,13 +614,14 @@ def train_one(store, train, val, spec, args, torch):
 
 def train_models(args):
     data = load_histories(args.features, ("train", "val"), args.min_years, args.history_root)
-    samples, coverage = read_labels(data, args.labels, args.min_years)
+    samples, coverage = read_labels(data, args.labels, args.min_years, args.allow_derived_labels)
     train = [s for s in samples if s["split"] == "train"]
     val = [s for s in samples if s["split"] == "val"]
     for split, rows in (("train", train), ("val", val)):
         if {s["label"] for s in rows} != {0, 1}:
-            raise ValueError(f"{split.upper()} needs reviewed positive and negative events. "
-                             "Fill review.csv from history-scores; scores/semantic masks are not event GT.")
+            raise ValueError(f"{split.upper()} needs usable positive and negative events. "
+                             "Use reviewed labels, or explicit --allow-derived-labels with a history-targets export. "
+                             "Unknown crops cannot supply negative targets.")
     config = {k: v for k, v in vars(args).items() if k != "resume"}
     existing = Path(args.out) / "run.json"
     if args.resume and existing.exists() and read_json(existing).get("status") == "completed":
@@ -623,6 +662,7 @@ def train_models(args):
                   "building_splits": {t["building_id"]: t["split"] for t in data.tracks.values()},
                   "feature_index_sha256": sha256(data.index_path),
                   "labels_sha256": sha256(args.labels), "test_used": False}
+        bundle["training_reference"] = coverage["reference_by_split"]
         write_json(store.out / "models.json", bundle)
         finish_run(store, data, {"models": list(models), "labels": coverage,
                                 "selection": "best building-weighted validation AP; threshold from VAL only",
@@ -648,7 +688,7 @@ def evaluate_models(args):
         if old is not None and old != track["split"]:
             raise ValueError("A training building changed splits")
     if args.labels:
-        samples, coverage = read_labels(data, args.labels, bundle["min_years"])
+        samples, coverage = read_labels(data, args.labels, bundle["min_years"], args.allow_derived_labels)
     else:
         samples, coverage = data.samples, {"status": "unlabelled inference; metrics not computed"}
     data.fingerprints.add(run / "run.json")
@@ -668,7 +708,8 @@ def evaluate_models(args):
         torch_runtime(args.device, bundle["seed"])
         store.event("device_ready", device=args.device, cuda_runtime=torch.version.cuda,
                     gpu_name=torch.cuda.get_device_name(args.device) if args.device != "cpu" else None)
-        rows = [{**{k: s[k] for k in LABEL_FIELDS if k in s}, **cosine_scores(s)} for s in samples]
+        rows = [{**{k: s[k] for k in (*LABEL_FIELDS, "label_kind", "target_scope") if k in s},
+                 **cosine_scores(s)} for s in samples]
         columns = {name: np.array([r[name] for r in rows]) for name in SCORES}
         thresholds = {name: info["threshold"] for name, info in bundle["baselines"].items()}
         shuffled = {}
@@ -717,7 +758,7 @@ def evaluate_models(args):
                     "normal": report_metrics(matched, columns[name][original_ids], thresholds[name]),
                     "shuffled": report_metrics(matched, values[positions], thresholds[name]),
                     "scope": "inference perturbation; earlier appearances permuted, latest pair and date slots fixed"}
-        write_csv(store.out / "predictions.csv", rows, (*LABEL_FIELDS, *SCORES,
+        write_csv(store.out / "predictions.csv", rows, (*LABEL_FIELDS, "label_kind", "target_scope", *SCORES,
                     *(f"probability_{name}" for name in bundle["models"])))
         write_json(store.out / "metrics.json", {"splits": metrics, "past_shuffle": perturbations,
                                                "paired_ap_differences": differences,
@@ -751,6 +792,8 @@ def parser():
         if name != "score":
             command.add_argument("--labels", required=name == "train",
                                  help="Reviewed event CSV; omit during evaluate for unlabelled inference only")
+            command.add_argument("--allow-derived-labels", action="store_true",
+                                 help="Explicitly use hash-bound annotation-derived targets; metrics retain this scope")
             command.add_argument("--device", default="cpu")
             command.add_argument("--batch-size", type=int, default=64)
         if name == "train":
