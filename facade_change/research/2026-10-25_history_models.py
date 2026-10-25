@@ -533,29 +533,28 @@ def predict(model, samples, device, batch_size, shuffle_past=False, seed=42):
     return np.asarray(probabilities), np.asarray(embeddings)
 
 
-def train_one(store, train, val, spec, args, torch, objective=None):
+def train_one(store, train, val, spec, args, torch):
     networks = importlib.import_module(NETWORK_MODULE)
     key = f"{spec['model']}_{spec['time_mode']}"
     folder = store.out / key
     folder.mkdir(exist_ok=True)
-    model = (objective.build_model(spec) if objective else networks.HistoryClassifier(**spec)).to(args.device)
+    model = networks.HistoryClassifier(**spec).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     last, best = folder / "last.pth", folder / "best.pth"
-    start, best_ap, stale, best_epoch, best_state = 0, -float("inf"), 0, 0, None
+    start, best_ap, stale, best_epoch, best_state = 0, -1.0, 0, 0, None
     if last.exists():
         checkpoint = torch.load(last, map_location="cpu", weights_only=True)
         if checkpoint["spec"] != spec:
             raise ValueError("Checkpoint specification differs from the requested model")
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
-        start, best_ap, stale = checkpoint["epoch"], checkpoint.get("best_score", checkpoint.get("best_ap")), checkpoint["stale"]
+        start, best_ap, stale = checkpoint["epoch"], checkpoint["best_ap"], checkpoint["stale"]
         best_epoch, best_state = checkpoint["best_epoch"], checkpoint["best_state"]
         torch.set_rng_state(checkpoint["rng"])
         if args.device != "cpu":
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
-    weights = objective.loss_weights(train) if objective else building_weights(train)
-    if objective is None:
-        weights /= weights.mean()
+    weights = building_weights(train)
+    weights /= weights.mean()
     for epoch in range(start, args.epochs):
         if stale >= args.patience:
             break
@@ -566,13 +565,10 @@ def train_one(store, train, val, spec, args, torch, objective=None):
             ids = order[offset:offset+args.batch_size]
             rows = [train[i] for i in ids]
             batch = networks.batch_samples(rows, args.device)
+            targets = torch.tensor([row["label"] for row in rows], dtype=torch.float32, device=args.device)
             logits, _ = model(**batch)
-            if objective:
-                loss = objective.loss(logits, rows, weights[ids], torch)
-            else:
-                targets = torch.tensor([row["label"] for row in rows], dtype=torch.float32, device=args.device)
-                losses = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-                loss = (losses * torch.tensor(weights[ids], dtype=torch.float32, device=args.device)).mean()
+            losses = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+            loss = (losses * torch.tensor(weights[ids], dtype=torch.float32, device=args.device)).mean()
             if not torch.isfinite(loss):
                 raise ValueError("Non-finite training loss")
             optimizer.zero_grad(set_to_none=True)
@@ -581,8 +577,7 @@ def train_one(store, train, val, spec, args, torch, objective=None):
             optimizer.step()
             loss_sum += float(loss.detach()) * len(ids)
         scores, _ = predict(model, val, args.device, args.batch_size)
-        ap = (-objective.report_metrics(val, scores)["macro_building_mae"] if objective else
-              average_precision([s["label"] for s in val], scores, building_weights(val)))
+        ap = average_precision([s["label"] for s in val], scores, building_weights(val))
         improved = ap > best_ap
         if improved:
             best_ap, best_epoch, stale = ap, epoch + 1, 0
@@ -590,32 +585,27 @@ def train_one(store, train, val, spec, args, torch, objective=None):
         else:
             stale += 1
         payload = {"spec": spec, "epoch": epoch+1, "state_dict": model.state_dict(),
-                   "optimizer": optimizer.state_dict(), "best_score": best_ap, "best_epoch": best_epoch,
+                   "optimizer": optimizer.state_dict(), "best_ap": best_ap, "best_epoch": best_epoch,
                    "best_state": best_state, "stale": stale, "rng": torch.get_rng_state(),
                    "cuda_rng": torch.cuda.get_rng_state_all() if args.device != "cpu" else []}
         atomic_checkpoint(torch, last, payload)
-        metric = {"val_macro_building_mae": -ap} if objective else {"val_building_weighted_ap": ap}
         store.event("epoch_completed", model=key, epoch=epoch+1, train_loss=loss_sum/len(train),
-                    **metric, best_epoch=best_epoch, checkpoint_sha256=sha256(last))
-        description = f"VAL macro MAE={-ap:.5f}" if objective else f"VAL AP={ap:.5f}"
+                    val_building_weighted_ap=ap, best_epoch=best_epoch, checkpoint_sha256=sha256(last))
         print(f"{key}: epoch {epoch+1}/{args.epochs}, loss={loss_sum/len(train):.5f}, "
-              f"{description}, best epoch={best_epoch}", flush=True)
+              f"VAL AP={ap:.5f}, best epoch={best_epoch}", flush=True)
     if best_state is None:
         raise ValueError("No trained checkpoint was produced")
     model.load_state_dict(best_state, strict=True)
     atomic_checkpoint(torch, best, {"spec": spec, "state_dict": best_state, "epoch": best_epoch})
     scores, embeddings = predict(model, val, args.device, args.batch_size)
-    if objective:
-        details, arrays = objective.model_result(val, scores)
-    else:
-        threshold = select_threshold(val, scores, args.fpr)
-        details, arrays = {"threshold": threshold, "val": report_metrics(val, scores, threshold)}, {"probabilities": scores}
+    threshold = select_threshold(val, scores, args.fpr)
     _npz(folder / "val_predictions.npz", {"event_ids": np.array([s["event_id"] for s in val]),
-                                          **arrays, "history_embeddings": embeddings})
+                                          "probabilities": scores, "history_embeddings": embeddings})
+    metrics = report_metrics(val, scores, threshold)
     info = {"spec": spec, "checkpoint": best.relative_to(store.out).as_posix(),
             "checkpoint_sha256": sha256(best), "best_epoch": best_epoch,
             "parameters": sum(p.numel() for p in model.parameters()),
-            **details,
+            "threshold": threshold, "val": metrics,
             "embedding_scope": "observations strictly before the current target"}
     write_json(folder / "result.json", info)
     store.event("model_completed", model=key, checkpoint_sha256=info["checkpoint_sha256"])
@@ -623,8 +613,6 @@ def train_one(store, train, val, spec, args, torch, objective=None):
 
 
 def train_models(args):
-    if args.class_targets:
-        return importlib.import_module("facade_change.research.2026-10-25_history_regression").train_models(args)
     data = load_histories(args.features, ("train", "val"), args.min_years, args.history_root)
     samples, coverage = read_labels(data, args.labels, args.min_years, args.allow_derived_labels)
     train = [s for s in samples if s["split"] == "train"]
@@ -692,10 +680,6 @@ def evaluate_models(args):
     record, bundle = read_json(run / "run.json"), read_json(run / "models.json")
     if record.get("status") != "completed" or record.get("artifact_sha256", {}).get("models.json") != sha256(run / "models.json"):
         raise ValueError("Training run is incomplete or models.json is corrupt")
-    if bundle.get("objective") == "class_fractions":
-        return importlib.import_module("facade_change.research.2026-10-25_history_regression").evaluate_models(args, run, bundle)
-    if args.class_targets:
-        raise ValueError("This binary training run requires event labels, not class fractions")
     data = load_histories(args.features, args.splits, bundle["min_years"], args.history_root)
     if data.index["encoder"] != bundle["encoder"]:
         raise ValueError("Feature encoder/preprocessing differs from training")
@@ -806,10 +790,8 @@ def parser():
             command.add_argument("--splits", nargs="+", choices=("train", "val", "test"), default=["train", "val"])
             command.add_argument("--gallery-limit", type=int, default=60)
         if name != "score":
-            targets = command.add_mutually_exclusive_group(required=name == "train")
-            targets.add_argument("--labels",
+            command.add_argument("--labels", required=name == "train",
                                  help="Reviewed event CSV; omit during evaluate for unlabelled inference only")
-            targets.add_argument("--class-targets", help="history-fractions index.json; use masked per-class regression")
             command.add_argument("--allow-derived-labels", action="store_true",
                                  help="Explicitly use hash-bound annotation-derived targets; metrics retain this scope")
             command.add_argument("--device", default="cpu")

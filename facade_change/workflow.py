@@ -38,8 +38,6 @@ COMMANDS = {
                                    "Project target-class COCO masks into saved histories; retain unknown areas"),
         "targets": Command("facade_change.research.2026-10-25_history_targets",
                            "Shared target masks for --features histories or --crops pairs"),
-        "history-fractions": Command("facade_change.research.2026-10-25_history_regression",
-                                     "Derive per-class change fractions from existing annotation targets"),
         "temporal-embeddings": Command("facade_change.research.2026-10-25_history_models",
                                        "Apply trained history encoders to cached features", ("evaluate",)),
         "synthetic": Command(CORE, "Controlled H0/H1 cases from reviewed RGB crops", ("h0h1",)),
