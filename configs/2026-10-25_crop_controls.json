@@ -1,13 +1,23 @@
 {
   "schema_version": 1,
+  "include_real_pairs": true,
   "selection": {
+    "strategy": "annotation-balanced-v1",
     "splits": [
       "train",
       "val"
     ],
-    "crops_per_building": 2,
-    "max_buildings_per_split": 0,
-    "min_valid_fraction": 0.8
+    "min_valid_fraction": 0.8,
+    "min_known_pixels": 64,
+    "min_known_fraction": 0.01,
+    "min_changed_pixels": 8,
+    "min_stable_class_pixels": 8,
+    "change_fraction_edges": [0.01, 0.05, 0.1, 0.25],
+    "area_direction_threshold": 0.01,
+    "max_pairs": 500,
+    "max_pairs_per_building": 40,
+    "max_crops_per_photo_pair": 4,
+    "max_same_pair_iou": 0.25
   },
   "states": [
     "unchanged",

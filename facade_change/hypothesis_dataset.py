@@ -43,6 +43,8 @@ def _check_parent_file(root, record, relative):
 
 
 def _selection(rows, split, selection):
+    if selection.get("strategy") is not None:
+        raise ValueError("Annotation selection uses the frozen --plan-only/--selection-plan workflow, not legacy _selection")
     requested = selection.get("splits", ["train", "val", "test"])
     per_building = selection.get("crops_per_building", 2)
     limit = selection.get("max_buildings_per_split", 0)
@@ -362,7 +364,24 @@ def prepare_history_dataset(dataset, out, seed=42, crops_per_building=1,
         progress.close()
 
 
-def prepare_hypothesis_dataset(crop_run, config_path, out):
+def _generation_budget(synthetic, real, states, scenarios):
+    """Count files written by the existing renderer and the real-pair side branch."""
+    u, k, s, p = len(synthetic), len(real), len(states), len(scenarios)
+    intensity = sum(item["kind"] in {"identity", "shadow", "occlusion"} for item in scenarios)
+    return dict(synthetic_bases=u, real_crop_pairs=k, states=s, scenarios=p,
+                synthetic_comparisons=u*s*p, real_comparisons=k*p,
+                total_comparisons=u*s*p+k*p,
+                synthetic_rgb_png=u*(1+s*p), real_rgb_png=k*(1+p),
+                rgb_png=u*(1+s*p)+k*(1+p),
+                synthetic_auxiliary_png=u*(1+2*s+8*s*p),
+                real_auxiliary_png=k*(3+5*p),
+                auxiliary_png=u*(1+2*s+8*s*p)+k*(3+5*p),
+                intensity_npy=intensity*(u*s+k),
+                png_count_includes_copied_references=True, json_csv_html_files_not_counted=True)
+
+
+def prepare_hypothesis_dataset(crop_run, config_path, out, statistics_run=None,
+                               selection_plan=None, plan_only=False):
     """Build same-reference H0/H1 controls, never labels from the real later photo."""
     from .augmentations import apply_nuisance, render_state, validate_scenarios
 
@@ -382,15 +401,56 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
     if not isinstance(states, list) or not states or len(set(states)) != len(states) or any(state not in {"unchanged", "crack", "paint_patch", "self_paste"} for state in states):
         raise ValueError("states must contain unique supported procedural states")
     scenarios = validate_scenarios(config["scenarios"])
-    selected, excluded, selection = _selection(index["crops"], split, config.get("selection", {}))
-    if not selected:
-        raise ValueError("No indexed crops meet the requested partitions and valid-fraction threshold")
     inputs = {"parent_run": parent_hash, "parent_summary": summary_hash, "parent_index": index_hash,
               "split": split_hash, "config": config_hash}
+    input_files = {str(path): digest for path, digest in ((crop_run / "run.json", parent_hash),
+                   (summary_path, summary_hash), (index_path, index_hash), (split_path, split_hash),
+                   (config_path, config_hash))}
+    plan, plan_files, real_rows = None, {}, []
+    annotation_selection = config.get("selection", {}).get("strategy") is not None
+    if annotation_selection:
+        from .crop_selection import build_plan, load_plan, verify_plan, write_plan
+        if type(config.get("include_real_pairs", False)) is not bool:
+            raise ValueError("include_real_pairs must be boolean")
+        if selection_plan and statistics_run:
+            raise ValueError("Use either --statistics-run or the frozen --selection-plan")
+        if selection_plan:
+            plan, plan_files = load_plan(selection_plan, config, inputs)
+        elif statistics_run:
+            plan = build_plan(crop_run, index, split, parent_summary, config, statistics_run, inputs)
+            plan["external_inputs"].update(input_files)
+        else:
+            raise ValueError("Annotation selection requires --statistics-run or --selection-plan")
+        selected, excluded, selection = plan["synthetic_selected"], plan["excluded_crops"], plan["selection"]
+        if config.get("include_real_pairs", False):
+            real_rows = plan["selected"]
+        budget = _generation_budget(selected, real_rows, states, scenarios)
+        output = Path(out).expanduser().resolve()
+        protected = [crop_run, *(Path(path).parent for path in plan["external_inputs"] if Path(path).name == "run.json")]
+        if selection_plan:
+            protected.append(Path(selection_plan).expanduser().resolve())
+        if (any(output == path or output in path.parents or path in output.parents for path in protected)
+                or any(output == Path(path) or output in Path(path).parents for path in plan["external_inputs"])):
+            raise ValueError("Output must be separate from crop, statistics, config and selection inputs")
+        verify_plan(plan, config, inputs)
+        if plan_only:
+            return write_plan(output, plan, budget)
+        input_files.update(plan["external_inputs"])
+        input_files.update(plan_files)
+    else:
+        if statistics_run or selection_plan or plan_only or config.get("include_real_pairs"):
+            raise ValueError("Plan/statistics/real-pair options require annotation-balanced-v1 selection")
+        selected, excluded, selection = _selection(index["crops"], split, config.get("selection", {}))
+    if not selected:
+        raise ValueError("No indexed crops meet the requested partitions and valid-fraction threshold")
     out = new_directory(out)
     record = run_record("hypothesis_dataset", {"crop_run": str(crop_run), "config_path": str(config_path),
                         "input_sha256": inputs, "selection": selection, "states": states, "scenarios": scenarios,
-                        "label_scope": LABEL_SCOPE, "selection_algorithm": "stable SHA ranking with view/reference diversity; no random split"})
+                        "label_scope": LABEL_SCOPE, "selection_algorithm": "annotation-balanced-v1" if plan else "stable SHA ranking with view/reference diversity; no random split"})
+    if plan:
+        record["config"].update(selection_plan_sha256=_digest(plan), bound_inputs=input_files,
+                                generation_budget=budget)
+        record["config_sha256"] = _digest(record["config"])
     write_json(out / "run.json", record)
     progress = tqdm(total=len(selected) * len(states) * len(scenarios), desc="Prepare synthetic H0/H1",
                     unit="case", dynamic_ncols=True)
@@ -404,6 +464,8 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
                               "parent_excluded_pairs": index.get("excluded_pairs", []),
                               "policy": "Frozen selection for this run; newly appended candidate crops may change a future SHA-ranked selection."}
         write_json(out / "selection.json", selection_document)
+        if plan:
+            write_json(out / "cohort_selection.json", plan)
         cases, bases, selected_hashes = [], [], {}
         families = {state: [] for state in states}
         for row in selected:
@@ -411,6 +473,9 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
             selected_hashes.update(checked)
             base_id = _digest([row["building_id"], row["view_id"], row["source_image_sha256"]["reference"],
                                row["artifact_sha256"]["reference_rgb.png"], row["bbox_canvas_xyxy"]])[:24]
+            if plan:
+                base_id = _digest([row["building_id"], row["view_id"], row["artifact_sha256"]["reference_rgb.png"],
+                                   row["artifact_sha256"]["reference_support.png"]])[:24]
             base_relative = Path("bases") / base_id
             base = new_directory(out / base_relative)
             original = _inside(crop_run, row["path"])
@@ -496,6 +561,9 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
                     families[state].append(case)
                     progress.update()
         progress.close()
+        real_summary = _prepare_real_pairs(out, crop_run, parent, real_rows, scenarios, plan["selected_details"]) if real_rows else None
+        if real_summary:
+            selected_hashes.update(real_summary.pop("checked_parent_artifacts"))
         for relative, digest in tqdm(selected_hashes.items(), desc="Verify synthetic inputs", unit="file", dynamic_ncols=True):
             if sha256(crop_run / relative) != digest:
                 raise ValueError(f"Selected parent crop changed during export: {relative}")
@@ -503,6 +571,10 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
                              (split_path, split_hash), (config_path, config_hash)):
             if sha256(path) != digest:
                 raise ValueError(f"Input provenance changed during export: {path.name}")
+        if plan:
+            for path, digest in input_files.items():
+                if sha256(path) != digest:
+                    raise ValueError(f"Selection provenance changed during export: {path}")
         write_json(out / "index.json", {"schema_version": 1, "label_scope": LABEL_SCOPE, "input_sha256": inputs,
                                        "selection_path": "selection.json", "split": split, "bases": bases, "cases": cases,
                                        "parent_summary": parent_summary,
@@ -533,6 +605,10 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
                    "index_path": "index.json", "csv_index_path": "index.csv", "selection_path": "selection.json",
                    "gallery_path": "gallery.html", "label_scope": LABEL_SCOPE,
                    "status": "completed_needs_review"}
+        if plan:
+            summary.update(cohort_pair_count=len(plan["selected"]), cohort_report=plan["report"],
+                           generation_budget=budget, real_pairs=real_summary,
+                           cohort_selection_path="cohort_selection.json")
         write_json(out / "summary.json", summary)
         (out / "summary.txt").write_text(
             f"Selected {len(selected)} of {len(index['crops'])} indexed crops from {summary['selected_building_count']} buildings.\n"
@@ -549,6 +625,89 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
         raise
     finally:
         progress.close()
+
+
+def _prepare_real_pairs(out, crop_run, parent, rows, scenarios, details):
+    """Perturb the actual late photo B in A -> T(B); create no natural-change GT."""
+    from .augmentations import apply_nuisance
+    root = new_directory(out / "real_pairs")
+    cases, checked_inputs = [], {}
+    for row in tqdm(rows, desc="Prepare real RGB pairs", unit="pair", dynamic_ncols=True):
+        reference, reference_support, checked = _checked_crop(crop_run, parent, row)
+        checked_inputs.update(checked)
+        original = _inside(crop_run, row["path"])
+        source, opaque = load_rgb(original / "source_rgb.png")
+        with Image.open(original / "source_support.png") as image:
+            source_support = np.asarray(image) == 255
+        with Image.open(original / "geometric_overlap.png") as image:
+            overlap = np.asarray(image) == 255
+        if (source.shape != reference.shape or source_support.shape != reference_support.shape
+                or np.any(source_support & ~opaque)
+                or not np.array_equal(overlap, reference_support & source_support)):
+            raise ValueError("Real-pair RGB/supports disagree with the saved native crop grid")
+        pair_key = _digest([row["building_id"], row["dataset_crop_id"]])[:24]
+        base = new_directory(root / "bases" / pair_key)
+        for name in ("reference_rgb.png", "reference_support.png", "source_support.png", "geometric_overlap.png"):
+            shutil.copyfile(original / name, base / name)
+        write_json(base / "metadata.json", dict(parent_crop=row, selection_diagnostics=details[row["dataset_crop_id"]],
+                   label_scope="original annotation diagnostics retained; no natural event/pixel labels generated"))
+        for scenario in scenarios:
+            result = apply_nuisance(source.copy(), source_support.copy(), scenario)
+            rgb = np.asarray(result["rgb"])
+            support = _mask(result["support"], source_support.shape, "source_support")
+            visibility = _mask(result["true_visibility"], source_support.shape, "artificial_visibility")
+            if (rgb.dtype != np.uint8 or rgb.shape != source.shape
+                    or np.any(support & ~source_support) or np.any(visibility & ~source_support)):
+                raise ValueError("Real-pair nuisance changed geometry or invented support")
+            case_id = pair_key + "-" + scenario["id"]
+            directory = new_directory(root / "cases" / case_id)
+            arrays = dict(source_rgb=rgb, source_support=support, artificial_visibility=visibility,
+                          geometric_visible_support=reference_support & support & visibility,
+                          nuisance_mask=_mask(result["nuisance_mask"], support.shape, "nuisance_mask"),
+                          nuisance_actual_change=_mask(result["actual_change_mask"], support.shape, "nuisance_actual_change"))
+            paths = {}
+            for name, array in arrays.items():
+                _save(directory / (name + ".png"), array.astype(np.uint8)*255 if array.dtype == bool else array)
+                paths[name] = (directory / (name + ".png")).relative_to(out).as_posix()
+            if "intensity" in result:
+                intensity = np.asarray(result["intensity"])
+                if intensity.shape != support.shape or not np.isfinite(intensity).all():
+                    raise ValueError("Real nuisance intensity has invalid shape/values")
+                np.save(directory / "nuisance_intensity.npy", intensity, allow_pickle=False)
+                paths["nuisance_intensity"] = (directory / "nuisance_intensity.npy").relative_to(out).as_posix()
+            paths.update(reference_rgb=(base / "reference_rgb.png").relative_to(out).as_posix(),
+                         reference_support=(base / "reference_support.png").relative_to(out).as_posix(),
+                         original_geometric_overlap=(base / "geometric_overlap.png").relative_to(out).as_posix())
+            cases.append(dict(case_id=case_id, parent_dataset_crop_id=row["dataset_crop_id"],
+                **{key: row[key] for key in ("pair_id", "building_id", "view_id", "split", "reference_year", "source_year")},
+                scenario_id=scenario["id"], nuisance_kind=scenario["kind"], nuisance_parameters=result["parameters"],
+                source_origin="actual saved later photograph; nuisance applied to B in A -> T(B)",
+                real_occlusion_known=False, natural_change_labels_created=False,
+                original_pair_status=details[row["dataset_crop_id"]]["original_pair_status"],
+                original_pair_reason=details[row["dataset_crop_id"]]["original_pair_reason"],
+                support_scope="saved geometry minus known artificial occlusion; not semantic annotation coverage",
+                artifact_sha256={key: sha256(out / path) for key, path in paths.items()}, **paths))
+    document = dict(kind="real_pair_augmentations", schema_version=1, artifact_root="..", cases=cases,
+                    natural_change_labels_created=False, hypothesis_labels_created=False,
+                    label_scope="RGB robustness observations; derive/evaluate natural masks through prepare targets separately")
+    write_json(root / "index.json", document)
+    fields = ["case_id", "parent_dataset_crop_id", "building_id", "view_id", "split", "reference_year", "source_year",
+              "scenario_id", "nuisance_kind", "reference_rgb", "source_rgb", "geometric_visible_support",
+              "original_pair_status", "original_pair_reason", "natural_change_labels_created"]
+    with (root / "index.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(cases)
+    page = ['<!doctype html><meta charset="utf-8"><title>Real pair augmentations</title>',
+            '<style>body{font:16px system-ui;margin:24px}img{max-width:160px}td{padding:8px}</style>',
+            '<h1>Real A / perturbed late B</h1><p>Annotation diagnostics only; unknown context remains unknown.</p><table>']
+    for case in cases:
+        page.append('<tr><td>' + html.escape(case["parent_dataset_crop_id"]+" / "+case["scenario_id"]) + '</td>' + ''.join(
+            '<td><img loading="lazy" src="../' + html.escape(case[key], quote=True) + '"></td>' for key in ("reference_rgb", "source_rgb")) + '</tr>')
+    (root / "gallery.html").write_text('\n'.join(page+['</table>']), encoding="utf-8")
+    return dict(pair_count=len(rows), case_count=len(cases), index_path="real_pairs/index.json",
+                gallery_path="real_pairs/gallery.html", natural_change_labels_created=False,
+                checked_parent_artifacts=checked_inputs)
 
 
 def _galleries(out, families):

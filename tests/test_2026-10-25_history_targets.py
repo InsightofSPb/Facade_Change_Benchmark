@@ -324,6 +324,14 @@ class CropTargetPipelineTests(unittest.TestCase):
         options = read_json(config)
         self.assertEqual(options["selection"]["splits"], ["train", "val"])
         self.assertEqual((len(options["states"]), len(options["scenarios"])), (4, 18))
+        self.assertEqual(options["selection"]["strategy"], "annotation-balanced-v1")
+        # Test the unchanged procedural matrix independently of the new CSV selector.
+        # The annotation-selector integration has its own hash-bound statistics fixture.
+        options.pop("include_real_pairs")
+        options["selection"] = dict(splits=["train", "val"], crops_per_building=2,
+                                    max_buildings_per_split=0, min_valid_fraction=.8)
+        config = self.root / "legacy-synthetic.json"
+        write_json(config, options)
         with mock.patch("facade_change.segmentation.data.rasterize_annotations", side_effect=AssertionError("synthetic GT is procedural")):
             result = prepare_hypothesis_dataset(self.crops, config, self.root / "synthetic")
         index = read_json(self.root / "synthetic/index.json")
