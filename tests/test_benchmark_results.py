@@ -191,7 +191,8 @@ class ReuseResultsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, _, bases, cases, hashes, method = save_run(root)
-            with patch("torch.load", side_effect=AssertionError("Model loading forbidden")):
+            # Reusing saved maps must also work without importing optional Torch.
+            with patch.dict("sys.modules", {"torch": None}):
                 reuse = ReuseResults(root)
                 reuse.validate_selection(hashes, bases, cases)
                 result = reuse.load(method, cases[0]["case_id"])
