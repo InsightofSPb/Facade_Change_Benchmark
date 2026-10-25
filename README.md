@@ -39,6 +39,12 @@ review, split и ссылки на Canny/cycle/drift сохраняются; с�
 из существующей сессии; изображения и признаки кэшируются отдельно.
 [Команды, формат данных и продолжение эксперимента](docs/2026-10-25_history_features.md).
 
+Готовые признаки используются без повторного DINO: `workflow benchmark history-scores`
+строит оценки и таблицу ручной разметки, `workflow train history-models` обучает pair,
+pooled, GRU и Transformer, `workflow benchmark history-models` оценивает сохранённые
+модели. `workflow prepare temporal-embeddings` экспортирует обученные векторы.
+[Контракт меток событий, команды и проверки](docs/2026-10-25_history_models.md).
+
 ## Данные и научный контракт
 
 Подготовка берёт только изображения текущего COCO. Хеш-префиксы и

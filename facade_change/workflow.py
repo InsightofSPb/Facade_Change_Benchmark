@@ -34,6 +34,8 @@ COMMANDS = {
         "crops": Command(CORE, "Export a crop dataset from saved alignment", ("crop-dataset",)),
         "crop-histories": Command("facade_change.history_features", "Canonical multi-year RGB crop tracks from saved alignment", ("prepare",)),
         "history-features": Command("facade_change.history_features", "Frozen DINOv2 features and year-aware crop sequences", ("embed",)),
+        "temporal-embeddings": Command("facade_change.research.2026-10-25_history_models",
+                                       "Apply trained history encoders to cached features", ("evaluate",)),
         "synthetic": Command(CORE, "Controlled H0/H1 cases from reviewed RGB crops", ("h0h1",)),
         "history": Command(CORE, "Five-frame synthetic histories and matched controls", ("prepare-history",)),
         "augmentations": Command(SEGMENTATION, "Fixed segmentation crops and augmentations", ("--prepare-only",),
@@ -44,6 +46,8 @@ COMMANDS = {
         "robustness": Command(ROBUSTNESS, "Prepare real observation-variation controls", ("prepare",)),
     },
     "train": {
+        "history-models": Command("facade_change.research.2026-10-25_history_models",
+                                  "Pair/pooled classifiers, GRU and temporal Transformer", ("train",)),
         "segmentation": Command(SEGMENTATION, "Train the DINO semantic head on prepared augmentations",
                                 forbidden=("--prepare-only", "--evaluate-run")),
         "msdzip": Command(CORE, "Train MSDZip on TRAIN H0 RGB residuals", ("msdzip-train",)),
@@ -51,6 +55,10 @@ COMMANDS = {
         "bcm": Command(CORE, "Adapt BCM-Net on TRAIN H0 RGB tiles", ("bcm-train",)),
     },
     "benchmark": {
+        "history-scores": Command("facade_change.research.2026-10-25_history_models",
+                                  "Cached previous/earliest/history cosine scores and review table", ("score",)),
+        "history-models": Command("facade_change.research.2026-10-25_history_models",
+                                  "Frozen temporal models, validation thresholds and facade statistics", ("evaluate",)),
         "synthetic": Command(CORE, "Compare methods on fixed H0/H1 cases", ("h0h1-benchmark",)),
         "real": Command(REAL, "PREVIOUS / EARLIEST / HISTORY with frozen models", ("run",)),
         "pilot": Command(REAL, "Bounded real-pair and history pilot", ("pilot",)),

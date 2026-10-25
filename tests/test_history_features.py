@@ -475,5 +475,14 @@ class FrozenFeatureTest(unittest.TestCase):
         self.assertTrue((self.features / "index.json").is_file())
 
 
+def load_tests(loader, standard_tests, pattern):
+    # unittest's filename filter skips ISO-dated modules. Include the next-stage
+    # contracts explicitly while retaining dated research source filenames.
+    import importlib
+    models = importlib.import_module("test_2026-10-25_history_models")
+    standard_tests.addTests(loader.loadTestsFromModule(models))
+    return standard_tests
+
+
 if __name__ == "__main__":
     unittest.main()
