@@ -56,6 +56,7 @@ coverage.json; эти предварительные числа включают
 ```bash
 conda run --no-capture-output -n scd_bench python -s -u \
   -m facade_change workflow prepare history-features \
+  --methods-config configs/history_features.local.json \
   --histories /home/sasha/Facade_Change_Benchmark/data/histories \
   --out /home/sasha/Facade_Change_Benchmark/data/2026-10-25-history-patches \
   --save-patch-tokens --device cuda:0 --batch-size 32 --trust-checkpoint
@@ -112,6 +113,17 @@ CPU requirements включают `tqdm` для подготовки кропо�
 переиспользования сохранённых карт запрещает импорт необязательного Torch.
 
 ## Основное сравнение
+
+Прогресс показывается с начала проверки данных: метаданные историй, загрузка
+последовательностей, проверка пространственных признаков и целевых масок.
+При обучении вложенные tqdm показывают методы, эпохи текущего метода и текущую
+фазу: TRAIN по обработанным примерам, VAL по переходам вида между двумя годами
+после объединения перекрывающихся кропов. Видны прошедшее время, ETA и текущий
+средний TRAIN loss; после VAL обновляются F1 и номер лучшей эпохи.
+Ранняя остановка выводится явно, без фиктивного заполнения оставшихся эпох.
+При resume счётчик эпох начинается с сохранённого checkpoint. Итоговая строка
+каждой эпохи и журнал events.jsonl сохраняются. Обновление предназначено для
+следующего запуска; текущий процесс продолжает выполнять загруженную версию.
 
 ```bash
 conda run --no-capture-output -n scd_bench python -s -u \

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from ..history_features import _inside, digest
+from ..history_features import _inside, digest, progress
 from ..io import read_json, sha256
 
 
@@ -29,7 +29,8 @@ def checked_categories(categories):
 class SpatialData:
     def __init__(self, features, targets, splits=("train", "val"), history_root=None,
                  target_features=None, categories=None, auxiliary=None, smoke_buildings=0):
-        self.history = history.load_histories(features, splits, 3, history_root)
+        print("Spatial data: checking histories, input hashes and targets before model allocation", flush=True)
+        self.history = history.load_histories(features, splits, 3, history_root, progress=progress)
         if smoke_buildings < 0:
             raise ValueError("smoke_buildings cannot be negative")
         if smoke_buildings:
@@ -105,7 +106,7 @@ class SpatialData:
                 raise ValueError("Duplicate target event")
             events[row["event_id"]] = row
         features_by_id = self.history.index.get("features", {})
-        for sample in self.history.samples:
+        for sample in progress(self.history.samples, "Validate spatial features and targets"):
             row = events.get(sample["event_id"])
             if row is None:
                 self.coverage["missing_target_events"] += 1
@@ -169,6 +170,8 @@ class SpatialData:
                          "feature_grid": list(first["features"].shape[-2:]),
                          "target_scope": contract["target_scope"],
                          "supervision": "derived annotation differences; not independently reviewed events"}
+        print(f"Spatial data ready: {len(self.samples)} prefixes, {len(self.categories)} classes; "
+              f"by split={dict(Counter(s['split'] for s in self.samples))}", flush=True)
 
     @lru_cache(maxsize=96)
     def arrays(self, path):

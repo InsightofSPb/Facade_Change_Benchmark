@@ -58,7 +58,7 @@ class HistoryData:
     coverage: dict
 
 
-def load_histories(index_path, splits=("train", "val"), min_years=3, history_root=None):
+def load_histories(index_path, splits=("train", "val"), min_years=3, history_root=None, progress=None):
     """Validate the immutable feature/geometry snapshots; load selected splits only."""
     path = Path(index_path).expanduser().resolve()
     if path.is_dir():
@@ -88,7 +88,8 @@ def load_histories(index_path, splits=("train", "val"), min_years=3, history_roo
     if document.get("kind") != "canonical_crop_histories":
         raise ValueError("Unexpected history manifest kind")
     tracks, buildings, views, source_splits, observations = {}, {}, {}, {}, set()
-    for track in document["tracks"]:
+    for track in (progress(document["tracks"], "Validate history metadata")
+                  if progress else document["tracks"]):
         key, building, split = track["track_id"], track["building_id"], track["split"]
         if key in tracks or not building or split not in {"train", "val", "test"}:
             raise ValueError("Invalid/duplicate history identity or split")
@@ -108,7 +109,8 @@ def load_histories(index_path, splits=("train", "val"), min_years=3, history_roo
         tracks[key] = track
     samples, seen, counts = [], set(), Counter()
     dimension = index["encoder"]["dimensions"]
-    for entry in index["sequences"]:
+    for entry in (progress(index["sequences"], "Load history sequences")
+                  if progress else index["sequences"]):
         key = entry["track_id"]
         track = tracks.get(key)
         if key in seen or track is None or any(entry[k] != track[k] for k in

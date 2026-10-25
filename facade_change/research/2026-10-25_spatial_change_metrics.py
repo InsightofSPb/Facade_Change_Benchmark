@@ -17,7 +17,8 @@ def binary_target(target):
     return np.where(known, positive.astype(np.uint8), 255)
 
 
-def collect_histograms(data, samples, prediction, binary_only=False, native_mask=False, block_size=256):
+def collect_histograms(data, samples, prediction, binary_only=False, native_mask=False, block_size=256,
+                       progress=None):
     """Average overlapping scores before counting each view/transition pixel once.
 
     Native binary masks retain their decision rule and merge by union. Coverage is
@@ -31,6 +32,8 @@ def collect_histograms(data, samples, prediction, binary_only=False, native_mask
     channels = len(data.categories)
     histogram = {}
     coverage = {"transitions": len(groups), "crop_events": len(samples), "unique_geometric_pixels": 0}
+    if progress is not None:
+        progress.reset(total=len(groups))
     for key, rows in sorted(groups.items()):
         bins = histogram.setdefault(key[0], np.zeros((channels + 1, 2, BINS), np.int64))
         blocks = defaultdict(list)
@@ -87,6 +90,8 @@ def collect_histograms(data, samples, prediction, binary_only=False, native_mask
                 label = targets[channel][valid]
                 for positive in (0, 1):
                     bins[channel, positive] += np.bincount(quantized[label == positive], minlength=BINS)
+        if progress is not None:
+            progress.update(1)
     return histogram, coverage
 
 

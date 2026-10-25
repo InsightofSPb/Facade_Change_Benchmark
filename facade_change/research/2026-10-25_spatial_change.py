@@ -9,6 +9,7 @@ import html
 import importlib
 import io
 from pathlib import Path
+import sys
 
 import numpy as np
 from PIL import Image
@@ -94,6 +95,8 @@ def finish(store, data, summary):
 
 
 def train(args):
+    from tqdm import tqdm
+
     data = load_data(args, ("train", "val"))
     train_rows = [s for s in data.samples if s["split"] == "train"]
     val_rows = [s for s in data.samples if s["split"] == "val"]
@@ -111,80 +114,104 @@ def train(args):
         from ..segmentation.model import masked_multilabel_loss
         building_counts = Counter(s["building_id"] for s in train_rows)
         records, final_reports = [], {}
-        for mode in args.models:
-            torch.manual_seed(args.seed)
-            spec = dict(feature_channels=data.dimension, target_channels=len(data.categories),
-                        mode=mode, hidden=args.hidden, extra_channels=len(data.extra_spec["channels"]))
-            model = networks.SpatialChangeModel(**spec).to(args.device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-            folder = store.out / mode
-            folder.mkdir(exist_ok=True)
-            last, best = folder / "last.pth", folder / "best.pth"
-            epoch_start, best_score, best_epoch, stale = 0, -1., 0, 0
-            if last.exists():
-                payload = torch.load(last, map_location="cpu", weights_only=True)
-                if payload["identity"] != data.identity or payload["spec"] != spec:
-                    raise ValueError("Resume checkpoint channels, features or context differ")
+        bar_options = dict(dynamic_ncols=True, mininterval=0.5)
+        with tqdm(args.models, desc="Methods", unit="method", position=0, **bar_options) as methods_bar:
+            for mode in methods_bar:
+                methods_bar.set_postfix_str(mode, refresh=False)
+                torch.manual_seed(args.seed)
+                spec = dict(feature_channels=data.dimension, target_channels=len(data.categories),
+                            mode=mode, hidden=args.hidden, extra_channels=len(data.extra_spec["channels"]))
+                model = networks.SpatialChangeModel(**spec).to(args.device)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+                folder = store.out / mode
+                folder.mkdir(exist_ok=True)
+                last, best = folder / "last.pth", folder / "best.pth"
+                epoch_start, best_score, best_epoch, stale = 0, -1., 0, 0
+                if last.exists():
+                    payload = torch.load(last, map_location="cpu", weights_only=True)
+                    if payload["identity"] != data.identity or payload["spec"] != spec:
+                        raise ValueError("Resume checkpoint channels, features or context differ")
+                    model.load_state_dict(payload["model"])
+                    optimizer.load_state_dict(payload["optimizer"])
+                    epoch_start, best_score = payload["epoch"], payload["best_score"]
+                    best_epoch, stale = payload["best_epoch"], payload["stale"]
+                with tqdm(total=args.epochs, initial=epoch_start, desc=f"{mode}: epochs",
+                          unit="epoch", position=1, leave=False, **bar_options) as epochs_bar:
+                    for epoch in range(epoch_start, args.epochs):
+                        if stale >= args.patience:
+                            tqdm.write(f"{mode}: early stopping after {epoch} epochs; best epoch={best_epoch}")
+                            sys.stdout.flush()
+                            break
+                        model.train()
+                        order = np.random.default_rng(args.seed + epoch).permutation(len(train_rows))
+                        total_loss = 0.
+                        with tqdm(total=len(order), desc=f"{mode} {epoch + 1}/{args.epochs}: TRAIN",
+                                  unit="sample", position=2, leave=False, **bar_options) as train_bar:
+                            for offset in range(0, len(order), args.batch_size):
+                                optimizer.zero_grad(set_to_none=True)
+                                batch = order[offset:offset + args.batch_size]
+                                for index in batch:
+                                    sample = train_rows[int(index)]
+                                    item = data.load(sample)
+                                    logits = model(**tensors(item, args.device))
+                                    labels = torch.from_numpy(item["target"]).to(args.device)
+                                    weight = len(train_rows) / (len(building_counts) * building_counts[sample["building_id"]])
+                                    loss = masked_multilabel_loss(logits, (labels == 1)[None], (labels != 255)[None])
+                                    (loss * weight / len(batch)).backward()
+                                    total_loss += float(loss.detach().cpu()) * weight
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+                                optimizer.step()
+                                processed = offset + len(batch)
+                                train_bar.set_postfix(loss=f"{total_loss / processed:.5f}", refresh=False)
+                                train_bar.update(len(batch))
+                        with tqdm(desc=f"{mode} {epoch + 1}/{args.epochs}: VAL", unit="transition",
+                                  position=2, leave=False, **bar_options) as val_bar:
+                            hist, _ = metrics.collect_histograms(
+                                data, val_rows, model_prediction(model, data, args.device), progress=val_bar)
+                        report = metrics.report(hist, data.categories, [0.5] * (len(data.categories) + 1))
+                        score = report["classes"]["primary"]["f1"]
+                        score = -1. if score is None else float(score)
+                        improved = best_epoch == 0 or score > best_score + 1e-12
+                        if improved:
+                            best_score, best_epoch, stale = score, epoch + 1, 0
+                        else:
+                            stale += 1
+                        payload = {"schema_version": 1, "spec": spec, "identity": data.identity,
+                                   "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                                   "epoch": epoch + 1, "best_score": best_score, "best_epoch": best_epoch, "stale": stale}
+                        if improved:
+                            history.atomic_checkpoint(torch, best, payload)
+                        history.atomic_checkpoint(torch, last, payload)
+                        store.event("spatial_epoch", model=mode, epoch=epoch + 1,
+                                    train_loss=total_loss / len(train_rows), val_macro_building_f1=score,
+                                    checkpoint_sha256=sha256(last), best_epoch=best_epoch)
+                        epochs_bar.set_postfix(loss=f"{total_loss / len(train_rows):.5f}",
+                                               val_f1=f"{score:.5f}", best_epoch=best_epoch, refresh=False)
+                        epochs_bar.update(1)
+                        tqdm.write(f"{mode}: epoch {epoch + 1}/{args.epochs}, loss={total_loss / len(train_rows):.5f}, "
+                                   f"VAL building F1={score:.5f}")
+                        sys.stdout.flush()
+                payload = torch.load(best, map_location="cpu", weights_only=True)
                 model.load_state_dict(payload["model"])
-                optimizer.load_state_dict(payload["optimizer"])
-                epoch_start, best_score = payload["epoch"], payload["best_score"]
-                best_epoch, stale = payload["best_epoch"], payload["stale"]
-            for epoch in range(epoch_start, args.epochs):
-                if stale >= args.patience:
-                    break
-                model.train()
-                order = np.random.default_rng(args.seed + epoch).permutation(len(train_rows))
-                total_loss = 0.
-                for offset in range(0, len(order), args.batch_size):
-                    optimizer.zero_grad(set_to_none=True)
-                    batch = order[offset:offset + args.batch_size]
-                    for index in batch:
-                        sample = train_rows[int(index)]
-                        item = data.load(sample)
-                        logits = model(**tensors(item, args.device))
-                        labels = torch.from_numpy(item["target"]).to(args.device)
-                        weight = len(train_rows) / (len(building_counts) * building_counts[sample["building_id"]])
-                        loss = masked_multilabel_loss(logits, (labels == 1)[None], (labels != 255)[None])
-                        (loss * weight / len(batch)).backward()
-                        total_loss += float(loss.detach().cpu()) * weight
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
-                    optimizer.step()
-                hist, _ = metrics.collect_histograms(data, val_rows, model_prediction(model, data, args.device))
-                report = metrics.report(hist, data.categories, [0.5] * (len(data.categories) + 1))
-                score = report["classes"]["primary"]["f1"]
-                score = -1. if score is None else float(score)
-                improved = best_epoch == 0 or score > best_score + 1e-12
-                if improved:
-                    best_score, best_epoch, stale = score, epoch + 1, 0
-                else:
-                    stale += 1
-                payload = {"schema_version": 1, "spec": spec, "identity": data.identity,
-                           "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                           "epoch": epoch + 1, "best_score": best_score, "best_epoch": best_epoch, "stale": stale}
-                if improved:
-                    history.atomic_checkpoint(torch, best, payload)
-                history.atomic_checkpoint(torch, last, payload)
-                store.event("spatial_epoch", model=mode, epoch=epoch + 1,
-                            train_loss=total_loss / len(train_rows), val_macro_building_f1=score,
-                            checkpoint_sha256=sha256(last), best_epoch=best_epoch)
-                print(f"{mode}: epoch {epoch + 1}/{args.epochs}, loss={total_loss / len(train_rows):.5f}, "
-                      f"VAL building F1={score:.5f}", flush=True)
-            payload = torch.load(best, map_location="cpu", weights_only=True)
-            model.load_state_dict(payload["model"])
-            hist, merged = metrics.collect_histograms(data, val_rows, model_prediction(model, data, args.device))
-            thresholds, reasons = metrics.calibrate(hist, len(data.categories) + 1)
-            result = metrics.report(hist, data.categories, thresholds)
-            result["coverage"] = merged
-            final_reports[mode] = result
-            write_json(folder / "val_metrics.json", result)
-            record = {"name": mode, "spec": spec, "checkpoint": best.relative_to(store.out).as_posix(),
-                      "checkpoint_sha256": sha256(best), "thresholds": thresholds, "threshold_reasons": reasons,
-                      "best_epoch": best_epoch, "parameters": sum(p.numel() for p in model.parameters())}
-            records.append(record)
-            store.event("spatial_model_completed", **record)
-            del model, optimizer, payload
-            if args.device.startswith("cuda"):
-                torch.cuda.empty_cache()
+                with tqdm(desc=f"{mode}: best checkpoint VAL", unit="transition",
+                          position=1, leave=False, **bar_options) as val_bar:
+                    hist, merged = metrics.collect_histograms(
+                        data, val_rows, model_prediction(model, data, args.device), progress=val_bar)
+                thresholds, reasons = metrics.calibrate(hist, len(data.categories) + 1)
+                result = metrics.report(hist, data.categories, thresholds)
+                result["coverage"] = merged
+                final_reports[mode] = result
+                write_json(folder / "val_metrics.json", result)
+                record = {"name": mode, "spec": spec, "checkpoint": best.relative_to(store.out).as_posix(),
+                          "checkpoint_sha256": sha256(best), "thresholds": thresholds, "threshold_reasons": reasons,
+                          "best_epoch": best_epoch, "parameters": sum(p.numel() for p in model.parameters())}
+                records.append(record)
+                store.event("spatial_model_completed", **record)
+                tqdm.write(f"{mode}: completed; best epoch={best_epoch}, VAL building F1={best_score:.5f}")
+                sys.stdout.flush()
+                del model, optimizer, payload
+                if args.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
         write_json(store.out / "models.json", {"schema_version": 1, "kind": "spatial_change_models",
                     "identity": data.identity, "models": records, "data_request": data_request(args),
                     "checkpoint_selection": "VAL equal-building macro-class F1 at fixed 0.5",
