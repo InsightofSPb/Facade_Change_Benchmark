@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from facade_change.derived import _starts
 from facade_change.geometry import expanded_canvas
@@ -274,7 +275,7 @@ def audit(run_path, snapshot_path, out_path, alignment_runs=None, runs_root=None
 
 
 def _verify_hashes(hashes):
-    for path, expected in hashes.items():
+    for path, expected in tqdm(hashes.items(), desc="Verify real history inputs", unit="file", dynamic_ncols=True):
         if sha256(path) != expected:
             raise ValueError(f"Изменился вход после аудита: {path}")
 
@@ -492,9 +493,9 @@ def prepare(audit_path, out_path, max_facades=12, crops_per_facade=1, tile_size=
                  audit_path=str(path), audited_views=len(parents), processed_views=0)
     atomic_json(out / "run.json", state)
     try:
-        for index, parent in enumerate(parents, 1):
-            print(f"CPU [{index}/{len(parents)}] {parent['building_id']} · {parent['split']}: "
-                  f"разметка {len(parent['frames'])} дат", flush=True)
+        for index, parent in enumerate(tqdm(parents, desc="Inspect real histories", unit="view", dynamic_ncols=True), 1):
+            tqdm.write(f"CPU [{index}/{len(parents)}] {parent['building_id']} · {parent['split']}: "
+                       f"разметка {len(parent['frames'])} дат")
             rows, stats = _rank_view(data, parent, tile_size, stride, min_support, min_known_pixels)
             candidates.extend(rows)
             view_rows.append(stats)
@@ -510,9 +511,9 @@ def prepare(audit_path, out_path, max_facades=12, crops_per_facade=1, tile_size=
             raise ValueError("Нет кропов с достаточной поддержкой, известной разметкой и изменениями")
         parent_index = {row["sequence_id"]: row for row in parents}
         sequences = []
-        for index, row in enumerate(selected, 1):
+        for index, row in enumerate(tqdm(selected, desc="Export real histories", unit="history", dynamic_ncols=True), 1):
             parent = parent_index[row["parent_sequence_id"]]
-            print(f"CPU сохраняем [{index}/{len(selected)}] {row['building_id']} · {row['sequence_id']}", flush=True)
+            tqdm.write(f"CPU сохраняем [{index}/{len(selected)}] {row['building_id']} · {row['sequence_id']}")
             frames, previews, previous = [], [], None
             for frame_number, frame in enumerate(parent["frames"]):
                 arrays = _warp(data, parent, frame, row["crop_xywh"], include_rgb=True)

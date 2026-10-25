@@ -7,6 +7,8 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
+from tqdm import tqdm
+
 from .derived import build_crops, controlled_examples
 from .io import finish_record, new_directory, read_json, run_record, sha256, write_json
 from .pipeline import select_pair
@@ -132,7 +134,7 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
         crops, exported, excluded, control_rows, control_failures = [], [], [], [], []
         control_sources = 0
         derivative_failures = 0
-        for pair in pairs:
+        for pair in tqdm(pairs, desc="Export aligned crops", unit="pair", dynamic_ncols=True):
             pair_id = pair["pair_id"]
             chosen = (session.selected.get(pair_id) if session else
                       next((lookup[(pair_id, method)] for method in methods
@@ -248,7 +250,7 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
                                + html.escape(excluded_by_id[pair["pair_id"]]["reason"]) + '</td></tr>')
         gallery.append('</table></html>')
         (out / "gallery.html").write_text('\n'.join(gallery), encoding="utf-8")
-        for key, path in input_paths.items():
+        for key, path in tqdm(input_paths.items(), desc="Verify crop inputs", unit="file", dynamic_ncols=True):
             if sha256(path) != hashes[key]:
                 raise ValueError(f"Input {key} changed during crop dataset preparation")
         summary = {"selected_pair_count": len(pairs), "exported_pair_count": len(exported),
@@ -270,7 +272,7 @@ def prepare_crop_dataset(batch_run=None, out=None, methods=None, tile_size=256,
             "Source-only tiles fail the overlap threshold; semantic masks and real temporal labels were not created.\n",
             encoding="utf-8")
         record["summary"] = summary
-        finish_record(out, record, summary["status"])
+        finish_record(out, record, summary["status"], progress_desc="Hash crop dataset")
         return summary
     except (Exception, KeyboardInterrupt) as exc:
         finish_record(out, record, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", str(exc))

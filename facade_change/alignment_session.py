@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from tqdm import tqdm
+
 from .io import read_json, sha256
 from .preparation import validate_partitions
 
@@ -207,7 +209,7 @@ def _load_session(root, fingerprints, quality_report=None):
             reviews[key] = row
     selected, seen = {}, set()
     prepared = {(str(p["reference_id"]), str(p["source_id"])) for p in manifest.get("pairs", [])}
-    for pair in pairs:
+    for pair in tqdm(pairs, desc="Validate saved alignments", unit="pair", dynamic_ncols=True):
         pid = pair["pair_id"]
         if pid in seen:
             raise ValueError("Duplicate alignment session pair")

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from .io import finish_record, load_rgb, new_directory, read_json, run_record, sha256, write_json
 
@@ -212,6 +213,7 @@ def prepare_history_dataset(dataset, out, seed=42, crops_per_building=1,
     out = new_directory(out)
     record = run_record("history_dataset", config)
     write_json(out / "run.json", record)
+    progress = tqdm(total=len(selected) * 2 * 5, desc="Prepare synthetic histories", unit="frame", dynamic_ncols=True)
     try:
         write_json(out / "config.json", config)
         write_json(out / "selection.json", {"selected": selected, "excluded_images_or_small_crops": excluded,
@@ -313,11 +315,13 @@ def prepare_history_dataset(dataset, out, seed=42, crops_per_building=1,
                         f'<img loading="lazy" src="{html.escape(paths[key], quote=True)}" alt="{key}"><br>'
                         for key in ("rgb", "new_change")) + '</td>')
                     previous_visibility = visibility
+                    progress.update()
                 page.append('</tr></table>')
                 sequences.append({"sequence_id": sequence_id, "base_id": base_id, "arm": arm,
                                   "building_id": image["building_id"], "split": image["split"],
                                   "independent_photo_sample": False, "frames": frames})
-        for path, expected in source_hashes.items():
+        progress.close()
+        for path, expected in tqdm(source_hashes.items(), desc="Verify history originals", unit="image", dynamic_ncols=True):
             if sha256(path) != expected:
                 raise ValueError(f"Source image changed during history preparation: {path}")
         for name, path in data.metadata["paths"].items():
@@ -349,11 +353,13 @@ def prepare_history_dataset(dataset, out, seed=42, crops_per_building=1,
                    "manifest": "manifest.json", "gallery": "gallery.html", "label_scope": LABEL_SCOPE}
         write_json(out / "summary.json", summary)
         record["summary"] = summary
-        finish_record(out, record, summary["status"])
+        finish_record(out, record, summary["status"], progress_desc="Hash synthetic histories")
         return summary
     except (Exception, KeyboardInterrupt) as exc:
         finish_record(out, record, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", str(exc))
         raise
+    finally:
+        progress.close()
 
 
 def prepare_hypothesis_dataset(crop_run, config_path, out):
@@ -386,6 +392,8 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
                         "input_sha256": inputs, "selection": selection, "states": states, "scenarios": scenarios,
                         "label_scope": LABEL_SCOPE, "selection_algorithm": "stable SHA ranking with view/reference diversity; no random split"})
     write_json(out / "run.json", record)
+    progress = tqdm(total=len(selected) * len(states) * len(scenarios), desc="Prepare synthetic H0/H1",
+                    unit="case", dynamic_ncols=True)
     try:
         shutil.copyfile(split_path, out / "split.json")
         shutil.copyfile(config_path, out / "config.json")
@@ -486,7 +494,9 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
                             "artifact_sha256": {name: sha256(out / path) for name, path in paths.items()}, **paths}
                     cases.append(case)
                     families[state].append(case)
-        for relative, digest in selected_hashes.items():
+                    progress.update()
+        progress.close()
+        for relative, digest in tqdm(selected_hashes.items(), desc="Verify synthetic inputs", unit="file", dynamic_ncols=True):
             if sha256(crop_run / relative) != digest:
                 raise ValueError(f"Selected parent crop changed during export: {relative}")
         for path, digest in ((crop_run / "run.json", parent_hash), (summary_path, summary_hash), (index_path, index_hash),
@@ -532,11 +542,13 @@ def prepare_hypothesis_dataset(crop_run, config_path, out):
             "Existing base damage remains unchanged. Known source occlusion is explicitly recorded; labels there are 255.\n"
             "Edit masks precede nuisance; shadows and exposure never become state-edit ground truth.\n", encoding="utf-8")
         record["summary"] = summary
-        finish_record(out, record, summary["status"])
+        finish_record(out, record, summary["status"], progress_desc="Hash synthetic H0/H1")
         return summary
     except (Exception, KeyboardInterrupt) as exc:
         finish_record(out, record, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", str(exc))
         raise
+    finally:
+        progress.close()
 
 
 def _galleries(out, families):

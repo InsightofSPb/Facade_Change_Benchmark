@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from facade_change.augmentations import apply_nuisance
 from . import real_gt_metrics
@@ -259,7 +260,7 @@ def prepare(run_path, snapshot_path, out_path, repo_path=None, boundary_toleranc
     try:
         ordered = sorted(baseline, key=lambda row: (row["building_id"], row["sequence_id"], row["frame"]))
         current_id, cached = None, {}
-        for number, source_row in enumerate(ordered, 1):
+        for number, source_row in enumerate(tqdm(ordered, desc="Prepare real robustness", unit="pair", dynamic_ncols=True), 1):
             state["processed_pairs"] = number
             identifier, frame = source_row["sequence_id"], source_row["frame"]
             row = {"pair_id": "pair-" + digest([identifier, frame])[:24], "sequence_id": identifier,
@@ -270,7 +271,7 @@ def prepare(run_path, snapshot_path, out_path, repo_path=None, boundary_toleranc
                 row["exclusion_reason"] = "Исходная RGB-DIFF единица не завершена: " + str(source_row.get("status"))
                 pairs.append(row)
                 atomic_json(out / "run.json", state)
-                print(f"[{number}/{len(ordered)}] {identifier} frame {frame}: исключено — {row['exclusion_reason']}", flush=True)
+                tqdm.write(f"[{number}/{len(ordered)}] {identifier} frame {frame}: исключено — {row['exclusion_reason']}")
                 continue
             sequence = sequences[identifier]
             if sequence.get("split") != "val" or sequence.get("domain") != "real" or sequence.get("building_id") != row["building_id"]:
@@ -310,7 +311,7 @@ def prepare(run_path, snapshot_path, out_path, repo_path=None, boundary_toleranc
                 row["exclusion_reason"] = "Нет общей поддержки или кроп меньше 8 пикселей"
                 pairs.append(row)
                 atomic_json(out / "run.json", state)
-                print(f"[{number}/{len(ordered)}] {identifier} frame {frame}: исключено — {row['exclusion_reason']}", flush=True)
+                tqdm.write(f"[{number}/{len(ordered)}] {identifier} frame {frame}: исключено — {row['exclusion_reason']}")
                 continue
             arrays = {"reference": previous["rgb"], "source": current["rgb"], "support": support, "labels": labels,
                       "reference_bits": previous["packed"], "source_bits": current["packed"]}
@@ -328,7 +329,7 @@ def prepare(run_path, snapshot_path, out_path, repo_path=None, boundary_toleranc
             pairs.append(row)
             state["completed_pairs"] += 1
             atomic_json(out / "run.json", state)
-            print(f"[{number}/{len(ordered)}] {row['building_id']} {identifier} frame {frame}: GT+ {row['positive_pixels']}, GT− {row['negative_pixels']}; сохранено.", flush=True)
+            tqdm.write(f"[{number}/{len(ordered)}] {row['building_id']} {identifier} frame {frame}: GT+ {row['positive_pixels']}, GT− {row['negative_pixels']}; сохранено.")
         # A concurrently changed snapshot must never produce a reviewable manifest.
         if any(sha256(path) != expected for path, expected in metadata.items()):
             raise ValueError("Исходные метаданные изменились во время подготовки")
