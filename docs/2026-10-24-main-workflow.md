@@ -43,6 +43,7 @@ split, методов и нового `--out` остаётся явным. Ко�
 |---|---|---|
 | prepare | dataset, align, crops | COCO + RGB + подтверждённые метаданные → dataset/split; RGB + manifest → alignment; сохранённая геометрия → crop dataset |
 | prepare | crop-histories, history-features | Сохранённая сессия alignment → общая сетка RGB-историй → frozen DINOv2 по датам и реальные интервалы лет |
+| prepare | targets / history-targets | Существующая COCO-разметка + `--features` историй или `--crops` пар → общие правила масок и аннотационных целей; RGB/признаки сохраняются |
 | prepare | history-targets | Существующие целевые COCO-маски + геометрия историй → автоматические метки различий, неизвестные области и галерея |
 | train / benchmark | history-models | Готовые DINO-признаки + проверенные или явно разрешённые автоматические метки → pair/pooled/GRU/Transformer и сравнение |
 | prepare | augmentations, synthetic, history | Подготовленный semantic dataset → фиксированные кропы/аугментации или пятикадровые истории; reviewed RGB crop dataset → контролируемые H0/H1 |

@@ -11,6 +11,9 @@ from unittest import mock
 import numpy as np
 from PIL import Image
 
+from facade_change import crop_targets, workflow
+from facade_change.crop_dataset import prepare_crop_dataset
+from facade_change.hypothesis_dataset import prepare_hypothesis_dataset
 from facade_change.io import read_json, sha256, write_json
 from facade_change.segmentation.data import rasterize_annotations
 
@@ -147,6 +150,186 @@ class MaskSemanticsTests(unittest.TestCase):
             actual = targets.target_difference(a, b, [0, 1, 2], radius)[0]
             expected = targets.derive_labels(a["packed"], b["packed"], a["support"], 3, radius)
             np.testing.assert_array_equal(actual, expected)
+
+
+@unittest.skipUnless(importlib.util.find_spec("pycocotools"), "COCO rasterizer required")
+class CropTargetPipelineTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        from test_alignment_session import session_fixture
+        self.input, session = session_fixture(self.root, dense=True)
+        self.crops = self.root / "crops"
+        prepare_crop_dataset(alignment_session=session, out=self.crops,
+                             tile_size=16, stride=8, min_valid_fraction=.8)
+        self.summary = read_json(self.crops / "summary.json")
+        self.index_path = self.crops / self.summary["index_path"]
+        self.index = read_json(self.index_path)
+        manifest = read_json(self.input["dataset"] / "manifest.json")
+        coco = self.input["dataset"] / "coco.json"
+        manifest["source"] = {"coco_json": str(coco), "coco_sha256": sha256(coco)}
+        self.annotation_manifest = self.root / "annotation_manifest.json"
+        write_json(self.annotation_manifest, manifest)
+
+    def args(self, *extra):
+        return targets.parser().parse_args(["--crops", str(self.crops),
+            "--annotation-manifest", str(self.annotation_manifest),
+            "--out", str(self.root / "crop-targets"), *extra])
+
+    def export(self, *extra):
+        return crop_targets.export_crop_targets(self.args(*extra))
+
+    def repin(self, *relative):
+        parent = read_json(self.crops / "run.json")
+        for name in relative:
+            parent["artifact_sha256"][name] = sha256(self.crops / name)
+        write_json(self.crops / "run.json", parent)
+
+    def test_shared_functions_and_both_public_commands_preserve_history_arguments(self):
+        self.assertIs(crop_targets.event_target, targets.event_target)
+        self.assertIs(crop_targets.project_masks, targets.project_masks)
+        legacy = targets.parser().parse_args(["--features", "features/index.json", "--out", "run"])
+        self.assertFalse(hasattr(legacy, "crops"))
+        self.assertEqual(legacy.min_years, 3)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(["prepare", "targets", *[
+                "--crops", str(self.crops), "--annotation-manifest", str(self.annotation_manifest),
+                "--out", str(self.root / "cli-targets"), "--gallery-limit", "0"]]), 0)
+        self.assertEqual(read_json(self.root / "cli-targets/summary.json")["kind"], "crop_annotation_targets")
+
+    def test_mixed_geometry_masks_match_exact_saved_rgb_crop_grid(self):
+        before = {p: sha256(p) for p in self.crops.rglob("*") if p.is_file()}
+        summary = self.export()
+        self.assertGreater(summary["derived_positive"], 0)
+        self.assertGreater(summary["derived_stable"], 0)
+        self.assertFalse(summary["reviewed_event_gt_created"])
+        out = self.root / "crop-targets"
+        exported = read_json(out / "index.json")
+        source = targets.load_annotation_source(self.annotation_manifest, crop_targets.Fingerprints())
+        self.assertEqual(summary["events"], sum(r["split"] in {"train", "val"} for r in self.index["crops"]))
+        saw_dense = saw_offset = saw_unknown = False
+        for event in exported["events"]:
+            row = next(r for r in self.index["crops"] if r["dataset_crop_id"] == event["dataset_crop_id"])
+            for role in ("reference", "source"):
+                observation_id = crop_targets.digest([event["track_id"], role])
+                record = exported["observations"][observation_id]
+                with np.load(out / record["artifact_path"], allow_pickle=False) as arrays:
+                    projected, support = arrays["packed"], arrays["support"]
+                    image = source["images"][row["source_image_sha256"][role]]
+                    packed = rasterize_annotations(source["annotations"][str(image["image_id"])],
+                                                   image["height"], image["width"], source["channel_map"])
+                    if role == "source" and row.get("dense_geometry"):
+                        from facade_change.saved_geometry import FrameSampler
+                        x0, y0, x1, y1 = row["bbox_canvas_xyxy"]
+                        expected = FrameSampler({"dense_geometry": row["dense_geometry"]}).warp(
+                            packed, (x0, y0, x1-x0, y1-y0), nearest=True)
+                        expected[~support] = 0
+                        saw_dense = True
+                    else:
+                        expected = targets.project_masks(packed, row[role + "_to_crop"], [0, 0, 16, 16], support)
+                    saw_offset |= row["bbox_canvas_xyxy"][0] != 0
+                    np.testing.assert_array_equal(projected, expected)
+            with np.load(out / event["target_path"], allow_pickle=False) as arrays:
+                self.assertTrue(np.isin(arrays["target"], [0, 1, 255]).all())
+                saw_unknown |= bool((arrays["target"] == 255).any())
+        self.assertTrue(saw_dense and saw_offset)
+        self.assertTrue(saw_unknown)
+        for path, expected in before.items():
+            self.assertEqual(sha256(path), expected)
+        self.assertIn("парные кропы", (out / "gallery.html").read_text())
+
+    def test_default_annotation_source_follows_crop_parent_not_latest(self):
+        parent = read_json(self.crops / "run.json")
+        parent["config"]["manifest_path"] = str(self.annotation_manifest)
+        parent["config"]["input_sha256"]["manifest"] = sha256(self.annotation_manifest)
+        write_json(self.crops / "run.json", parent)
+        args = self.args("--gallery-limit", "0")
+        args.annotation_manifest = None
+        self.assertGreater(crop_targets.export_crop_targets(args)["events"], 0)
+
+    def test_crop_masks_need_no_feature_cache_or_rgb_decoding_and_do_not_read_test(self):
+        for image in self.input["images"]:
+            if image["split"] == "test":
+                Path(image["image_path"]).unlink()
+        original_open = Image.open
+        def only_support(path, *args, **kwargs):
+            if "support" not in Path(path).name and Path(path).name != "geometric_overlap.png":
+                raise AssertionError("RGB decoding is not needed for mask export")
+            return original_open(path, *args, **kwargs)
+        with mock.patch.object(Image, "open", side_effect=only_support):
+            result = self.export("--gallery-limit", "0")
+        self.assertEqual(set(result["by_split"]), {"train", "val"})
+
+    def test_unknown_annotations_do_not_become_negative_crops(self):
+        coco = self.input["dataset"] / "coco.json"
+        content = read_json(coco)
+        content["annotations"] = []
+        write_json(coco, content)
+        manifest = read_json(self.annotation_manifest)
+        manifest["source"]["coco_sha256"] = sha256(coco)
+        write_json(self.annotation_manifest, manifest)
+        result = self.export("--gallery-limit", "0")
+        self.assertEqual(result["unknown"], result["events"])
+        self.assertEqual(result["derived_stable"], 0)
+
+    def test_selected_category_changes_only_affect_requested_targets(self):
+        result = self.export("--categories", "WALL", "--gallery-limit", "0")
+        self.assertEqual(result["derived_positive"], 0)
+        self.assertEqual(result["derived_stable"], result["events"])
+
+    def test_source_hash_and_category_mapping_tampering_fail_before_output(self):
+        coco = self.input["dataset"] / "coco.json"
+        coco.write_bytes(coco.read_bytes() + b"\n")
+        with self.assertRaisesRegex(ValueError, "Hash mismatch"):
+            self.export()
+        self.assertFalse((self.root / "crop-targets").exists())
+
+    def test_crop_transform_tampering_is_rejected(self):
+        row = self.index["crops"][0]
+        row["source_to_crop"][0][2] += 2
+        write_json(self.index_path, self.index)
+        self.repin(self.summary["index_path"])
+        with self.assertRaisesRegex(ValueError, "crop.json"):
+            self.export()
+
+    def test_building_leakage_is_rejected_before_annotation_decode(self):
+        self.index["crops"][-1]["building_id"] = self.index["crops"][0]["building_id"]
+        write_json(self.index_path, self.index)
+        self.repin(self.summary["index_path"])
+        with self.assertRaisesRegex(ValueError, "split leakage"):
+            self.export()
+
+    def test_resume_uses_committed_maps_and_completed_outputs_are_immutable(self):
+        original = crop_targets.CropRun.save_unit
+        def interrupted(store, record, arrays):
+            result = original(store, record, arrays)
+            if len(list((store.out / "units").glob("*.json"))) == 2:
+                raise KeyboardInterrupt()
+            return result
+        with mock.patch.object(crop_targets.CropRun, "save_unit", interrupted), self.assertRaises(KeyboardInterrupt):
+            self.export("--gallery-limit", "0")
+        self.assertEqual(read_json(self.root / "crop-targets/run.json")["status"], "interrupted")
+        result = self.export("--gallery-limit", "0", "--resume")
+        self.assertEqual(result["processing"]["reused_observations"], 2)
+        with self.assertRaisesRegex(ValueError, "already completed"):
+            self.export("--gallery-limit", "0", "--resume")
+        crop_parent_hash = sha256(self.crops / "run.json")
+        with self.assertRaisesRegex(ValueError, "separate from the input"):
+            self.export("--gallery-limit", "0", "--resume", "--out", str(self.crops))
+        self.assertEqual(sha256(self.crops / "run.json"), crop_parent_hash)
+
+    def test_full_synthetic_matrix_reuses_same_crops_without_real_annotation_labels(self):
+        config = Path(__file__).resolve().parents[1] / "configs/2026-10-25_crop_controls.json"
+        options = read_json(config)
+        self.assertEqual(options["selection"]["splits"], ["train", "val"])
+        self.assertEqual((len(options["states"]), len(options["scenarios"])), (4, 18))
+        with mock.patch("facade_change.segmentation.data.rasterize_annotations", side_effect=AssertionError("synthetic GT is procedural")):
+            result = prepare_hypothesis_dataset(self.crops, config, self.root / "synthetic")
+        index = read_json(self.root / "synthetic/index.json")
+        self.assertEqual(len(index["cases"]), 72 * len(index["bases"]))
+        self.assertTrue(all(case["split"] in {"train", "val"} for case in index["cases"]))
+        self.assertEqual(result["case_count"], len(index["cases"]))
 
 
 @unittest.skipUnless(importlib.util.find_spec("pycocotools"), "COCO rasterizer required")
