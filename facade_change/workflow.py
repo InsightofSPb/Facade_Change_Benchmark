@@ -50,6 +50,8 @@ COMMANDS = {
         "robustness": Command(ROBUSTNESS, "Prepare real observation-variation controls", ("prepare",)),
     },
     "train": {
+        "spatial-change": Command("facade_change.research.2026-10-25_spatial_change",
+                                  "Pair, mean and ConvGRU spatial change masks", ("train",)),
         "history-models": Command("facade_change.research.2026-10-25_history_models",
                                   "Pair/pooled classifiers, GRU and temporal Transformer", ("train",)),
         "segmentation": Command(SEGMENTATION, "Train the DINO semantic head on prepared augmentations",
@@ -59,6 +61,8 @@ COMMANDS = {
         "bcm": Command(CORE, "Adapt BCM-Net on TRAIN H0 RGB tiles", ("bcm-train",)),
     },
     "benchmark": {
+        "spatial-change": Command("facade_change.research.2026-10-25_spatial_change",
+                                  "Shared spatial evaluation with DINO and AnyChange baselines", ("evaluate",)),
         "history-scores": Command("facade_change.research.2026-10-25_history_models",
                                   "Cached previous/earliest/history cosine scores and review table", ("score",)),
         "history-models": Command("facade_change.research.2026-10-25_history_models",
@@ -85,6 +89,8 @@ COMMANDS = {
                                       "Cache-only raw-pair or directed-delta event fusion"),
     },
     "gallery": {
+        "spatial-change": Command("facade_change.research.2026-10-25_spatial_change",
+                                  "Rebuild spatial comparisons from saved maps", ("gallery",)),
         "sheets": Command("facade_change.gallery.report_sheets", "Compose pair and chronology sheets from saved report panels"),
         "lofo": Command("facade_change.gallery.lofo", "Render saved real-VAL LOFO decisions with mask/count verification"),
         "histories": Command(CORE, "Review saved synthetic and real transition histories", ("review-transitions",)),

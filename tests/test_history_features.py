@@ -483,6 +483,8 @@ def load_tests(loader, standard_tests, pattern):
     standard_tests.addTests(loader.loadTestsFromModule(models))
     targets = importlib.import_module("test_2026-10-25_history_targets")
     standard_tests.addTests(loader.loadTestsFromModule(targets))
+    spatial = importlib.import_module("test_2026-10-25_spatial_change")
+    standard_tests.addTests(loader.loadTestsFromModule(spatial))
     return standard_tests
 
 

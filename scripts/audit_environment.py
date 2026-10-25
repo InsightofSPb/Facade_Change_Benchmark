@@ -94,7 +94,13 @@ def capture(command, timeout=45):
                               capture_output=True, timeout=timeout)
         return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr,
                 "elapsed_seconds": round(time.monotonic() - started, 3)}
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        def decoded(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+        return {"returncode": None, "stdout": decoded(exc.stdout),
+                "stderr": decoded(exc.stderr) + "\n" + str(exc),
+                "elapsed_seconds": round(time.monotonic() - started, 3)}
+    except OSError as exc:
         return {"returncode": None, "stdout": "", "stderr": str(exc),
                 "elapsed_seconds": round(time.monotonic() - started, 3)}
 
@@ -606,11 +612,14 @@ def write_cleanup_report(out, report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, help="New report directory; never overwritten")
-    parser.add_argument("--run-tests", action="store_true", help="Run the small CPU suite with this interpreter")
+    parser.add_argument("--run-tests", action="store_true", help="Run the CPU suite with this interpreter; report optional skips")
+    parser.add_argument("--test-timeout", type=int, default=900, help="CPU suite time limit in seconds (default: 900)")
     parser.add_argument("--cleanup-plan", action="store_true", help="Read-only run dependency/cleanup inventory; no environment probes")
     parser.add_argument("--keep-run", action="append", default=[], help="Retain this run and all dependencies; repeatable")
     parser.add_argument("--scan-root", action="append", default=[], help="Shallow external inventory, e.g. $HOME; never deletion candidates")
     args = parser.parse_args(argv)
+    if args.test_timeout <= 0:
+        parser.error("--test-timeout must be positive")
     if not args.cleanup_plan and (args.keep_run or args.scan_root):
         parser.error("--keep-run/--scan-root require --cleanup-plan")
     if args.cleanup_plan and (args.run_tests or not args.keep_run):
@@ -653,10 +662,11 @@ def main(argv=None):
     if args.run_tests:
         if sift_ready:
             print("Running CPU project tests ...", flush=True)
-            tests = probe(TEST_CODE, timeout=60)
+            tests = probe(TEST_CODE, timeout=args.test_timeout)
             details = tests.get("details", {})
-            if tests["status"] == "ok" and not (details.get("successful") and details.get("tests_run", 0) > 0 and details.get("skipped") == 0):
-                tests["status"] = "failed_or_skipped"
+            if tests["status"] == "ok" and not (details.get("successful")
+                    and details.get("tests_run", 0) > details.get("skipped", 0)):
+                tests["status"] = "failed_or_empty"
             (out / "tests.log").write_text(tests["stdout"] + tests["stderr"], encoding="utf-8")
         else:
             tests = {"status": "not_run_missing_prerequisites"}

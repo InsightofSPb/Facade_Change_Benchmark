@@ -119,13 +119,13 @@ def masked_multilabel_loss(logits, targets, valid):
         raise ValueError("logits and targets must share shape B,C,H,W")
     if valid.ndim == 3:
         valid = valid.unsqueeze(1)
-    if tuple(valid.shape) != (logits.shape[0], 1, *logits.shape[-2:]):
-        raise ValueError("valid must have shape B,H,W or B,1,H,W")
+    if tuple(valid.shape) not in ((logits.shape[0], 1, *logits.shape[-2:]), tuple(logits.shape)):
+        raise ValueError("valid must have shape B,H,W, B,1,H,W or B,C,H,W")
     # Accumulate outside half precision, even when the forward pass uses AMP.
     scores = logits.float()
     truth = targets.to(device=logits.device, dtype=torch.float32)
-    mask = valid.to(device=logits.device, dtype=torch.bool).float()
-    valid_elements = mask.sum() * logits.shape[1]
+    mask = valid.to(device=logits.device, dtype=torch.bool).expand_as(scores).float()
+    valid_elements = mask.sum()
     bce = (F.binary_cross_entropy_with_logits(scores, truth, reduction="none")
            * mask).sum() / valid_elements.clamp_min(1.0)
     probabilities = scores.sigmoid() * mask
