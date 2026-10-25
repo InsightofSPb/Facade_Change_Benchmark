@@ -32,6 +32,8 @@ COMMANDS = {
         "dataset": Command("facade_change.dataset_setup", "COCO, reviewed identities and facade-disjoint splits"),
         "align": Command(CORE, "Align original RGB pairs; optionally export crops", ("batch",)),
         "crops": Command(CORE, "Export a crop dataset from saved alignment", ("crop-dataset",)),
+        "crop-histories": Command("facade_change.history_features", "Canonical multi-year RGB crop tracks from saved alignment", ("prepare",)),
+        "history-features": Command("facade_change.history_features", "Frozen DINOv2 features and year-aware crop sequences", ("embed",)),
         "synthetic": Command(CORE, "Controlled H0/H1 cases from reviewed RGB crops", ("h0h1",)),
         "history": Command(CORE, "Five-frame synthetic histories and matched controls", ("prepare-history",)),
         "augmentations": Command(SEGMENTATION, "Fixed segmentation crops and augmentations", ("--prepare-only",),

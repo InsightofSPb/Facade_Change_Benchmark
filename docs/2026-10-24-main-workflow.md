@@ -42,6 +42,7 @@ split, методов и нового `--out` остаётся явным. Ко�
 | Стадия | Задачи | Вход → выход |
 |---|---|---|
 | prepare | dataset, align, crops | COCO + RGB + подтверждённые метаданные → dataset/split; RGB + manifest → alignment; сохранённая геометрия → crop dataset |
+| prepare | crop-histories, history-features | Сохранённая сессия alignment → общая сетка RGB-историй → frozen DINOv2 по датам и реальные интервалы лет |
 | prepare | augmentations, synthetic, history | Подготовленный semantic dataset → фиксированные кропы/аугментации или пятикадровые истории; reviewed RGB crop dataset → контролируемые H0/H1 |
 | prepare | real-audit, real, robustness, transitions | Сохранённые реальные данные и геометрия → audit → подготовленные истории/варианты наблюдений/кандидаты переходов |
 | train | segmentation, msdzip, arib, bcm | TRAIN и отдельный VAL → training run, checkpoint и метрики; готовые модели можно переиспользовать |
@@ -126,6 +127,9 @@ RGB-DIFF/SSIM запуска. Его [контракт](../data_analysis/README.
 
 ## Истории и robustness
 
+- `prepare crop-histories` → `prepare history-features` собирает новые
+  [канонические истории RGB-кропов и frozen DINOv2](2026-10-25_history_features.md)
+  с кэшем, альтернативными снимками одного года и явными пропусками дат.
 - `prepare history` строит синтетические истории из semantic dataset.
 - `prepare transitions` использует готовое выравнивание; `gallery histories`
   объединяет сохранённые synthetic/real истории для просмотра.
