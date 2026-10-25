@@ -1,4 +1,5 @@
 import importlib.util
+import importlib
 import contextlib
 import io
 import tempfile
@@ -12,7 +13,7 @@ from PIL import Image
 from facade_change.hypothesis_benchmark import (
     THRESHOLDS, _building_macro, _calibrate, _case_metrics, _counts, run_hypothesis_benchmark,
 )
-from facade_change.io import finish_record, read_json, sha256, write_json
+from facade_change.io import finish_record, read_json, run_record, sha256, write_json
 
 
 class BenchmarkMetricTests(unittest.TestCase):
@@ -340,6 +341,303 @@ class HypothesisBenchmarkTests(unittest.TestCase):
         metrics = read_json(out / "metrics.json")
         self.assertEqual({row["case_id"] for row in metrics["cases"] if row["method"] == "rgb_diff"},
                          {row["case_id"] for row in metrics["cases"] if row["method"] == "ssim"})
+
+
+@unittest.skipUnless(importlib.util.find_spec("cv2") and importlib.util.find_spec("pycocotools"), "OpenCV/COCO required")
+class CropDevelopmentBenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        import csv
+        from facade_change import annotation_targets, crop_targets
+        from facade_change.crop_selection import DEFAULTS, VERSION
+        from facade_change.hypothesis_dataset import prepare_hypothesis_dataset
+        module = importlib.import_module("test_2026-10-25_history_targets")
+        self.fixture = module.CropTargetPipelineTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.root, self.crops = self.fixture.root, self.fixture.crops
+        self.silence = contextlib.redirect_stdout(io.StringIO())
+        self.silence.__enter__()
+        self.addCleanup(self.silence.__exit__, None, None, None)
+        full_args = self.fixture.args("--gallery-limit", "0", "--out", str(self.root / "all-targets"))
+        crop_targets.export_crop_targets(full_args)
+        full = read_json(self.root / "all-targets/index.json")
+        data, source = crop_targets.load_crops(self.crops, ("train", "val"), self.fixture.annotation_manifest)
+        index = read_json(data.index_path)
+        by_id = {r["dataset_crop_id"]: r for r in index["crops"]}
+        crop_rows, class_rows = [], []
+        for event in full["events"]:
+            row = by_id[event["dataset_crop_id"]]
+            meta = {k: row[k] for k in ("dataset_crop_id", "pair_id", "building_id", "view_id", "split",
+                                        "reference_year", "source_year", "alignment_method")}
+            crop_rows.append(dict(meta, status={1: "changed", 0: "stable", "": "unknown"}[event["label"]],
+                reason=event["reason"], known_pixels=event["known_pixels"], known_fraction=event["known_fraction"],
+                changed_pixels=event["changed_pixels"], uncomparable_target_pixels=event["uncomparable_target_pixels"]))
+            packed = []
+            for observation in data.tracks[event["track_id"]]["observations"]:
+                record = full["observations"][observation["observation_id"]]
+                with np.load(self.root / "all-targets" / record["artifact_path"], allow_pickle=False) as arrays:
+                    packed.append(arrays["packed"].copy())
+            with np.load(self.root / "all-targets" / event["target_path"], allow_pickle=False) as arrays:
+                for channel, (category, layer) in enumerate(zip(source["categories"], arrays["class_targets"])):
+                    bit = 1 << channel
+                    possible = ((packed[0] | packed[1]) & bit) != 0
+                    if not possible.any():
+                        continue
+                    valid = layer != 255
+                    n, changed = int(valid.sum()), int((layer == 1).sum())
+                    a, b = [int((((p & bit) != 0) & valid).sum()) for p in packed]
+                    class_rows.append(dict(meta, category_id=category["id"], category=category["name"],
+                        status="changed" if changed >= 8 else "unknown", known_pixels=n,
+                        known_fraction=n/round(row["valid_fraction"]*256), changed_pixels=changed,
+                        change_fraction=changed/n if n else None, before_fraction=a/n if n else None,
+                        after_fraction=b/n if n else None, area_delta=(b-a)/n if n else None,
+                        uncomparable_target_pixels=int((possible & ~valid).sum())))
+        statistics = self.root / "statistics"
+        statistics.mkdir()
+        for name, rows in (("crops.csv", crop_rows), ("class_changes.csv", class_rows)):
+            with (statistics / name).open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        write_json(statistics / "summary.json", dict(all_crop_pairs=len(index["crops"]), processed_crop_pairs=len(crop_rows),
+            classes=[dict(category_id=c["id"], category=c["name"]) for c in source["categories"]]))
+        write_json(statistics / "experiment_contract.json", dict(inputs=dict(data.fingerprints.files),
+                   annotation_core_sha256=sha256(annotation_targets.__file__)))
+        finish_record(statistics, run_record("crop_statistics", dict(crops=str(self.crops))), "completed")
+        config = self.root / "controls.json"
+        write_json(config, dict(include_real_pairs=True, selection=dict(DEFAULTS, strategy=VERSION, max_pairs=6),
+            states=["unchanged", "crack", "paint_patch", "self_paste"], scenarios=[
+                dict(id="clean", kind="identity"), dict(id="exposure", kind="exposure", gain=1.2),
+                dict(id="occluded", kind="occlusion", rectangle=[0., 0., 1., 1.])]))
+        self.augmented = self.root / "augmented"
+        self.plan = self.root / "plan"
+        prepare_hypothesis_dataset(self.crops, config, self.plan, statistics_run=statistics, plan_only=True)
+        prepare_hypothesis_dataset(self.crops, config, self.augmented, selection_plan=self.plan)
+        self.selected = read_json(self.augmented / "cohort_selection.json")["selected"]
+        self.targets = self.root / "selected-targets"
+        self.target_args = self.fixture.args("--selection-plan", str(self.augmented), "--gallery-limit", "0", "--out", str(self.targets))
+        crop_targets.export_crop_targets(self.target_args)
+
+    def args(self, *extra):
+        from facade_change.crop_benchmark import parser
+        return parser().parse_args(["--dataset-run", str(self.augmented), "--targets-run", str(self.targets),
+            "--out", str(self.root / "benchmark"), "--methods", "rgb_diff", "ssim", "--gallery-limit", "4", *extra])
+
+    def csv(self, name):
+        import csv
+        with (self.root / "benchmark" / name).open(newline="") as stream:
+            return list(csv.DictReader(stream))
+
+    def test_subset_projects_only_frozen_pairs_and_matches_full_dense_and_homography_maps(self):
+        from facade_change import crop_targets
+        full = {r["dataset_crop_id"]: r for r in read_json(self.root / "all-targets/index.json")["events"]}
+        selected = read_json(self.targets / "index.json")
+        self.assertEqual({r["dataset_crop_id"] for r in selected["events"]}, {r["dataset_crop_id"] for r in self.selected})
+        self.assertLess(len(selected["events"]), len(full))
+        for event in selected["events"]:
+            with np.load(self.targets / event["target_path"], allow_pickle=False) as a, \
+                    np.load(self.root / "all-targets" / full[event["dataset_crop_id"]]["target_path"], allow_pickle=False) as b:
+                for key in a.files:
+                    np.testing.assert_array_equal(a[key], b[key])
+        # Missing unselected crop files must not trigger their validation/projection.
+        chosen = {r["dataset_crop_id"] for r in self.selected}
+        for row in self.fixture.index["crops"]:
+            if row["dataset_crop_id"] not in chosen:
+                (self.crops / row["path"] / "reference_support.png").unlink()
+        original_open = Image.open
+        def supports_only(path, *args, **kwargs):
+            if "support" not in Path(path).name and Path(path).name != "geometric_overlap.png":
+                raise AssertionError("Mask-only export decoded RGB")
+            return original_open(path, *args, **kwargs)
+        args = self.fixture.args("--selection-plan", str(self.plan), "--gallery-limit", "0", "--out", str(self.root / "mask-only"))
+        with patch("PIL.Image.open", side_effect=supports_only), \
+                patch("facade_change.crop_selection.verify_plan", side_effect=AssertionError("Historical IDs must not rerank")):
+            report = crop_targets.export_crop_targets(args)
+        self.assertEqual(report["events"], len(chosen))
+        self.assertFalse(list((self.root / "mask-only").rglob("*.png")))
+
+    def test_both_branches_real_cpu_methods_per_class_metrics_and_unknown_occlusion(self):
+        from facade_change import crop_benchmark
+        before = {str(p): sha256(p) for root in (self.augmented, self.targets, self.crops)
+                  for p in root.rglob("*") if p.is_file()}
+        result = crop_benchmark.run(self.args())
+        self.assertFalse(result["test_used"])
+        self.assertEqual(result["computed_maps"], result["case_method_evaluations"])
+        self.assertEqual(result["methods"], ["rgb_diff", "ssim"])
+        self.assertEqual({r["category"] for r in self.csv("classes.csv")}, {"WALL", "CRACK"})
+        for row in self.csv("cases.csv"):
+            if row["branch"] == "real" and row["scenario_id"] == "occluded":
+                self.assertEqual(int(row["valid_pixels"]), 0)
+                self.assertEqual(int(row["ignored_pixels"]), 256)
+                self.assertEqual(row["f1"], "")
+        choices = read_json(self.root / "benchmark/threshold_selection.json")
+        self.assertTrue(all(c["selection_split"] == "train" and c["selection_scenario"] == "identity"
+            for methods in choices["methods"].values() for c in methods.values()))
+        self.assertTrue((self.root / "benchmark/gallery.html").is_file())
+        self.assertEqual(before, {str(p): sha256(p) for root in (self.augmented, self.targets, self.crops)
+                                 for p in root.rglob("*") if p.is_file()})
+
+    def test_real_occlusion_is_evaluation_only_and_never_changes_scorer_geometry(self):
+        from facade_change.crop_benchmark import FrozenCrops
+        data = FrozenCrops(self.augmented, self.targets, ["real"], 0)
+        clean = next(c for c in data.cases if c["scenario_id"] == "clean")
+        occluded = next(c for c in data.cases if c["scenario_id"] == "occluded" and c["parent_dataset_crop_id"] == clean["parent_dataset_crop_id"])
+        a, b = data.inputs(clean), data.inputs(occluded)
+        np.testing.assert_array_equal(a[0], b[0])
+        np.testing.assert_array_equal(a[2], b[2])
+        self.assertTrue(a[2].any())
+        self.assertTrue((b[3] == 255).all() and (b[4] == 255).all())
+        self.assertFalse(np.array_equal(a[1], b[1]))
+
+    def test_wrong_target_snapshot_and_channel_order_fail_before_model_creation(self):
+        from facade_change import crop_benchmark
+        index = read_json(self.targets / "index.json")
+        index["crop_index_sha256"] = "wrong-snapshot"
+        write_json(self.targets / "index.json", index)
+        finish_record(self.targets, read_json(self.targets / "run.json"), "completed")
+        with patch.object(crop_benchmark, "make_scorer", side_effect=AssertionError("Model started")) as make:
+            with self.assertRaisesRegex(ValueError, "different crop snapshot"):
+                crop_benchmark.run(self.args())
+            make.assert_not_called()
+        self.assertFalse((self.root / "benchmark").exists())
+
+    def test_target_category_permutation_is_rejected_before_any_inference(self):
+        from facade_change import crop_benchmark
+        index = read_json(self.targets / "index.json")
+        event = index["events"][0]
+        path = self.targets / event["target_path"]
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = {k: archive[k].copy() for k in archive.files}
+        arrays["category_ids"] = arrays["category_ids"][::-1]
+        np.savez_compressed(path, **arrays)
+        event["target_sha256"] = sha256(path)
+        write_json(self.targets / "index.json", index)
+        finish_record(self.targets, read_json(self.targets / "run.json"), "completed")
+        with patch.object(crop_benchmark, "make_scorer", side_effect=AssertionError("Inference started")):
+            with self.assertRaisesRegex(ValueError, "mapping mismatch"):
+                crop_benchmark.run(self.args())
+
+    def test_resume_reuses_committed_score_maps_and_keeps_completed_outputs_immutable(self):
+        from facade_change import crop_benchmark
+        RunStore = importlib.import_module("facade_change.2026-10-14_temporal_experiment").RunStore
+        original_save, original_make = RunStore.save_unit, crop_benchmark.make_scorer
+        calls = []
+        def make(method, **options):
+            wrapped = original_make(method, **options)
+            class Counted:
+                metadata = wrapped.metadata
+                raw_scores = None
+                def __call__(self, *args):
+                    calls.append(method)
+                    return wrapped(*args)
+            return Counted()
+        def interrupt(store, record, arrays):
+            result = original_save(store, record, arrays)
+            if len(list((store.out / "units").glob("*.json"))) == 3:
+                raise KeyboardInterrupt()
+            return result
+        with patch.object(crop_benchmark, "make_scorer", side_effect=make), patch.object(RunStore, "save_unit", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                crop_benchmark.run(self.args("--methods", "rgb_diff"))
+        self.assertEqual(read_json(self.root / "benchmark/run.json")["status"], "interrupted")
+        old = {p: sha256(p) for p in (self.root / "benchmark/maps").glob("*.npz")}
+        with patch.object(crop_benchmark, "make_scorer", side_effect=make):
+            result = crop_benchmark.run(self.args("--methods", "rgb_diff", "--resume"))
+        self.assertEqual(len(calls), result["case_method_evaluations"])
+        self.assertGreaterEqual(result["reused_map_reads"], 3)
+        self.assertEqual(old, {p: sha256(p) for p in old})
+        self.assertEqual(len(self.csv("cases.csv")), result["case_method_evaluations"])
+        with self.assertRaisesRegex(ValueError, "completed outputs are immutable"):
+            crop_benchmark.run(self.args("--methods", "rgb_diff", "--resume"))
+
+    def test_val_inference_starts_after_threshold_freeze_and_sees_only_rgb_and_geometry(self):
+        from facade_change import crop_benchmark
+        original_make, observations = crop_benchmark.make_scorer, []
+        val_pixels = set()
+        for case in read_json(self.augmented / "real_pairs/index.json")["cases"]:
+            if case["split"] == "val":
+                with Image.open(self.augmented / case["reference_rgb"]) as image:
+                    val_pixels.add(tuple(np.asarray(image)[0, 0]))
+        def make(method, **options):
+            wrapped = original_make(method, **options)
+            class Checked:
+                metadata = wrapped.metadata
+                raw_scores = None
+                def __call__(self, *args):
+                    self_count = len(args)
+                    self_test.assertEqual(self_count, 3)
+                    reference, source, support = args
+                    self_test.assertEqual((reference.dtype, source.dtype, support.dtype), (np.uint8, np.uint8, np.bool_))
+                    if tuple(reference[0, 0]) in val_pixels:
+                        choice = read_json(self_test.root / "benchmark/threshold_selection.json")
+                        self_test.assertIn(method, choice["methods"])
+                        observations.append(choice["methods"][method])
+                    return wrapped(*args)
+            return Checked()
+        self_test = self
+        with patch.object(crop_benchmark, "make_scorer", side_effect=make):
+            crop_benchmark.run(self.args("--methods", "rgb_diff"))
+        self.assertTrue(observations)
+        self.assertTrue(all(o == observations[0] for o in observations))
+
+    def test_author_native_mask_is_preserved_without_calibration(self):
+        from facade_change import crop_benchmark
+        class Native:
+            def __init__(self, method, options, pool):
+                self.metadata = dict(method=method, output_kind="native_mask", implementation_version="test-seam")
+                self.raw_scores = None
+                self.native_prediction = None
+            def activate(self):
+                return self.metadata
+            def __call__(self, reference, source, support):
+                self.native_prediction = (np.indices(support.shape)[1] < 4) & support
+                scores = self.native_prediction.astype(np.float32)
+                scores[~support] = np.nan
+                return scores
+            def close(self):
+                pass
+        with patch.object(crop_benchmark, "RemoteScorer", Native), \
+                patch.object(crop_benchmark, "_calibrate", side_effect=AssertionError("Native threshold was fitted")):
+            crop_benchmark.run(self.args("--methods", "anychange"))
+        choices = read_json(self.root / "benchmark/threshold_selection.json")["methods"]["anychange"]
+        self.assertTrue(all(c["threshold"] == .5 and c["selection_split"] is None for c in choices.values()))
+        with np.load(next((self.root / "benchmark/maps").glob("*.npz")), allow_pickle=False) as archive:
+            prediction, scores = archive["native_prediction"], archive["scores"]
+            np.testing.assert_array_equal(scores[np.isfinite(scores)], prediction[np.isfinite(scores)].astype(np.float32))
+
+
+class CropDevelopmentMetricTests(unittest.TestCase):
+    def test_calibration_rejects_val_and_perturbed_train_and_excludes_sham(self):
+        from facade_change.crop_benchmark import _calibrate
+        grid = THRESHOLDS
+        positive = _counts(np.array([.7, .1], np.float32), np.array([1, 0], np.uint8), grid)
+        negative = _counts(np.array([.1], np.float32), np.array([0], np.uint8), grid)
+        meta = dict(building_id="train", split="train", nuisance_kind="identity", sham_self_paste=False)
+        samples = [(meta, positive), (meta, negative)]
+        choice = _calibrate(samples, grid)
+        self.assertEqual(choice["selection_split"], "train")
+        self.assertLess(choice["threshold"], .7)
+        self.assertGreater(choice["threshold"], .1)
+        sham = dict(meta, sham_self_paste=True)
+        self.assertEqual(_calibrate(samples+[(sham, negative)]*100, grid), choice)
+        for changed in (dict(meta, split="val"), dict(meta, nuisance_kind="exposure")):
+            with self.assertRaisesRegex(ValueError, "clean TRAIN"):
+                _calibrate([(changed, positive)], grid)
+
+    def test_building_macro_weights_buildings_equally_and_keeps_missing_metrics_undefined(self):
+        from facade_change.crop_benchmark import Macro
+        aggregate = Macro()
+        base = dict(method="rgb_diff", branch="real", split="val", target_type="class", category_id=9,
+                    category="CRACK", scenario_id="clean", hypothesis="", sham_self_paste=False,
+                    f1=1., iou=1., precision=1., recall=1., fpr=0.)
+        for _ in range(100):
+            aggregate.add(dict(base, building_id="many"))
+        aggregate.add(dict(base, building_id="one", f1=0., iou=0.))
+        aggregate.add(dict(base, building_id="unknown", **{m: None for m in ("f1", "iou", "precision", "recall", "fpr")}))
+        row = next(r for r in aggregate.rows() if r["scenario_id"] == "all")
+        self.assertEqual(row["f1"], .5)
+        self.assertEqual(row["building_count"], 3)
+        self.assertEqual(row["f1_building_count"], 2)
 
 
 if __name__ == "__main__":

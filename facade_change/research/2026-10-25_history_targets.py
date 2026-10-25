@@ -252,6 +252,8 @@ def parser():
     inputs.add_argument("--features", help="Existing frozen history-feature index (unchanged history mode)")
     inputs.add_argument("--crops", default=argparse.SUPPRESS,
                         help="Existing pairwise crop dataset; CPU masks only, no history features needed")
+    cli.add_argument("--selection-plan", default=argparse.SUPPRESS,
+                     help="With --crops: project only the frozen IDs from a selection or completed augmentation run")
     cli.add_argument("--history-root")
     cli.add_argument("--annotation-manifest", help="Override with a reviewed manifest linked to exact COCO bytes")
     cli.add_argument("--out", required=True)
@@ -281,6 +283,8 @@ def main(argv=None):
             from ..crop_targets import export_crop_targets
             result = export_crop_targets(args)
         else:
+            if hasattr(args, "selection_plan"):
+                cli.error("--selection-plan belongs to --crops mode")
             result = export_targets(args)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

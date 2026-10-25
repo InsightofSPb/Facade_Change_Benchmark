@@ -51,6 +51,7 @@ split, методов и нового `--out` остаётся явным. Ко�
 | prepare | real-audit, real, robustness, transitions | Сохранённые реальные данные и геометрия → audit → подготовленные истории/варианты наблюдений/кандидаты переходов |
 | train | segmentation, msdzip, arib, bcm | TRAIN и отдельный VAL → training run, checkpoint и метрики; готовые модели можно переиспользовать |
 | benchmark | synthetic, real, pilot, robustness, semantic, segmentation | Подготовленный набор + явные модели/маршруты → сохранённые карты, thresholds, метрики и run.json |
+| benchmark | crops | Зафиксированные RGB-аугментации пар + выбранные целевые маски → TRAIN-пороги, VAL F1/IoU/FPR по классам и помехам, карты и галерея; [команды](2026-10-25-crop-benchmark.md) |
 | benchmark | metrics, calibration, real-lofo, final-fpr, fusion, temporal-snapshot, semantic-updates, continuous-updates | Сохранённые карты → оценки, калибровка или научно определённая композиция; разные протоколы сохраняют свои контракты |
 | gallery | histories, real, real-crops, robustness, robustness-results, comparison, errors, sheets, lofo, bundle, atlas | Сохранённые входы/карты/результаты → HTML, таблицы, PNG-листы, архив историй или локальный atlas |
 

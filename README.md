@@ -59,6 +59,11 @@ pooled, GRU и Transformer, `workflow benchmark history-models` оценивае
 точный список, причины и бюджет сохраняются до генерации. Этот же план
 задаёт настоящие A→T(B) и контролируемые A→T(edit(A)) примеры.
 
+`prepare targets --crops ... --selection-plan ...` переносит маски только для
+зафиксированной выборки. `benchmark crops` оценивает обе готовые ветви с порогами
+по чистому TRAIN и F1/IoU изменений по классам на VAL.
+[Команды, маски 500 пар, метрики и resume](docs/2026-10-25-crop-benchmark.md).
+
 Для пространственных предсказаний: `workflow train spatial-change` обучает pair,
 mean и ConvGRU на patch-токенах и поклассовых целях. `benchmark spatial-change`
 сравнивает их с DINO-разностью и AnyChange, сохраняет карты, F1/IoU и галерею.

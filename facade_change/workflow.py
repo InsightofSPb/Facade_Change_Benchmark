@@ -61,6 +61,7 @@ COMMANDS = {
         "bcm": Command(CORE, "Adapt BCM-Net on TRAIN H0 RGB tiles", ("bcm-train",)),
     },
     "benchmark": {
+        "crops": Command("facade_change.crop_benchmark", "Frozen synthetic/real crop comparisons; clean-TRAIN thresholds and class change F1/IoU"),
         "spatial-change": Command("facade_change.research.2026-10-25_spatial_change",
                                   "Shared spatial evaluation with DINO and AnyChange baselines", ("evaluate",)),
         "history-scores": Command("facade_change.research.2026-10-25_history_models",

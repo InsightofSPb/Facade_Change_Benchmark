@@ -47,6 +47,7 @@ class CropData:
     tracks: dict
     fingerprints: Fingerprints
     coverage: dict
+    selection_reference: dict | None = None
 
 
 def _parent_file(root, parent, relative, fp, expected=None):
@@ -66,7 +67,43 @@ def _support(path, shape):
     return raw == 255
 
 
-def load_crops(path, splits, annotation_manifest=None):
+def _crop_selection(path, parent, summary, index, root, fp):
+    """Consume frozen IDs, not the current selector/generator implementation.
+
+    A finished RGB export is historical evidence even after generator code changes.
+    Mask projection only requires its exact crop snapshot and saved cohort rows.
+    """
+    selection_root = Path(path).expanduser().resolve()
+    fp.add(selection_root / "run.json")
+    record = read_json(selection_root / "run.json")
+    if record.get("kind") == "crop_selection" and record.get("status") == "completed":
+        name = "selection.json"
+    elif record.get("kind") == "hypothesis_dataset" and record.get("status") in {"completed", "completed_needs_review"}:
+        name = "cohort_selection.json"
+    else:
+        raise ValueError("--selection-plan requires a completed crop selection or augmented crop run")
+    selected_path = _parent_file(selection_root, record, name, fp)
+    selected = read_json(selected_path)
+    if selected.get("kind") != "crop_selection_plan" or selected.get("schema_version") != 1:
+        raise ValueError("Invalid frozen crop selection descriptor")
+    expected = {"parent_run": sha256(root / "run.json"), "parent_summary": sha256(root / "summary.json"),
+                "parent_index": sha256(root / summary["index_path"]), "split": sha256(root / "split.json")}
+    if any(selected.get("input_sha256", {}).get(k) != v for k, v in expected.items()):
+        raise ValueError("Frozen selection belongs to another crop snapshot")
+    if name == "cohort_selection.json" and any(record.get("config", {}).get("input_sha256", {}).get(k) != v for k, v in expected.items()):
+        raise ValueError("Augmented run and cohort refer to different crop snapshots")
+    rows = {r["dataset_crop_id"]: r for r in index["crops"]}
+    chosen = selected.get("selected", [])
+    identifiers = [r["dataset_crop_id"] for r in chosen]
+    if not chosen or len(set(identifiers)) != len(chosen) or any(rows.get(r["dataset_crop_id"]) != r for r in chosen):
+        raise ValueError("Frozen selected rows disagree with the crop index")
+    reference = dict(run=str(selection_root), kind=record["kind"], selection_path=name,
+                     selection_sha256=sha256(selected_path), cohort_crops=len(chosen),
+                     crop_index_sha256=expected["parent_index"], selected_ids_sha256=digest(sorted(identifiers)))
+    return set(identifiers), reference
+
+
+def load_crops(path, splits, annotation_manifest=None, selection_plan=None):
     """Check the frozen crop snapshot and selected metadata before rasterizing COCO."""
     if not splits or len(set(splits)) != len(splits) or set(splits) - {"train", "val", "test"}:
         raise ValueError("Use unique explicit train/val/test splits")
@@ -95,6 +132,7 @@ def load_crops(path, splits, annotation_manifest=None):
         raise ValueError("Annotation and crop category mappings disagree")
     if len(index["crops"]) != summary["crop_count"]:
         raise ValueError("Crop summary and index counts disagree")
+    chosen, selection_reference = _crop_selection(selection_plan, parent, summary, index, root, fp) if selection_plan else (None, None)
     seen, buildings, views, hashes, rows, tracks = set(), {}, {}, {}, [], {}
     for row in index["crops"]:
         identifier, building, view, part = (row[k] for k in ("dataset_crop_id", "building_id", "view_id", "split"))
@@ -108,7 +146,7 @@ def load_crops(path, splits, annotation_manifest=None):
         for value in row["source_image_sha256"].values():
             if hashes.setdefault(value, part) != part:
                 raise ValueError("Original image hash leakage across crop splits")
-        if part not in splits:
+        if part not in splits or (chosen is not None and identifier not in chosen):
             continue
         if (type(row["reference_year"]) is not int or type(row["source_year"]) is not int
                 or row["reference_year"] >= row["source_year"]):
@@ -177,13 +215,15 @@ def load_crops(path, splits, annotation_manifest=None):
     coverage = {"candidate_crops": len(index["crops"]), "selected_crops": len(rows),
                 "buildings": len({r["building_id"] for r in rows}), "splits": list(splits),
                 "by_split": dict(Counter(r["split"] for r in rows))}
-    return CropData(root, index_path, index, rows, tracks, fp, coverage), source
+    if selection_reference:
+        coverage["frozen_cohort_crops"] = selection_reference["cohort_crops"]
+    return CropData(root, index_path, index, rows, tracks, fp, coverage, selection_reference), source
 
 
 def export_crop_targets(args):
     """Rasterize each selected original once, then reuse the history target rules."""
     import cv2
-    data, source = load_crops(args.crops, args.splits, args.annotation_manifest)
+    data, source = load_crops(args.crops, args.splits, args.annotation_manifest, getattr(args, "selection_plan", None))
     names = [c["name"] for c in source["categories"]]
     if args.categories and (set(args.categories) - set(names) or len(set(args.categories)) != len(args.categories)):
         raise ValueError(f"Unknown/duplicate target categories; available: {names}")
@@ -191,6 +231,10 @@ def export_crop_targets(args):
     out = Path(args.out).expanduser().resolve()
     if out == data.history_root or out in data.history_root.parents:
         raise ValueError("Annotation output must be separate from the input crop dataset")
+    if data.selection_reference:
+        selected_root = Path(data.selection_reference["run"])
+        if out == selected_root or out in selected_root.parents or selected_root in out.parents:
+            raise ValueError("Annotation output must be separate from the frozen selection/augmentation input")
     if args.resume and (out / "run.json").exists():
         previous = read_json(out / "run.json")
         if previous.get("kind") not in {"crop_annotation_targets", "temporal_experiment"}:
@@ -212,6 +256,8 @@ def export_crop_targets(args):
                     "grid": "saved pairwise native canvas and exact RGB crop transforms",
                     "unknown_policy": "unannotated, unsupported and crowd remain unknown",
                     "rgb_recomputed": False, "dino_recomputed": False, "reviewed_event_gt_created": False}
+        if data.selection_reference:
+            contract["selection_reference"] = data.selection_reference
         store.contract(contract)
         jobs = defaultdict(list)
         for track in data.tracks.values():
@@ -294,6 +340,7 @@ def export_crop_targets(args):
         history.write_csv(store.out / "labels.csv", rows, (*history.LABEL_FIELDS, *targets.EXTRA_FIELDS, *PAIR_FIELDS))
         write_json(store.out / "index.json", {"schema_version": 1, "kind": "crop_annotation_targets",
                     "crop_root": str(data.history_root), "crop_index_sha256": sha256(data.index_path),
+                    **({"selection_reference": data.selection_reference} if data.selection_reference else {}),
                     "contract": contract, "observations": observations, "events": rows,
                     "input_sha256": data.fingerprints.files})
         targets.render_audit(data, source, rows, store, observations, args.gallery_limit,
