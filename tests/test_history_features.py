@@ -483,6 +483,8 @@ def load_tests(loader, standard_tests, pattern):
     standard_tests.addTests(loader.loadTestsFromModule(models))
     targets = importlib.import_module("test_2026-10-25_history_targets")
     standard_tests.addTests(loader.loadTestsFromModule(targets))
+    regression = importlib.import_module("test_2026-10-25_history_regression")
+    standard_tests.addTests(loader.loadTestsFromModule(regression))
     return standard_tests
 
 
