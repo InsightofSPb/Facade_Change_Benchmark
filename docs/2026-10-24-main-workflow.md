@@ -46,6 +46,7 @@ split, методов и нового `--out` остаётся явным. Ко�
 | prepare | targets / history-targets | Существующая COCO-разметка + `--features` историй или `--crops` пар → общие правила масок и аннотационных целей; RGB/признаки сохраняются |
 | prepare | history-targets | Существующие целевые COCO-маски + геометрия историй → автоматические метки различий, неизвестные области и галерея |
 | train / benchmark | history-models | Готовые DINO-признаки + проверенные или явно разрешённые автоматические метки → pair/pooled/GRU/Transformer и сравнение |
+| train / benchmark / gallery | spatial-change | Пространственные patch-токены и class_targets → pair/mean/ConvGRU, сравнение с AnyChange, поклассовые метрики и галерея; [контракт и команды](2026-10-25_spatial_change.md) |
 | prepare | augmentations, synthetic, history | Подготовленный semantic dataset → фиксированные кропы/аугментации или пятикадровые истории; reviewed RGB crop dataset → контролируемые H0/H1 |
 | prepare | real-audit, real, robustness, transitions | Сохранённые реальные данные и геометрия → audit → подготовленные истории/варианты наблюдений/кандидаты переходов |
 | train | segmentation, msdzip, arib, bcm | TRAIN и отдельный VAL → training run, checkpoint и метрики; готовые модели можно переиспользовать |
