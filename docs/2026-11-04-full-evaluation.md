@@ -62,6 +62,7 @@ cd /home/sasha/Facade_Change_Benchmark
 python -s -u scripts/2026-11-04-consolidate-models.py \
   --prepared runs/2026-10-17-night-prepared-001 \
   --models models \
+  --dino-search-root /home/sasha \
   --anychange-source /home/sasha/miniconda3/envs/lposs310/lib/python3.10/site-packages \
   --out-config configs/2026-11-04-models.local.json
 ```
@@ -82,6 +83,11 @@ AnyChange получает установленное дерево исходн�
 отличия упаковки, например отсутствие прежнего LICENSE/NOTICE, фиксируются
 отдельно. Наличие одинакового имени файла само по себе не подтверждает совпадение
 весов или реализации.
+
+`--dino-search-root` ищет другие локальные копии DINOv2 по `hubconf.py`.
+Каталог принимается только при точном совпадении сохранённого хеша Python-дерева.
+При несовпадении выводятся ожидаемый и фактический хеши и число Python-файлов.
+Перенос целого каталога сам по себе хеш не меняет: абсолютный путь в него не входит.
 
 Пилот всех методов:
 

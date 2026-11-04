@@ -181,7 +181,7 @@ class ModelConsolidationTests(unittest.TestCase):
         self.sam = self.file(self.models / "downloads/sam_vit_h_4b8939.pth", b"frozen sam")
         self.dino_source = self.models / "dinov2/source"
         self.file(self.dino_source / "hubconf.py", b"def model(): pass\n")
-        self.file(self.dino_source / "dinov2/model.py", b"class Model: pass\n")
+        self.file(self.dino_source / "dinov2/models/vision_transformer.py", b"class Model: pass\n")
         dino_sources = BUNDLE.dino_sources(self.dino_source)
         dino_sources["path"] = str(self.missing / "dino-source")
         self.anychange = self.root / "env/lib/python3.10/site-packages"
@@ -271,12 +271,13 @@ class ModelConsolidationTests(unittest.TestCase):
     def snapshot(self):
         return {path: sha256(path) for path in self.root.rglob("*") if path.is_file()}
 
-    def consolidate(self, prepared=None):
+    def consolidate(self, prepared=None, dino_search_root=None, output_stream=None):
         with patch.object(BUNDLE, "geoscd_sources", side_effect=self.geo_sources), \
                 patch.object(BUNDLE.Path, "home", return_value=self.root), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(output_stream if output_stream is not None else io.StringIO()):
             return BUNDLE.consolidate(self.source_run if prepared is None else None,
-                                      self.models, self.anychange, self.output, "cpu", prepared=prepared)
+                                      self.models, self.anychange, self.output, "cpu", prepared=prepared,
+                                      dino_search_root=dino_search_root)
 
     def assert_preflight_failure(self, message):
         with patch.object(BUNDLE, "_copy_weight") as copy:
@@ -354,6 +355,56 @@ class ModelConsolidationTests(unittest.TestCase):
         self.assertEqual(report["source_record_sha256"], sha256(path))
         self.assertEqual(path.read_bytes(), original)
         self.assertTrue(self.output.is_file())
+
+    def test_dino_search_selects_exact_relocated_tree_and_rejects_other_candidates(self):
+        search_root = self.root / "other-projects"
+        search_root.mkdir()
+        matched = search_root / "b-relocated-dino"
+        self.dino_source.rename(matched)
+        different = search_root / "a-different-dino"
+        shutil.copytree(matched, different)
+        self.file(different / "dinov2/models/vision_transformer.py", b"class OtherModel: pass\n")
+        unrelated = self.file(search_root / "unrelated/hubconf.py", b"not a DINO source tree\n")
+        discovery = BUNDLE.subprocess.CompletedProcess([], 0, stdout="\n".join(map(str, (
+            different / "hubconf.py", unrelated, matched / "hubconf.py"))) + "\n", stderr="")
+        captured = io.StringIO()
+        with patch.object(BUNDLE.subprocess, "run", return_value=discovery) as search:
+            report = self.consolidate(dino_search_root=search_root, output_stream=captured)
+        search.assert_called_once()
+        command = search.call_args.args[0]
+        self.assertEqual(command[0], "rg")
+        self.assertIn(str(search_root), command)
+        self.assertIn("--no-ignore", command)
+        config = read_json(self.output)["methods"]
+        expected = BUNDLE.dino_sources(matched)["python_tree_sha256"]
+        for method in ("dinov2", "semantic_dino"):
+            self.assertEqual(config[method]["source_root"], str(matched))
+            self.assertEqual(report["source_audits"][method]["python_tree_sha256"], expected)
+        self.assertIn(expected, captured.getvalue())
+        self.assertIn("MATCH", captured.getvalue())
+
+    def test_dino_search_hash_mismatch_reports_expected_and_actual_without_writes(self):
+        search_root = self.root / "other-projects"
+        search_root.mkdir()
+        different = search_root / "different-dino"
+        self.dino_source.rename(different)
+        self.file(different / "dinov2/models/vision_transformer.py", b"class ChangedModel: pass\n")
+        expected = self.contract["models"]["dinov2"]["expected_metadata"]["sources"]["python_tree_sha256"]
+        actual = BUNDLE.dino_sources(different)["python_tree_sha256"]
+        self.assertNotEqual(expected, actual)
+        discovery = BUNDLE.subprocess.CompletedProcess(
+            [], 0, stdout=str(different / "hubconf.py") + "\n", stderr="")
+        before, captured = self.snapshot(), io.StringIO()
+        with patch.object(BUNDLE.subprocess, "run", return_value=discovery), \
+                patch.object(BUNDLE, "_copy_weight") as copy:
+            with self.assertRaisesRegex(ValueError, "no DINO source tree matching"):
+                self.consolidate(dino_search_root=search_root, output_stream=captured)
+        copy.assert_not_called()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.audit.exists())
+        self.assertEqual(self.snapshot(), before)
+        for text in (expected, actual, str(different), "EXPECTED", "DIFF"):
+            self.assertIn(text, captured.getvalue())
 
     def test_missing_method_or_conflicting_recorded_hash_rejected(self):
         original = deepcopy(self.contract)

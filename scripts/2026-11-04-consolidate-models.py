@@ -85,7 +85,8 @@ def _copy_weight(source, target, checksum):
             temporary.unlink(missing_ok=True)
 
 
-def consolidate(source_run, models, anychange_source, out_config, device="cuda:0", *, prepared=None):
+def consolidate(source_run, models, anychange_source, out_config, device="cuda:0", *, prepared=None,
+                dino_search_root=None):
     source_record, contracts = _contracts(source_run, prepared)
     source_hash = sha256(source_record)
     provenance_files = {}
@@ -156,13 +157,45 @@ def consolidate(source_run, models, anychange_source, out_config, device="cuda:0
         entry = dict(path=metadata[method]["checkpoint_path"], sha256=metadata[method]["checkpoint_sha256"])
         weight(method, "checkpoint_path", entry, f"msdzip/2026-11-04-{representation}.pt")
 
+    discovered = []
+    if dino_search_root is not None:
+        search_root = Path(dino_search_root).expanduser().resolve()
+        if not search_root.is_dir():
+            raise ValueError(f"DINO source search directory missing: {search_root}")
+        print(f"Searching DINO source trees in {search_root}", flush=True)
+        scan = subprocess.run(["rg", "--files", "--hidden", "--no-ignore", "--follow", str(search_root),
+                               "-g", "hubconf.py", "-g", "!**/.git/**"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if scan.stderr:
+            print(scan.stderr, file=sys.stderr, end="", flush=True)
+        if scan.returncode not in (0, 1, 2):
+            raise ValueError(f"DINO source search failed with exit code {scan.returncode}")
+        discovered = sorted({Path(line).resolve().parent for line in scan.stdout.splitlines()
+                             if (Path(line).parent / "dinov2/models/vision_transformer.py").is_file()})
+        print(f"Found {len(discovered)} DINO source candidates", flush=True)
+    source_cache = {}
     for method, expected in (("dinov2", metadata["dinov2"]["sources"]),
                              ("semantic_dino", semantic["backbone_provenance"]["sources"])):
-        candidates = [root / "dinov2/source", Path(expected["path"])]
+        print(f"EXPECTED {method}: {expected['python_tree_sha256']} "
+              f"({expected.get('python_file_count', '?')} Python files)", flush=True)
+        candidates = [root / "dinov2/source", Path(expected["path"]), *discovered]
         matched = None
-        for candidate in dict.fromkeys(candidates):
-            if candidate.is_dir() and dino_sources(candidate)["python_tree_sha256"] == expected["python_tree_sha256"]:
-                matched = candidate.resolve()
+        for candidate in dict.fromkeys(path.resolve() for path in candidates):
+            if not candidate.is_dir():
+                print(f"MISSING {method} source: {candidate}", flush=True)
+                continue
+            try:
+                if candidate not in source_cache:
+                    source_cache[candidate] = dino_sources(candidate)
+                actual = source_cache[candidate]
+            except (OSError, ValueError) as error:
+                print(f"UNREADABLE {method} source: {candidate}: {error}", flush=True)
+                continue
+            same = actual["python_tree_sha256"] == expected["python_tree_sha256"]
+            print(f"{'MATCH' if same else 'DIFFERENT'} {candidate}: "
+                  f"{actual['python_tree_sha256']} ({actual['python_file_count']} Python files)", flush=True)
+            if same:
+                matched = candidate
                 break
         if matched is None:
             issues.append(f"{method}: no DINO source tree matching the recorded Python hash")
@@ -250,10 +283,11 @@ def main():
                         help="Root containing torchange/models/segment_any_change")
     parser.add_argument("--out-config", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--dino-search-root", help="Search local hubconf.py trees and accept only exact recorded source hashes")
     args = parser.parse_args()
     try:
         consolidate(args.source_run, args.models, args.anychange_source, args.out_config, args.device,
-                    prepared=args.prepared)
+                    prepared=args.prepared, dino_search_root=args.dino_search_root)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(1, f"Model consolidation failed: {error}\n")
 
