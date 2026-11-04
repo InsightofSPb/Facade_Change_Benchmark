@@ -64,10 +64,14 @@ pooled, GRU и Transformer, `workflow benchmark history-models` оценивае
 по чистому TRAIN и F1/IoU изменений по классам на VAL.
 [Команды, маски 500 пар, метрики и resume](docs/2026-10-25-crop-benchmark.md).
 
-Полный экспорт RGB-кропов оценивается через `benchmark crops --crops ...`
-раздельно на TRAIN/VAL/TEST. TRAIN служит диагностикой и калибровкой порогов;
-для полных пригодных хронологий есть `prepare real --selection-mode all-geometric`.
-[Команды, различия выборок и продолжение](docs/2026-11-04-full-evaluation.md).
+Текущий общий набор для пар и историй — готовые кропы 224 px с шагом 192:
+`prepare real --histories ...`, затем `benchmark pilot` и `benchmark real`.
+Семь готовых методов работают в PREVIOUS/EARLIEST/HISTORY на одинаковых шагах;
+полный VAL выбирает пороги, TRAIN и TEST получают зафиксированные решения.
+RGB не пересоздаётся, обучение не запускается; карты, состояния памяти и метрики сохраняются.
+[Точный набор, команды пилота/полного запуска, метрики и ограничения](docs/2026-11-04-canonical-history-benchmark.md).
+Прежний отдельный парный экспорт через `benchmark crops` сохраняет свой
+[исходный протокол](docs/2026-11-04-full-evaluation.md).
 
 Для пространственных предсказаний: `workflow train spatial-change` обучает pair,
 mean и ConvGRU на patch-токенах и поклассовых целях. `benchmark spatial-change`

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -41,7 +42,15 @@ def main(argv=None):
     audit.add_argument('--splits', nargs='+', choices=('train', 'val', 'test'), default=['test', 'val', 'train'])
     audit.add_argument('--out', required=True)
     prepare = commands.add_parser('prepare', help='CPU: выбранные или все геометрически пригодные истории')
-    prepare.add_argument('--audit', required=True)
+    source = prepare.add_mutually_exclusive_group(required=True)
+    source.add_argument('--audit')
+    source.add_argument('--histories', help='Готовый canonical manifest.json, 224 px / шаг 192; RGB не пересоздаётся')
+    prepare.add_argument('--annotation-manifest', help='Reviewed manifest с source.coco_json; иначе из provenance истории')
+    prepare.add_argument('--class-groups', default=str(Path(__file__).resolve().parents[2] / 'configs/semantic_class_groups.json'))
+    prepare.add_argument('--expected-sha256')
+    prepare.add_argument('--expected-candidates', type=int)
+    prepare.add_argument('--boundary-tolerance', type=int, default=1)
+    prepare.add_argument('--resume', action='store_true')
     prepare.add_argument('--out', required=True)
     prepare.add_argument('--selection-mode', choices=('gt-enriched', 'all-geometric'), default='gt-enriched',
                          help='all-geometric: все окна без отбора по GT, без лимитов фасадов/кропов')
@@ -63,6 +72,10 @@ def main(argv=None):
         command.add_argument('--modes', nargs='+', choices=('previous', 'earliest', 'history'),
                              default=['previous', 'earliest', 'history'])
         command.add_argument('--device', default=None)
+        command.add_argument('--methods-config', help='Существующий JSON с путями весов и worker_python')
+        command.add_argument('--trust-checkpoint', action='store_true')
+        command.add_argument('--pilot-tracks', type=int, default=3,
+                             help='Canonical pilot: столько полных историй на TRAIN и VAL')
         command.add_argument('--geoscd-run', help='Дополнительный кэш готовых пар GeoSCD')
         command.add_argument('--reuse-run', help='Переиспользовать проверенные парные карты отдельного pilot')
         command.add_argument('--resume', action='store_true')
@@ -91,6 +104,25 @@ def main(argv=None):
     sys.path.insert(0, str(repo))
     if args.command in ('pilot', 'run') and args.detach:
         _launch_detached(args, argv)
+        return
+    canonical = None
+    if args.command == 'prepare' and args.histories:
+        canonical = 'prepare'
+    elif args.command in ('pilot', 'run'):
+        path = Path(args.prepared).expanduser() / 'index.json'
+        if path.exists() and json.loads(path.read_text()).get('kind') == 'canonical_history_prepared':
+            canonical = 'run'
+    elif args.command == 'report':
+        path = Path(args.run).expanduser() / 'run.json'
+        if path.exists() and json.loads(path.read_text()).get('kind') == 'canonical_history_benchmark':
+            canonical = 'report'
+    if canonical:
+        module = importlib.import_module('facade_change.research.2026-11-04_history_benchmark' +
+                                         ('_data' if canonical == 'prepare' else ''))
+        result = module.report(args.run, args.out) if canonical == 'report' else getattr(module, canonical)(args)
+        if canonical != 'report':
+            print(json.dumps({'out': str(Path(args.out).resolve()),
+                              'status': result.get('status', 'completed')}, ensure_ascii=False, indent=2))
         return
     if args.command == 'audit':
         from scripts.real_eval.night_prepare import audit

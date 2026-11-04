@@ -10,6 +10,16 @@ from pathlib import Path
 import numpy as np
 
 
+def cuda_peak(device):
+    """Observe an already initialized Torch allocator; never initialize CUDA here."""
+    torch = sys.modules.get("torch")
+    if torch is None or not str(device).startswith("cuda") or not torch.cuda.is_initialized():
+        return None
+    return dict(allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                scope="Torch allocator high-water mark in this worker; excludes non-Torch allocations")
+
+
 def _json_value(value):
     if isinstance(value, Path):
         return str(value)
@@ -41,7 +51,8 @@ def serve(requests, responses):
                     scorer = make_method(request["method"], **request.get("options", {}))
                     from .io import environment
                     worker_environment = {**environment(), "executable": sys.executable}
-                    payload = {"metadata": {**scorer.metadata, "worker_environment": worker_environment}}
+                    payload = {"metadata": {**scorer.metadata, "worker_environment": worker_environment,
+                                             "cuda_peak": cuda_peak(scorer.metadata.get("device"))}}
                 elif operation == "score":
                     if set(request) != {"id", "operation", "input_path", "output_path"}:
                         raise ValueError("Score requests accept only RGB/support archive paths")
@@ -71,7 +82,8 @@ def serve(requests, responses):
                     validate_auxiliary_arrays(auxiliary, support, scorer.metadata)
                     arrays.update(auxiliary)
                     np.savez(request["output_path"], **arrays)
-                    payload = {"metadata": {**scorer.metadata, "worker_environment": worker_environment}}
+                    payload = {"metadata": {**scorer.metadata, "worker_environment": worker_environment,
+                                             "cuda_peak": cuda_peak(scorer.metadata.get("device"))}}
                 elif operation == "close":
                     if scorer is not None:
                         if hasattr(scorer, "close"):

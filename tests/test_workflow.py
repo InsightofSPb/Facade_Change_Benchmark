@@ -99,5 +99,15 @@ class WorkflowSyntheticTests(unittest.TestCase):
         self.assertEqual({p: p.read_bytes() for p in before}, before)
 
 
+def load_tests(loader, tests, pattern):
+    # unittest discovery skips ISO-dated filenames because '-' is not an identifier.
+    path = Path(__file__).with_name("test_2026-11-04_history_benchmark.py")
+    spec = importlib.util.spec_from_file_location("canonical_history_benchmark_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tests.addTests(loader.loadTestsFromModule(module))
+    return tests
+
+
 if __name__ == "__main__":
     unittest.main()
