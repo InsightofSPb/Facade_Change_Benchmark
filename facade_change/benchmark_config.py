@@ -47,7 +47,7 @@ def load_method_options(path):
         result[method] = {key: _path(value, methods_file.parent) if key in {
             "worker_python", "source_root", "checkpoint_path", "dino_root", "dino_checkpoint",
             "py_utils_root", "sam_checkpoint", "backbone_checkpoint", "calibration_checkpoint",
-            "training_run", "model_config"
+            "training_run", "model_config", "head_checkpoint"
         } and value else value for key, value in values.items()}
     return result
 

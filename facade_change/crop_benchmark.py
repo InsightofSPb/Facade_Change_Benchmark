@@ -43,6 +43,8 @@ IMMUTABLE_METADATA = ("method", "output_kind", "checkpoint", "checkpoints", "wei
                       "device", "worker_python", "worker_environment", "codec", "implementation_version",
                       "representation", "tile_size", "stride", "score_formula", "category_to_channel",
                       "ontology", "ontology_sha256", "model_config", "evaluation_split_audit",
+                      "training_run", "training_status", "head_checkpoint", "backbone_provenance",
+                      "checkpoint_epoch", "checkpoint_selection", "checkpoint_origin_audit",
                       "checkpoint_path", "checkpoint_sha256", "checkpoint_dataset_verified", "input_sha256",
                       "reviewed_split", "buildings", "source_sha256", "source_commit", "model_args",
                       "window_groups", "protocol")
@@ -400,6 +402,21 @@ def _pin_model_files(value, fp):
             _pin_model_files(item, fp)
 
 
+def _checkpoint_exposure(metadata):
+    audits = {key: metadata[key] for key in ("evaluation_split_audit", "checkpoint_origin_audit")
+              if isinstance(metadata.get(key), dict)}
+    if not audits:
+        return {}
+    msdzip = audits.get("evaluation_split_audit", {})
+    semantic = audits.get("checkpoint_origin_audit", {})
+    affected = [part for part in ("val", "test")
+                if part in msdzip.get("exploratory_splits", [])
+                or semantic.get("train_overlap_by_current_split", {}).get(part)]
+    known = bool(msdzip.get("known_checkpoint_holdout_overlap")
+                 or semantic.get("known_checkpoint_train_holdout_overlap") or affected)
+    return {**audits, "known_holdout_overlap": known, "exploratory_splits": affected}
+
+
 def _validate_arrays(arrays, support, native, metadata):
     if "scores" not in arrays or set(arrays)-{"scores", "raw_scores", "native_prediction"}-AUXILIARY_ARRAY_NAMES:
         raise ValueError("Unexpected method output archive schema")
@@ -579,6 +596,7 @@ def run(args):
     store.record["kind"] = run_kind
     pool = RemotePool(log_dir=out / "worker_logs")
     processed, computed, reused, thresholds, macro, html_rows = 0, 0, 0, {}, Macro(), []
+    checkpoint_exposure = {}
     gallery_ids = _gallery_case_ids(data.cases, args.gallery_limit)
     try:
         store.contract(dict(protocol=protocol, inputs=dict(data.fp.files), sources=source_hashes,
@@ -590,7 +608,7 @@ def run(args):
             calibration="clean TRAIN only, one threshold per method/branch; sham excluded; fixed for all evaluation cases",
             statistical_unit=("building; overlapping crops are correlated; means over exported crop pairs, not whole-facade IoU"
                               if raw_export else "building; selected overlapping crops are correlated; exploratory development cohort; no TEST"),
-            split_roles=(dict(train="calibration and in-sample diagnostics; semantic checkpoints may have seen these images",
+            split_roles=(dict(train="calibration and in-sample diagnostics; checkpoints may have seen these images",
                               val="separate validation", test="separate frozen-threshold evaluation",
                               checkpoint_independence="not established by this crop split; retain checkpoint provenance")
                          if raw_export else dict(train="calibration and diagnostics", val="development evaluation"))))
@@ -604,7 +622,7 @@ def run(args):
                 writers[key].writeheader()
             for method in args.methods:
                 settings = {"device": args.device, "trust_checkpoint": args.trust_checkpoint, **options.get(method, {})}
-                if method == "geoscd":
+                if method in {"geoscd", "semantic_dino"}:
                     settings.pop("trust_checkpoint", None)
                 if raw_export and method.startswith("msdzip_"):
                     settings.pop("dataset_fingerprint", None)
@@ -635,6 +653,14 @@ def run(args):
                     write_json(method_contract, identity)
                 _pin_model_files(identity, data.fp)
                 store.event("method_activated", method=method, identity=identity)
+                exposure = _checkpoint_exposure(scorer.metadata)
+                if exposure:
+                    checkpoint_exposure[method] = exposure
+                    store.event("checkpoint_exposure", method=method, **exposure)
+                    if exposure["known_holdout_overlap"]:
+                        parts = ", ".join(part.upper() for part in exposure["exploratory_splits"]) or "evaluation"
+                        print(f"{method}: checkpoint training/selection overlaps {parts}; "
+                              "affected results are exploratory; continuing inference", flush=True)
                 native = scorer.metadata.get("output_kind") == "native_mask"
                 grid = _threshold_grid(method)
                 method_hash = digest([snapshot_hash, selection_hash, method, settings, identity])
@@ -717,11 +743,15 @@ def run(args):
             sham_policy="saved in cases.csv, excluded from primary aggregates and threshold fitting",
             real_scope="agreement with annotation-derived target-class change maps on known support; not semantic-state segmentation or independent event GT",
             aggregates=aggregates))
+        exposure_notes = [f"<p>{method}: {', '.join(part.upper() for part in row['exploratory_splits']) or 'evaluation'} "
+                          "results are exploratory due to checkpoint training/selection exposure.</p>"
+                          for method, row in checkpoint_exposure.items() if row["known_holdout_overlap"]]
         page = ['<!doctype html><meta charset="utf-8"><title>Crop benchmark</title>',
                 '<style>body{font:16px system-ui;margin:24px}td{padding:6px;vertical-align:top}</style>',
                 '<h1>Frozen crop comparisons</h1><p>Reference / source / target (gray unknown) / score / prediction on known support.</p>',
                 '<p>Clean TRAIN thresholds; unchanged across evaluation splits. TRAIN is in-sample diagnostics. '
-                'Real targets are annotation-derived; checkpoint independence requires its own provenance.</p><table>', *html_rows, '</table>']
+                'Real targets are annotation-derived; checkpoint independence requires its own provenance.</p>',
+                *exposure_notes, '<table>', *html_rows, '</table>']
         (out / "gallery.html").write_text('\n'.join(page), encoding="utf-8")
         data.fp.verify()
         summary = dict(kind=run_kind, status="completed", protocol=protocol,
@@ -732,6 +762,7 @@ def run(args):
                                                                       for part in args.splits)
                                                             if raw_export else "VAL; TRAIN diagnostics also saved"),
             test_used="test" in actual_splits,
+            checkpoint_exposure=checkpoint_exposure,
             targets_are_annotation_derived="real" in args.branches, categories=data.categories,
             metrics_path="metrics.json", cases_path="cases.csv", classes_path="classes.csv", gallery_path="gallery.html",
             val_overall=[r for r in aggregates if r["split"] == "val" and r["target_type"] == "event"

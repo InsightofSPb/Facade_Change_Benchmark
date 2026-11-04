@@ -81,7 +81,8 @@ def _file_hashes(metadata):
     return found
 
 
-def _method_contract(method, manifest, source, device):
+def _recorded_method_contract(method, manifest, source, device):
+    """Resolve saved options and hashes; callers must verify actual asset bytes."""
     config = manifest["source_config"]
     if not isinstance(config, dict):
         raise ValueError("source_config должен быть сохранённым объектом конфигурации")
@@ -142,14 +143,19 @@ def _method_contract(method, manifest, source, device):
     if method not in {"rgb_diff", "ssim"} and not provenance:
         raise ValueError(f"{method}: нет исходного происхождения модели")
     artifacts = _file_hashes(provenance)
-    for path, expected in artifacts.items():
-        actual_path = Path(path).expanduser().resolve()
-        if not actual_path.is_file() or sha256(actual_path) != expected:
-            raise ValueError(f"{method}: исходный файл модели отсутствует или изменился: {actual_path}")
     return {"options": options, "expected_metadata": provenance, "model_files_sha256": artifacts,
             "provenance_file": str(provenance_path) if provenance_path is not None else None,
             "provenance_sha256": sha256(provenance_path) if provenance_path is not None else None,
             "provenance_files_sha256": {str(path): sha256(path) for path, _ in provenance_files}}
+
+
+def _method_contract(method, manifest, source, device):
+    contract = _recorded_method_contract(method, manifest, source, device)
+    for path, expected in contract["model_files_sha256"].items():
+        actual_path = Path(path).expanduser().resolve()
+        if not actual_path.is_file() or sha256(actual_path) != expected:
+            raise ValueError(f"{method}: исходный файл модели отсутствует или изменился: {actual_path}")
+    return contract
 
 
 def task_arrays(pair, hypothesis, condition):

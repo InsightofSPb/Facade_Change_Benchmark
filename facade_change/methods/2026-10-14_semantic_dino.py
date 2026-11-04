@@ -106,7 +106,8 @@ class SemanticDINOScorer:
 
     def __init__(self, training_run=None, device="cpu", batch_size=4,
                  export_probabilities=False, current_manifest=None, expected_categories=None,
-                 crop_size=None, crop_stride=None):
+                 crop_size=None, crop_stride=None, source_root=None,
+                 backbone_checkpoint=None, head_checkpoint=None):
         if not training_run:
             raise ValueError("semantic_dino requires training_run with completed best.pth provenance")
         from ..segmentation.evaluate import _checked_run
@@ -118,7 +119,9 @@ class SemanticDINOScorer:
         if type(export_probabilities) is not bool:
             raise ValueError("export_probabilities must be boolean")
         self.export_probabilities = export_probabilities
-        root, record, config, saved = _checked_run(training_run)
+        root, record, config, saved = _checked_run(
+            training_run, source_root=source_root, backbone_checkpoint=backbone_checkpoint,
+            head_checkpoint=head_checkpoint)
         if current_manifest:
             current_categories = read_json(current_manifest).get("categories")
             if expected_categories is None and current_categories is not None:
@@ -143,7 +146,9 @@ class SemanticDINOScorer:
         if not geometry:
             origin["warnings"].append("Training crop geometry unavailable; recorded adapter crop geometry is used")
         gpu = gpu_preflight(self.device)
-        model, provenance = load_model(config["source_root"], config["checkpoint"], len(categories),
+        source = source_root if source_root is not None else config["source_root"]
+        backbone = backbone_checkpoint if backbone_checkpoint is not None else config["checkpoint"]
+        model, provenance = load_model(source, backbone, len(categories),
                                        self.device, config.get("trust_checkpoint", False))
         for name, key in (("sources", "python_tree_sha256"), ("checkpoint", "sha256")):
             if provenance[name][key] != saved["backbone_provenance"][name][key]:
@@ -155,7 +160,8 @@ class SemanticDINOScorer:
         self.metadata = {
             "method": "semantic_dino", "implementation_version": "2026-10-14-v1", "output_kind": "score",
             "training_run": str(root), "training_status": record["status"],
-            "head_checkpoint": file_provenance(root / "best.pth"), "checkpoint_epoch": saved["epoch"],
+            "head_checkpoint": file_provenance(head_checkpoint if head_checkpoint is not None else root / "best.pth"),
+            "checkpoint_epoch": saved["epoch"],
             "checkpoint_selection": "previously saved best VAL head; no retraining or reselection",
             "categories": categories, "category_to_channel": mapping, "num_classes": len(categories),
             "probability": "independent sigmoid for every class; no softmax",

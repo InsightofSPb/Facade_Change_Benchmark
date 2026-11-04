@@ -818,17 +818,27 @@ def _evaluation_split_audit(metadata, evaluation_split):
                for part in ("train", "val", "test")}
         for role, values in buildings.items()
     }
-    if overlaps["train"]["val"] or overlaps["train"]["test"]:
-        raise ValueError("MSDZip checkpoint TRAIN buildings overlap evaluation VAL/TEST")
-    if overlaps["val"]["test"]:
-        raise ValueError("MSDZip checkpoint selection VAL buildings overlap evaluation TEST")
+    train_holdout_overlap = bool(overlaps["train"]["val"] or overlaps["train"]["test"])
+    selection_test_overlap = bool(overlaps["val"]["test"])
+    warnings = []
+    if train_holdout_overlap:
+        warnings.append("MSDZip checkpoint TRAIN overlaps current VAL/TEST; affected results are exploratory")
+    if selection_test_overlap:
+        warnings.append("MSDZip checkpoint selection VAL overlaps current TEST; affected results are exploratory")
     return {
         "evaluation_split_sha256": _digest(evaluation_split),
         "checkpoint_overlap_by_current_split": overlaps,
         "checkpoint_buildings_outside_evaluation": {
             role: sorted(set(values) - set(assignments)) for role, values in buildings.items()},
         "scope": "stable project building IDs only; image identities and external pretraining are not audited",
-        "checkpoint_holdout_overlap_rejected": True,
+        "overlap_policy": "record_only",
+        "known_checkpoint_train_holdout_overlap": train_holdout_overlap,
+        "known_checkpoint_selection_test_overlap": selection_test_overlap,
+        "known_checkpoint_holdout_overlap": train_holdout_overlap or selection_test_overlap,
+        "exploratory_splits": [part for part in ("val", "test")
+                               if overlaps["train"][part] or (part == "test" and selection_test_overlap)],
+        "warnings": warnings,
+        "checkpoint_holdout_overlap_rejected": False,
         "unseen_facades_verified": False,
     }
 

@@ -92,22 +92,42 @@ class FrozenCheckpointSplitTests(unittest.TestCase):
         self.assertEqual(audit["checkpoint_overlap_by_current_split"]["train"]["train"], ["b_train"])
         self.assertEqual(audit["checkpoint_overlap_by_current_split"]["val"]["val"], ["b_val"])
         self.assertEqual(audit["checkpoint_overlap_by_current_split"]["train"]["test"], [])
+        self.assertEqual(audit["overlap_policy"], "record_only")
+        self.assertFalse(audit["known_checkpoint_holdout_overlap"])
+        self.assertFalse(audit["checkpoint_holdout_overlap_rejected"])
+        self.assertEqual(audit["exploratory_splits"], [])
+        self.assertEqual(audit["warnings"], [])
         self.assertFalse(audit["unseen_facades_verified"])
         self.assertNotIn("evaluation_split_audit", self.metadata)
 
-    def test_holdout_exposure_fails_before_device_or_model_creation(self):
+    def test_holdout_exposure_is_recorded_without_blocking_frozen_inference(self):
         for building, part in (("b_train", "val"), ("b_train", "test"), ("b_val", "test")):
             with self.subTest(building=building, part=part):
                 split = copy.deepcopy(self.split)
                 split["building_assignments"][building] = part
-                fake_torch = Mock()
-                fake_torch.load.return_value = {"metadata": self.metadata, "state_dict": {}}
-                with patch.object(msdzip, "_torch", return_value=fake_torch), \
-                        patch.object(msdzip, "_device") as device, patch.object(msdzip, "_new_model") as model:
-                    with self.assertRaisesRegex(ValueError, "buildings overlap evaluation"):
-                        msdzip.MSDZipScorer(self.checkpoint, evaluation_split=split)
-                    device.assert_not_called()
-                    model.assert_not_called()
+                scorer = self._load(evaluation_split=split)
+                scorer.model.load_state_dict.assert_called_once_with({}, strict=True)
+                scorer.model.eval.assert_called_once_with()
+                audit = scorer.metadata["evaluation_split_audit"]
+                role = "train" if building == "b_train" else "val"
+                self.assertEqual(audit["checkpoint_overlap_by_current_split"][role][part], [building])
+                self.assertTrue(audit["known_checkpoint_holdout_overlap"])
+                self.assertEqual(audit["known_checkpoint_train_holdout_overlap"], role == "train")
+                self.assertEqual(audit["known_checkpoint_selection_test_overlap"], role == "val")
+                self.assertEqual(audit["exploratory_splits"], [part])
+                self.assertEqual(len(audit["warnings"]), 1)
+                self.assertFalse(audit["checkpoint_holdout_overlap_rejected"])
+                self.assertFalse(audit["unseen_facades_verified"])
+                self.assertEqual(self.metadata["reviewed_split"], self.split)
+
+    def test_combined_exposure_reports_both_reasons_and_all_affected_splits(self):
+        split = copy.deepcopy(self.split)
+        split["building_assignments"].update(b_train="val", b_val="test")
+        audit = self._load(evaluation_split=split).metadata["evaluation_split_audit"]
+        self.assertTrue(audit["known_checkpoint_train_holdout_overlap"])
+        self.assertTrue(audit["known_checkpoint_selection_test_overlap"])
+        self.assertEqual(audit["exploratory_splits"], ["val", "test"])
+        self.assertEqual(len(audit["warnings"]), 2)
 
     def test_invalid_evaluation_split_rejected_and_original_fingerprint_check_retained(self):
         for split in ([], {}, {**self.split, "mode": "unreviewed"},
@@ -120,6 +140,11 @@ class FrozenCheckpointSplitTests(unittest.TestCase):
         scorer = self._load(dataset_fingerprint=self.fingerprint)
         self.assertTrue(scorer.metadata["checkpoint_dataset_verified"])
         self.assertNotIn("evaluation_split_audit", scorer.metadata)
+
+    def test_record_only_policy_does_not_accept_inconsistent_checkpoint_training_split(self):
+        self.metadata["buildings"]["train"].append("b_val")
+        with self.assertRaisesRegex(ValueError, "training buildings disagree"):
+            self._load(evaluation_split=self.split)
 
     def test_registry_forwards_evaluation_split_to_msdzip_only(self):
         from facade_change.methods import registry

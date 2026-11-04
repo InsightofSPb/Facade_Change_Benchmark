@@ -3,6 +3,7 @@ import importlib
 import contextlib
 import csv
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -801,6 +802,96 @@ class FullCropBenchmarkTests(unittest.TestCase):
         self.assertEqual(make.call_args.kwargs["checkpoint_path"], checkpoint)
         self.assertEqual(make.call_args.kwargs["evaluation_split"], self.index["split"])
         self.assertNotIn("worker_python", make.call_args.kwargs)
+
+    def test_checkpoint_exposure_is_reported_without_changing_inputs_maps_or_metrics(self):
+        methods = ["msdzip_abs", "semantic_dino"]
+        config = self.root / "methods.json"
+        head, backbone = self.root / "head.pth", self.root / "backbone.pth"
+        head.write_bytes(b"copied semantic head")
+        backbone.write_bytes(b"copied semantic backbone")
+        semantic_options = dict(training_run=str(self.root / "semantic-training"),
+                                source_root=str(self.root / "semantic-source"),
+                                backbone_checkpoint=str(backbone), head_checkpoint=str(head))
+        write_json(config, {"methods": {"msdzip_abs": {
+            "checkpoint_path": str(self.root / "abs.pt"), "worker_python": sys.executable},
+            "semantic_dino": semantic_options}})
+        semantic_files = dict(training_run=str(self.root / "semantic-training"),
+                              head_checkpoint=dict(path=str(head), sha256=sha256(head)),
+                              backbone_provenance=dict(checkpoint=dict(path=str(backbone), sha256=sha256(backbone))))
+        audits = {
+            "msdzip_abs": {"evaluation_split_audit": {
+                "known_checkpoint_holdout_overlap": True, "exploratory_splits": ["test"],
+                "checkpoint_overlap_by_current_split": {"train": {"test": ["b-test"]}},
+                "warnings": ["MSDZip checkpoint TRAIN overlaps current TEST"]}},
+            "semantic_dino": {"checkpoint_origin_audit": {
+                "known_checkpoint_train_holdout_overlap": True,
+                "train_overlap_by_current_split": {"train": [], "val": [{"building_id": "b-val"}], "test": []},
+                "warnings": ["Semantic checkpoint TRAIN overlaps current VAL"]}},
+        }
+        rgb = benchmark.make_scorer("rgb_diff")
+        calls = {False: [], True: []}
+        semantic_settings = []
+        audited = False
+
+        def semantic_adapter_options(*, training_run, source_root, backbone_checkpoint,
+                                     head_checkpoint, device):
+            semantic_settings.append(dict(training_run=training_run, source_root=source_root,
+                                          backbone_checkpoint=backbone_checkpoint, head_checkpoint=head_checkpoint))
+
+        class Scorer:
+            def __init__(self, method, options, pool):
+                self.method = method
+                self.metadata = dict(method=method, output_kind="score", implementation_version="exposure-test")
+                if method == "semantic_dino":
+                    semantic_adapter_options(**options)
+                    self.metadata.update(semantic_files)
+                if audited:
+                    self.metadata.update(audits[method])
+
+            def activate(self):
+                return self.metadata
+
+            def __call__(self, reference, source, support):
+                calls[audited].append((self.method, reference.copy(), source.copy(), support.copy()))
+                return rgb(reference, source, support)
+
+            def close(self):
+                pass
+
+        with patch.object(benchmark, "RemoteScorer", Scorer):
+            benchmark.run(self.args("--methods", *methods, "--methods-config", str(config)))
+            audited = True
+            result = benchmark.run(self.args("--methods", *methods, "--methods-config", str(config),
+                                             "--out", str(self.root / "audited")))
+        self.assertEqual(result["computed_maps"], 18)
+        self.assertEqual(semantic_settings, [semantic_options, semantic_options])
+        summary = read_json(self.root / "audited/summary.json")
+        for method, part in (("msdzip_abs", "test"), ("semantic_dino", "val")):
+            exposure = summary["checkpoint_exposure"][method]
+            self.assertTrue(exposure["known_holdout_overlap"])
+            self.assertEqual(exposure["exploratory_splits"], [part])
+            for key, value in audits[method].items():
+                self.assertEqual(exposure[key], value)
+                self.assertEqual(read_json(self.root / "audited/method_contracts" / (method + ".json"))[key], value)
+        with (self.root / "audited/events.jsonl").open() as stream:
+            events = [json.loads(line) for line in stream]
+        self.assertEqual({row["method"] for row in events if row["event_type"] == "checkpoint_exposure"}, set(methods))
+        gallery = (self.root / "audited/gallery.html").read_text()
+        self.assertIn("msdzip_abs: TEST results are exploratory", gallery)
+        self.assertIn("semantic_dino: VAL results are exploratory", gallery)
+        pinned = read_json(self.root / "audited/verified_inputs.json")
+        for path in (head, backbone):
+            self.assertEqual(pinned[str(path)], sha256(path))
+        self.assertEqual(len(calls[False]), len(calls[True]))
+        for before, after in zip(calls[False], calls[True]):
+            self.assertEqual(before[0], after[0])
+            for original, current in zip(before[1:], after[1:]):
+                np.testing.assert_array_equal(original, current)
+        for filename in ("selection.json", "threshold_selection.json", "metrics.json"):
+            self.assertEqual(read_json(self.root / "run" / filename), read_json(self.root / "audited" / filename))
+        for path in (self.root / "run/maps").glob("*.npz"):
+            with np.load(path) as before, np.load(self.root / "audited/maps" / path.name) as after:
+                np.testing.assert_array_equal(before["scores"], after["scores"])
 
     def test_test_labels_do_not_change_thresholds(self):
         benchmark.run(self.args())
