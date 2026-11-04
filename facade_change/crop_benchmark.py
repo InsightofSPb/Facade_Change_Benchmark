@@ -611,13 +611,18 @@ def run(args):
                     settings["evaluation_split"] = data.split
                 elif method.startswith(("arib_bps_", "msdzip_")) or method == "bcm_net_rgb":
                     settings["dataset_fingerprint"] = data.index["input_sha256"]
+                use_worker = method in EXTERNAL_METHODS or (
+                    method.startswith("msdzip_") and bool(settings.get("worker_python")))
                 if method not in EXTERNAL_METHODS:
-                    settings = {k: v for k, v in settings.items() if k in {"device", "trust_checkpoint", "checkpoint_path", "dataset_fingerprint",
-                                "compression_tile_size", "compression_stride", "zstd_level", "lzma_preset", "evaluation_split"}}
+                    allowed = {"device", "trust_checkpoint", "checkpoint_path", "dataset_fingerprint",
+                               "compression_tile_size", "compression_stride", "zstd_level", "lzma_preset", "evaluation_split"}
+                    if use_worker:
+                        allowed.update(("worker_python", "worker_timeout"))
+                    settings = {k: v for k, v in settings.items() if k in allowed}
                 report = _gpu_report(settings.get("device"))
                 if report:
                     store.event("gpu_preflight", method=method, report=report)
-                scorer = RemoteScorer(method, settings, pool) if method in EXTERNAL_METHODS else make_scorer(method, **settings)
+                scorer = RemoteScorer(method, settings, pool) if use_worker else make_scorer(method, **settings)
                 if isinstance(scorer, RemoteScorer):
                     scorer.activate()
                 identity = _identity(scorer.metadata)

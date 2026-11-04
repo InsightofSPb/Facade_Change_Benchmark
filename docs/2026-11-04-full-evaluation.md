@@ -29,62 +29,93 @@ python -s -u -m facade_change workflow prepare targets \
 Если этот запуск уже завершён, повторять его не нужно. Незавершённую подготовку
 продолжают той же командой с `--resume`. RGB и alignment не пересоздаются.
 
-Сначала небольшая CPU-проверка всего пути, включая TEST:
+CPU-проверка RGB/SSIM уже завершена: по 20 пар из каждого split. Следующий
+шаг — пилот всех девяти методов на одних и тех же 5 парах из каждого split,
+затем один общий полный запуск. Отдельные полные прогоны групп методов не нужны.
+
+Сначала восстановите настройки готовых моделей из сохранённого эксперимента.
+Этот шаг читает provenance, проверяет наличие и SHA-256 файлов моделей,
+включая MSDZip ABS/MOD256 и Semantic DINO. Обучение, скачивание весов и inference
+не запускаются. Старый prepared используется только как источник настроек
+моделей; новый набор пар по-прежнему определяется `data/crops`.
 
 ```bash
-python -s -u -m facade_change workflow benchmark crops \
-  --crops data/crops \
-  --targets-run runs/2026-11-04-full-targets-001 \
-  --splits train val test \
-  --methods rgb_diff ssim \
-  --max-pairs-per-split 20 \
-  --device cpu \
-  --out runs/2026-11-04-full-crops-smoke-001
+python -s -u - <<'PYCONFIG'
+import json
+from pathlib import Path
+
+from scripts.real_eval.night_common import (
+    DEFAULT_METHODS,
+    load_prepared,
+    read_model_contracts,
+)
+
+_, manifest = load_prepared("runs/2026-10-17-night-prepared-001")
+options = {}
+for method in DEFAULT_METHODS:
+    print(f"Checking {method}", flush=True)
+    contract = read_model_contracts(manifest, [method], device="cuda:0")[method]
+    options[method] = contract["options"]
+
+output = Path("configs/2026-11-04-methods-full-eval.local.json")
+with output.open("x", encoding="utf-8") as stream:
+    json.dump({"methods": options}, stream, indent=2, ensure_ascii=False)
+    stream.write("\n")
+print(f"Saved: {output}")
+PYCONFIG
 ```
 
-Smoke выбирает пары детерминированно по ID, без просмотра масок или оценок.
-Он проверяет данные и вычисления, но его метрики не заменяют полный результат.
-Если в выбранном TRAIN нет известных положительных или отрицательных пикселей,
-калибровка остановится с пояснением. Увеличьте лимит, например до 100, с новым
-`--out`; автоматического отбора по наличию изменений нет.
-После проверки `summary.json`, `metrics.json` и `gallery.html`:
+Новый конфиг не перезаписывает `configs/methods.local.json`; повторное создание
+того же файла также запрещено. Если он уже успешно создан, используйте его.
+Путь старого prepared относится к компьютеру владельца. MSDZip использует
+сохранённый `worker_python`, когда он указан, как и прежний эксперимент.
+
+Пилот всех методов:
 
 ```bash
-python -s -u -m facade_change workflow benchmark crops \
+time python -s -u -m facade_change workflow benchmark crops \
   --crops data/crops \
   --targets-run runs/2026-11-04-full-targets-001 \
   --splits train val test \
-  --methods rgb_diff ssim \
-  --max-pairs-per-split 0 \
-  --device cpu \
-  --out runs/2026-11-04-full-crops-rgb-ssim-001
+  --methods rgb_diff ssim lpips dinov2 semantic_dino anychange geoscd msdzip_abs msdzip_mod256 \
+  --methods-config configs/2026-11-04-methods-full-eval.local.json \
+  --max-pairs-per-split 5 \
+  --device cuda:0 \
+  --out runs/2026-11-04-all-methods-pilot-001
 ```
 
-Для нейросетевых методов используется прежний локальный файл моделей. Следующая
-команда предполагает, что `configs/methods.local.json` содержит рабочие source,
-weights и worker Python для каждого перечисленного метода. Веса не скачиваются.
-Сначала проверьте те же методы с `--max-pairs-per-split 20` и отдельным `--out`.
+Ошибка `msdzip_abs requires checkpoint_path in --methods-config` происходит
+до создания run record и вычисления карт. После именно этой ошибки можно
+повторить команду с тем же `--out` без `--resume`. Если запуск уже успел создать
+`run.json`, применяются обычные правила продолжения ниже.
+
+Пилот выбирает пары детерминированно по ID, без просмотра масок или оценок.
+Он проверяет вычисления и даёт первые замеры времени; его метрики не заменяют
+полный результат. Если в выбранном TRAIN нет известных положительных или
+отрицательных пикселей, калибровка остановится с пояснением. Тогда увеличьте
+лимит с новым `--out`; автоматического отбора по наличию изменений нет.
+Проверьте завершение всех методов, `summary.json`, `metrics.json`, `cases.csv`
+и `gallery.html`, оцените время общего прогона. Затем запустите все методы
+на полном экспорте:
 
 ```bash
-python -s -u -m facade_change workflow benchmark crops \
+time python -s -u -m facade_change workflow benchmark crops \
   --crops data/crops \
   --targets-run runs/2026-11-04-full-targets-001 \
   --splits train val test \
-  --methods lpips dinov2 semantic_dino anychange geoscd \
-  --methods-config configs/methods.local.json \
+  --methods rgb_diff ssim lpips dinov2 semantic_dino anychange geoscd msdzip_abs msdzip_mod256 \
+  --methods-config configs/2026-11-04-methods-full-eval.local.json \
   --max-pairs-per-split 0 \
   --device cuda:0 \
-  --out runs/2026-11-04-full-crops-neural-001
+  --out runs/2026-11-04-full-crops-all-methods-001
 ```
 
-MSDZip ABS/MOD256 можно запускать отдельно с теми же входами, методами
-`msdzip_abs msdzip_mod256` и новым `--out`. Конфигурация должна задавать
-`checkpoint_path` каждого метода. Для переноса готовых весов на полный экспорт
-проверяются сохранённые TRAIN/VAL идентификаторы зданий: обучение на текущем
-VAL/TEST или выбор checkpoint на текущем TEST блокирует запуск. Совпадение
-TRAIN допускается и остаётся диагностикой. Это проверка стабильных ID зданий,
-а не доказательство независимости всего внешнего предобучения. Старый режим
-оценки аугментаций сохраняет точную проверку fingerprint своего датасета.
+Для переноса готовых весов MSDZip на полный экспорт проверяются сохранённые
+TRAIN/VAL идентификаторы зданий: обучение на текущем VAL/TEST или выбор
+checkpoint на текущем TEST блокирует запуск. Совпадение TRAIN допускается
+и остаётся диагностикой. Это проверка стабильных ID зданий, а не доказательство
+независимости всего внешнего предобучения. Старый режим оценки аугментаций
+сохраняет точную проверку fingerprint своего датасета.
 ArIB/BCM в новом режиме полного экспорта пока не поддерживаются.
 
 ### Протокол и результаты

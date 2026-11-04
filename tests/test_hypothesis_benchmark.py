@@ -3,6 +3,7 @@ import importlib
 import contextlib
 import csv
 import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -745,6 +746,61 @@ class FullCropBenchmarkTests(unittest.TestCase):
         self.assertTrue(all(m["real"]["selection_split"] == "train" for m in thresholds["methods"].values()))
         with (self.root / "run/classes.csv").open() as stream:
             self.assertEqual(len(list(csv.DictReader(stream))), 36)
+
+    def test_msdzip_uses_configured_worker_and_current_evaluation_split(self):
+        methods = ["msdzip_abs", "msdzip_mod256"]
+        config = self.root / "methods.json"
+        worker_python = str(Path(sys.executable).resolve())
+        options = {method: dict(checkpoint_path=str(self.root / (method + ".pt")),
+                               worker_python=worker_python, worker_timeout=123,
+                               dataset_fingerprint={"old_dataset": "old_hash"}) for method in methods}
+        write_json(config, {"methods": options})
+        activations, calls = {}, []
+        rgb = benchmark.make_scorer("rgb_diff")
+
+        class Pool:
+            stderr_path = None
+
+            def __init__(self, **kwargs):
+                pass
+
+            def activate(self, method, settings):
+                activations[method] = settings.copy()
+                return dict(method=method, output_kind="score", implementation_version="test-worker")
+
+            def score(self, method, settings, reference, source, support):
+                calls.append(method)
+                return dict(scores=rgb(reference, source, support), metadata=self.activate(method, settings))
+
+            def release(self):
+                pass
+
+        with patch.object(benchmark, "RemotePool", Pool), \
+                patch.object(benchmark, "make_scorer", side_effect=AssertionError("MSDZip loaded in parent")):
+            result = benchmark.run(self.args("--methods", *methods, "--methods-config", str(config)))
+        self.assertEqual(result["computed_maps"], 18)
+        for method in methods:
+            self.assertEqual(calls.count(method), 9)
+            settings = activations[method]
+            self.assertEqual(settings["evaluation_split"], self.index["split"])
+            self.assertNotIn("dataset_fingerprint", settings)
+            for key in ("checkpoint_path", "worker_python", "worker_timeout"):
+                self.assertEqual(settings[key], options[method][key])
+            identity = read_json(self.root / "run/method_contracts" / (method + ".json"))
+            self.assertEqual(identity["worker_python"], worker_python)
+
+    def test_msdzip_without_worker_keeps_local_execution(self):
+        config = self.root / "methods.json"
+        checkpoint = str(self.root / "abs.pt")
+        write_json(config, {"methods": {"msdzip_abs": {"checkpoint_path": checkpoint}}})
+        rgb = benchmark.make_scorer("rgb_diff")
+        with patch.object(benchmark, "make_scorer", return_value=rgb) as make:
+            result = benchmark.run(self.args("--methods", "msdzip_abs", "--methods-config", str(config)))
+        self.assertEqual(result["computed_maps"], 9)
+        self.assertEqual(make.call_args.args, ("msdzip_abs",))
+        self.assertEqual(make.call_args.kwargs["checkpoint_path"], checkpoint)
+        self.assertEqual(make.call_args.kwargs["evaluation_split"], self.index["split"])
+        self.assertNotIn("worker_python", make.call_args.kwargs)
 
     def test_test_labels_do_not_change_thresholds(self):
         benchmark.run(self.args())
