@@ -416,8 +416,17 @@ def report(run_path, out_path=None, budgets=(.01, .05)):
                              **{field: counts[field] for field in ('expected_pairs', 'completed_pairs', 'failed_pairs', 'missing_pairs', 'evaluable_pairs')},
                              status='missing_calibration' if key in unavailable else 'available' if counts['evaluable_pairs'] else 'no_evaluable_results',
                              reason=' | '.join(reasons)))
+    selection_policy = manifest.get('selection_policy', {})
+    gt_enriched = selection_policy.get('mode', 'gt-enriched') != 'all-geometric'
+    selection_note = (
+        'Отбор фасадов и кропов по изменениям GT: это обогащённая диагностическая выборка, включая выбранный TEST; не полная несмещённая оценка TEST.'
+        if gt_enriched else
+        'Все геометрически пригодные окна аудированных хронологий, без отбора по GT. Общая поддержка требуется на всех принятых датах; отсутствующие геометрия, даты и исключённые аудитом виды остаются вне оценки.')
+    if selection_policy.get('requested_buildings'):
+        selection_note += ' Рассмотрены только фасады из явного списка --buildings.'
     warnings = [
-        'Отбор фасадов и кропов по изменениям GT: это обогащённая диагностическая выборка, включая выбранный TEST; не полная несмещённая оценка TEST.',
+        selection_note,
+        'TRAIN — диагностика, включая возможные знакомые модели фасады. TRAIN, VAL и TEST сохраняются отдельно; all_selected — описательное объединение, не независимая итоговая оценка.',
         'GT означает изменение набора аннотированных классов между датами. Неизвестная область исключается; это не независимая экспертная разметка временного события.',
         'PREVIOUS/HISTORY оценивают новое событие между соседними наблюдениями. EARLIEST оценивает состояние относительно первого наблюдения; соседние GT-маски не объединяются.',
         'P/R/F1/IoU усредняются по положительным кропам-кадрам внутри фасада, затем по фасадам. FPR учитывает известные отрицательные пиксели всех кадров и не называется H0 FPR.',
@@ -438,7 +447,8 @@ def report(run_path, out_path=None, budgets=(.01, .05)):
                       fusion_operations={'&': 'AND', '|': 'OR'},
                       fusion_comparison_bases=['previous_component', 'history_component'],
                       training_exposure=origins, boundary_tolerance=tolerance, no_model_inference=True,
-                      metrics_csv_units='fractions', selected_gt_enriched_cohort=True, warnings=warnings)
+                      metrics_csv_units='fractions', selected_gt_enriched_cohort=gt_enriched,
+                      selection_policy=selection_policy, pooled_split_scope='descriptive only; includes TRAIN', warnings=warnings)
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.temporal-report-', dir=out.parent) as temporary:
         staging = Path(temporary)

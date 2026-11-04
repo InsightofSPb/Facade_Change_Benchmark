@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit -> selected real histories -> timed pilot -> resumable frozen inference."""
+"""Audit -> real histories -> timed pilot -> resumable frozen inference."""
 from __future__ import annotations
 
 import argparse
@@ -40,16 +40,19 @@ def main(argv=None):
     audit.add_argument('--runs-root', help='Корень runs для обнаружения существующих совмещений')
     audit.add_argument('--splits', nargs='+', choices=('train', 'val', 'test'), default=['test', 'val', 'train'])
     audit.add_argument('--out', required=True)
-    prepare = commands.add_parser('prepare', help='CPU: отбор по размеченным изменениям, все годы и галерея')
+    prepare = commands.add_parser('prepare', help='CPU: выбранные или все геометрически пригодные истории')
     prepare.add_argument('--audit', required=True)
     prepare.add_argument('--out', required=True)
-    prepare.add_argument('--max-facades', type=int, default=12)
-    prepare.add_argument('--crops-per-facade', type=int, choices=(1, 2), default=1)
+    prepare.add_argument('--selection-mode', choices=('gt-enriched', 'all-geometric'), default='gt-enriched',
+                         help='all-geometric: все окна без отбора по GT, без лимитов фасадов/кропов')
+    prepare.add_argument('--max-facades', type=int, help='Только gt-enriched; по умолчанию 12')
+    prepare.add_argument('--crops-per-facade', type=int, choices=(1, 2), help='Только gt-enriched; по умолчанию 1')
     prepare.add_argument('--tile-size', type=int, default=512)
     prepare.add_argument('--stride', type=int, default=256)
     prepare.add_argument('--min-support', type=float, default=.8)
-    prepare.add_argument('--min-known-pixels', type=int, default=1024)
+    prepare.add_argument('--min-known-pixels', type=int, help='Только gt-enriched; по умолчанию 1024')
     prepare.add_argument('--buildings', nargs='+', help='Необязательно: явно ограничить фасады по audit')
+    prepare.add_argument('--gallery-limit', type=int, default=48, help='Максимум историй в HTML; данные не ограничивает')
     for name in ('pilot', 'run'):
         command = commands.add_parser(name, help=('Реальный замер на малой выборке' if name == 'pilot'
                                                   else 'PREVIOUS → EARLIEST → HISTORY, без обучения'))
@@ -100,7 +103,8 @@ def main(argv=None):
         result = prepare(args.audit, args.out, max_facades=args.max_facades,
                          crops_per_facade=args.crops_per_facade, tile_size=args.tile_size,
                          stride=args.stride, min_support=args.min_support,
-                         min_known_pixels=args.min_known_pixels, buildings=args.buildings)
+                         min_known_pixels=args.min_known_pixels, buildings=args.buildings,
+                         selection_mode=args.selection_mode, gallery_limit=args.gallery_limit)
         print(f'Галерея: {Path(args.out).resolve() / "gallery.html"}', flush=True)
     elif args.command in ('run', 'pilot'):
         from scripts.real_eval.night_run import run

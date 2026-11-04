@@ -1,7 +1,8 @@
-"""Development benchmark of frozen crop controls and annotation-derived changes.
+"""Benchmark frozen crop controls or a complete aligned RGB crop export.
 
-Fit thresholds on clean TRAIN only, keep them for every nuisance and VAL, and
-retain raw RGB as the scorer input. This is not the legacy VAL/TEST protocol.
+Fit thresholds on clean TRAIN only, keep them for every evaluation split, and
+retain raw RGB as the scorer input. Full exports include explicit TEST results;
+the existing augmented development protocol remains TRAIN/VAL only.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from scripts.real_eval.real_gt_metrics import evaluate_mask
 
 
 PROTOCOL = "crop-development-clean-train-v1"
+FULL_PROTOCOL = "crop-export-clean-train-v1"
 METRICS = ("f1", "iou", "precision", "recall", "fpr")
 FIELDS = ("method", "branch", "case_id", "dataset_crop_id", "building_id", "view_id", "split",
           "scenario_id", "nuisance_kind", "state", "hypothesis", "sham_self_paste", "target_type", "category_id", "category",
@@ -40,11 +42,17 @@ IMMUTABLE_METADATA = ("method", "output_kind", "checkpoint", "checkpoints", "wei
                       "backbone", "package", "normalization", "settings", "author_settings", "checkpoint_model_args",
                       "device", "worker_python", "worker_environment", "codec", "implementation_version",
                       "representation", "tile_size", "stride", "score_formula", "category_to_channel",
-                      "ontology", "ontology_sha256", "model_config")
+                      "ontology", "ontology_sha256", "model_config", "evaluation_split_audit",
+                      "checkpoint_path", "checkpoint_sha256", "checkpoint_dataset_verified", "input_sha256",
+                      "reviewed_split", "buildings", "source_sha256", "source_commit", "model_args",
+                      "window_groups", "protocol")
 
 
 class FrozenCrops:
     """One checked RGB/target provider for both branches; no new preparation."""
+
+    protocol = PROTOCOL
+    kind = "crop_development_benchmark"
 
     def __init__(self, dataset_run, targets_run, branches, max_pairs_per_split):
         self.root = Path(dataset_run).expanduser().resolve()
@@ -163,9 +171,14 @@ class FrozenCrops:
         if self.target_record.get("kind") != "crop_annotation_targets" or self.target_record.get("status") != "completed":
             raise ValueError("--targets-run must be a completed pairwise annotation export")
         index = read_json(self.file("index.json", target=True))
-        if index.get("crop_index_sha256") != self.index["input_sha256"]["parent_index"]:
+        expected_index = getattr(self, "crop_index_sha256", None) or self.index["input_sha256"]["parent_index"]
+        if index.get("crop_index_sha256") != expected_index:
             raise ValueError("Target masks belong to a different crop snapshot")
         contract = index["contract"]
+        channels = contract["target_channels"]
+        if (not channels or any(type(c) is not int or not 0 <= c < len(contract["categories"]) for c in channels)
+                or len(set(channels)) != len(channels)):
+            raise ValueError("Invalid target ontology channels")
         self.categories = [contract["categories"][channel] for channel in contract["target_channels"]]
         if len({c["id"] for c in self.categories}) != len(self.categories):
             raise ValueError("Ambiguous target ontology")
@@ -238,6 +251,134 @@ class FrozenCrops:
         return reference, source, support, target, layers
 
 
+class ExportCrops(FrozenCrops):
+    """Read every requested native crop, retaining stable and unknown examples."""
+
+    protocol = FULL_PROTOCOL
+    kind = "crop_export_benchmark"
+
+    def __init__(self, crops, targets_run, splits, max_pairs_per_split):
+        if (not splits or len(set(splits)) != len(splits)
+                or set(splits) - {"train", "val", "test"} or "train" not in splits):
+            raise ValueError("Full crop evaluation needs unique --splits including train for threshold calibration")
+        self.root = Path(crops).expanduser().resolve()
+        self.fp = Fingerprints()
+        self.fp.add(self.root / "run.json")
+        self.parent = read_json(self.root / "run.json")
+        if (self.parent.get("kind") != "crop_dataset"
+                or self.parent.get("status") not in {"completed", "completed_needs_review", "completed_with_issues"}):
+            raise ValueError("--crops requires a completed aligned crop export")
+        summary = read_json(self.file("summary.json"))
+        index_path = self.file(summary["index_path"])
+        self.crop_index_sha256 = sha256(index_path)
+        self.index = read_json(index_path)
+        self.split = read_json(self.file("split.json"))
+        if (self.index.get("schema_version") != 1 or self.index.get("split") != self.split
+                or self.split.get("mode") != "reviewed" or self.split.get("development_only") is not False
+                or len(self.index["crops"]) != summary["crop_count"]):
+            raise ValueError("Crop index, summary and reviewed split disagree")
+        pairs, views, images, pair_owners = {}, {}, {}, {}
+        for row in self.index["crops"]:
+            key, building, view, part = (row[k] for k in ("dataset_crop_id", "building_id", "view_id", "split"))
+            if (key in pairs or not building or not view or part not in {"train", "val", "test"}
+                    or self.split["building_assignments"].get(building) != part
+                    or views.setdefault(view, building) != building):
+                raise ValueError("Duplicate crop or building/view split leakage")
+            if set(row["source_image_sha256"]) != {"reference", "source"}:
+                raise ValueError("Crop lacks original image identities")
+            for value in row["source_image_sha256"].values():
+                if images.setdefault(value, part) != part:
+                    raise ValueError("Original image hash leaks between crop splits")
+            owner = (building, view, tuple(sorted(row["source_image_sha256"].items())))
+            if pair_owners.setdefault(row["pair_id"], owner) != owner:
+                raise ValueError("Photo pair has inconsistent owners or original images")
+            if (type(row["reference_year"]) is not int or type(row["source_year"]) is not int
+                    or row["reference_year"] >= row["source_year"]):
+                raise ValueError("Crop pair must have chronological cross-year observations")
+            pairs[key] = row
+        self.pairs = {}
+        for part in splits:
+            selected = sorted((row for row in pairs.values() if row["split"] == part),
+                              key=lambda row: digest(row["dataset_crop_id"]))
+            if not selected:
+                raise ValueError(f"No exported crops in requested split: {part}")
+            for row in selected[:max_pairs_per_split] if max_pairs_per_split else selected:
+                self.pairs[row["dataset_crop_id"]] = row
+        self.cases, self.events, self.target_root, self.target_record = [], {}, None, None
+        self.categories = []
+        for key, row in self.pairs.items():
+            directory = _inside(self.root, row["path"])
+            metadata = read_json(self.file((directory / "crop.json").relative_to(self.root).as_posix()))
+            for name in ("crop_id", "building_id", "view_id", "split", "reference_id", "source_id", "valid_fraction",
+                         "bbox_canvas_xyxy", "tile_shape", "reference_to_crop", "source_to_crop", "dense_geometry",
+                         "source_image_sha256", "artifact_sha256"):
+                if metadata.get(name) != row.get(name):
+                    raise ValueError(f"Crop index differs from saved crop.json: {name}")
+            shape, bbox = row["tile_shape"], row["bbox_canvas_xyxy"]
+            if (len(shape) != 2 or any(type(n) is not int or n < 8 for n in shape)
+                    or len(bbox) != 4 or any(type(n) is not int for n in bbox)
+                    or [bbox[3] - bbox[1], bbox[2] - bbox[0]] != shape
+                    or not 0 < row["valid_fraction"] <= 1):
+                raise ValueError("Invalid native crop rectangle/support")
+            if (row["pair_id"] != f"{row['reference_id']}-{row['source_id']}"
+                    or key != row["pair_id"] + "/" + row["crop_id"]):
+                raise ValueError("Crop identity differs from its observations")
+            for name in ("reference_rgb", "source_rgb", "reference_support", "source_support", "geometric_overlap"):
+                relative = (directory / (name + ".png")).relative_to(self.root).as_posix()
+                if name in row and row[name] != relative:
+                    raise ValueError(f"Indexed crop artifact path disagrees: {name}")
+                self.file(relative, row["artifact_sha256"][name + ".png"])
+            self.cases.append(dict(case_id=key, parent_dataset_crop_id=key, building_id=row["building_id"],
+                                   view_id=row["view_id"], split=row["split"], branch="real",
+                                   scenario_id="clean", nuisance_kind="identity"))
+        self._load_targets(targets_run)
+        target_index = read_json(self.file("index.json", target=True))
+        crop_categories = sorted((c["id"], c["name"]) for c in self.index["categories"])
+        target_categories = [(c["id"], c["name"]) for c in target_index["contract"]["categories"]]
+        if crop_categories != target_categories or len({c[0] for c in crop_categories}) != len(crop_categories):
+            raise ValueError("Crop and target category mappings disagree")
+        self.coverage = {part: dict(crop_pairs=0, known_pairs=0, positive_pairs=0, unknown_pairs=0,
+                                   known_pixel_contributions=0, ignored_pixel_contributions=0) for part in splits}
+        for case in progress(self.cases, "Validate native RGB, support and targets"):
+            _, _, _, target, _ = self.inputs(case)
+            counts = self.coverage[case["split"]]
+            known = int(np.count_nonzero(target != 255))
+            counts["crop_pairs"] += 1
+            counts["known_pairs"] += int(known > 0)
+            counts["positive_pairs"] += int(np.any(target == 1))
+            counts["unknown_pairs"] += int(known == 0)
+            counts["known_pixel_contributions"] += known
+            counts["ignored_pixel_contributions"] += target.size - known
+        self.selection = dict(protocol=self.protocol, max_pairs_per_split=max_pairs_per_split,
+            requested_splits=list(splits), pair_ids=sorted(self.pairs), case_ids={"real": [c["case_id"] for c in self.cases]},
+            source_pair_count=len(pairs), selected_pair_count=len(self.pairs),
+            source_by_split=dict(Counter(r["split"] for r in pairs.values())),
+            selected_by_split=dict(Counter(r["split"] for r in self.pairs.values())),
+            complete_requested_splits=max_pairs_per_split == 0,
+            algorithm="All exported crop IDs in requested splits; optional SHA256-ranked smoke limit; no annotation selection")
+
+    def inputs(self, case):
+        row = self.pairs[case["parent_dataset_crop_id"]]
+        directory = _inside(self.root, row["path"])
+        paths = {name: self.file((directory / (name + ".png")).relative_to(self.root).as_posix(),
+                                row["artifact_sha256"][name + ".png"])
+                 for name in ("reference_rgb", "source_rgb", "reference_support", "source_support", "geometric_overlap")}
+        reference, opaque_a = load_rgb(paths["reference_rgb"])
+        source, opaque_b = load_rgb(paths["source_rgb"])
+        shape = tuple(row["tile_shape"])
+        if reference.shape != (*shape, 3) or source.shape != reference.shape:
+            raise ValueError("Crop RGB differs from the native grid")
+        a, b, support = (_mask(paths[name], shape) for name in
+                         ("reference_support", "source_support", "geometric_overlap"))
+        if (not np.array_equal(support, a & b) or np.any(support & ~(opaque_a & opaque_b))
+                or not np.isclose(support.mean(), row["valid_fraction"])):
+            raise ValueError("Crop geometry, alpha and valid_fraction disagree")
+        target, layers = self.target_arrays(case["parent_dataset_crop_id"])
+        if np.any((target != 255) & ~support) or np.any((layers != 255) & ~support):
+            raise ValueError("Annotation targets extend outside crop geometry")
+        return reference, source, support, target, layers
+
+
 def _identity(metadata):
     result = {key: metadata[key] for key in IMMUTABLE_METADATA if key in metadata}
     if "worker_environment" in result:
@@ -250,6 +391,8 @@ def _pin_model_files(value, fp):
     if isinstance(value, dict):
         if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
             fp.add(value["path"], value["sha256"])
+        if isinstance(value.get("checkpoint_path"), str) and isinstance(value.get("checkpoint_sha256"), str):
+            fp.add(value["checkpoint_path"], value["checkpoint_sha256"])
         for item in value.values():
             _pin_model_files(item, fp)
     elif isinstance(value, (list, tuple)):
@@ -382,18 +525,30 @@ def _gallery_row(case, method, reference, source, target, scores, prediction):
 
 
 def run(args):
+    raw_export = bool(getattr(args, "crops", None))
+    args.branches = args.branches or (["real"] if raw_export else ["synthetic", "real"])
     if (not args.methods or len(set(args.methods)) != len(args.methods) or set(args.methods)-set(ALL_METHODS)
             or not args.branches or set(args.branches)-{"synthetic", "real"} or len(set(args.branches)) != len(args.branches)
             or args.max_pairs_per_split < 0 or args.gallery_limit < 0):
         raise ValueError("Invalid methods, branches or subset/gallery budget")
-    data = FrozenCrops(args.dataset_run, args.targets_run, args.branches, args.max_pairs_per_split)
+    if raw_export:
+        if args.branches != ["real"]:
+            raise ValueError("--crops evaluates original real pairs only; use --branches real")
+        args.splits = args.splits or ["train", "val", "test"]
+        data = ExportCrops(args.crops, args.targets_run, args.splits, args.max_pairs_per_split)
+    else:
+        if getattr(args, "splits", None) is not None:
+            raise ValueError("--splits belongs to --crops; augmented development data retain TRAIN/VAL")
+        data = FrozenCrops(args.dataset_run, args.targets_run, args.branches, args.max_pairs_per_split)
+    protocol, run_kind = data.protocol, data.kind
+    actual_splits = sorted({case["split"] for case in data.cases})
     out = Path(args.out).expanduser().resolve()
     for root in (data.root, data.target_root):
         if root and (out == root or out in root.parents or root in out.parents):
             raise ValueError("Benchmark output must be separate from its input runs")
     if args.resume and (out / "run.json").exists():
         old = read_json(out / "run.json")
-        if old.get("kind") != "crop_development_benchmark" or old.get("status") == "completed":
+        if old.get("kind") != run_kind or old.get("status") == "completed":
             raise ValueError("Resume requires an interrupted crop benchmark; completed outputs are immutable")
     options = load_method_options(args.methods_config) if args.methods_config else {}
     if args.methods_config:
@@ -403,10 +558,16 @@ def run(args):
     for method in args.methods:
         if method.startswith("msdzip_") and not options.get(method, {}).get("checkpoint_path"):
             raise ValueError(f"{method} requires checkpoint_path in --methods-config")
+        if raw_export and (method.startswith("arib_bps_") or method == "bcm_net_rgb"):
+            raise ValueError(f"{method}: transfer from its training dataset to --crops has not been validated")
     modules = [Path(__file__), Path(__file__).with_name("benchmark_config.py"),
-               Path(__file__).with_name("hypothesis_benchmark.py"), Path(__file__).with_name("scorers.py")]
+               Path(__file__).with_name("hypothesis_benchmark.py"), Path(__file__).with_name("scorers.py"),
+               Path(__file__).with_name("history_features.py"), Path(__file__).with_name("io.py"),
+               Path(__file__).with_name("2026-10-14_temporal_experiment.py"),
+               Path(__file__).with_name("2026-10-04_msdzip_h0.py"),
+               Path(__file__).parent.parent / "scripts/real_eval/real_gt_metrics.py"]
     modules += sorted((Path(__file__).parent / "methods").glob("*.py"))
-    source_hashes = {p.relative_to(Path(__file__).parent).as_posix(): sha256(p) for p in modules}
+    source_hashes = {p.relative_to(Path(__file__).parent.parent).as_posix(): sha256(p) for p in modules}
     for path in modules:
         data.fp.add(path)
     snapshot_hash = digest(data.fp.files)
@@ -415,18 +576,24 @@ def run(args):
     runtime = environment()
     RunStore = importlib.import_module("facade_change.2026-10-14_temporal_experiment").RunStore
     store = RunStore(out, config, resume=args.resume)
-    store.record["kind"] = "crop_development_benchmark"
+    store.record["kind"] = run_kind
     pool = RemotePool(log_dir=out / "worker_logs")
     processed, computed, reused, thresholds, macro, html_rows = 0, 0, 0, {}, Macro(), []
     gallery_ids = _gallery_case_ids(data.cases, args.gallery_limit)
     try:
-        store.contract(dict(protocol=PROTOCOL, inputs=dict(data.fp.files), sources=source_hashes,
+        store.contract(dict(protocol=protocol, inputs=dict(data.fp.files), sources=source_hashes,
             runtime={k: runtime[k] for k in ("python", "platform", "packages")},
             selection=data.selection, categories=data.categories,
-            target_scope="procedural edit GT and separate annotation-derived real changes; unknown pixels ignored",
+            target_scope=("annotation-derived real changes; unknown pixels ignored" if raw_export else
+                          "procedural edit GT and separate annotation-derived real changes; unknown pixels ignored"),
             inference_inputs="RGB pair and original geometry only; no target masks or artificial visibility",
-            calibration="clean TRAIN only, one threshold per method/branch; sham excluded; fixed for all VAL/nuisance cases",
-            statistical_unit="building; selected overlapping crops are correlated; exploratory development cohort; no TEST"))
+            calibration="clean TRAIN only, one threshold per method/branch; sham excluded; fixed for all evaluation cases",
+            statistical_unit=("building; overlapping crops are correlated; means over exported crop pairs, not whole-facade IoU"
+                              if raw_export else "building; selected overlapping crops are correlated; exploratory development cohort; no TEST"),
+            split_roles=(dict(train="calibration and in-sample diagnostics; semantic checkpoints may have seen these images",
+                              val="separate validation", test="separate frozen-threshold evaluation",
+                              checkpoint_independence="not established by this crop split; retain checkpoint provenance")
+                         if raw_export else dict(train="calibration and diagnostics", val="development evaluation"))))
         write_json(out / "selection.json", data.selection)
         write_json(out / "split.json", data.split)
         writers = {}
@@ -439,11 +606,14 @@ def run(args):
                 settings = {"device": args.device, "trust_checkpoint": args.trust_checkpoint, **options.get(method, {})}
                 if method == "geoscd":
                     settings.pop("trust_checkpoint", None)
-                if method.startswith(("arib_bps_", "msdzip_")) or method == "bcm_net_rgb":
+                if raw_export and method.startswith("msdzip_"):
+                    settings.pop("dataset_fingerprint", None)
+                    settings["evaluation_split"] = data.split
+                elif method.startswith(("arib_bps_", "msdzip_")) or method == "bcm_net_rgb":
                     settings["dataset_fingerprint"] = data.index["input_sha256"]
                 if method not in EXTERNAL_METHODS:
                     settings = {k: v for k, v in settings.items() if k in {"device", "trust_checkpoint", "checkpoint_path", "dataset_fingerprint",
-                                "compression_tile_size", "compression_stride", "zstd_level", "lzma_preset"}}
+                                "compression_tile_size", "compression_stride", "zstd_level", "lzma_preset", "evaluation_split"}}
                 report = _gpu_report(settings.get("device"))
                 if report:
                     store.event("gpu_preflight", method=method, report=report)
@@ -504,7 +674,7 @@ def run(args):
                 thresholds[method] = {branch: dict(threshold=.5, criterion="author native binary mask; no calibration",
                     selection_split=None, selection_scenario=None) if native else _calibrate(calibration[branch], grid)
                     for branch in args.branches}
-                write_json(out / "threshold_selection.json", dict(protocol=PROTOCOL, methods=thresholds))
+                write_json(out / "threshold_selection.json", dict(protocol=protocol, methods=thresholds))
                 store.event("thresholds_frozen", method=method, thresholds={b: t["threshold"] for b, t in thresholds[method].items()})
                 for case in progress(data.cases, f"{method}: frozen thresholds"):
                     record, arrays, reference, source, target, layers = score_case(case)
@@ -536,27 +706,37 @@ def run(args):
                     scorer.close()
                 pool.release()
         aggregates = macro.rows()
-        write_json(out / "metrics.json", dict(protocol=PROTOCOL, aggregation="case mean within building, then equally weighted buildings",
+        write_json(out / "metrics.json", dict(protocol=protocol, aggregation="case mean within building, then equally weighted buildings",
             undefined_metrics="null; no known pixels, or zero metric denominator; report contributing building counts",
             positive_metrics="F1/IoU/precision/recall on known-positive ROIs only; negatives remain in counts and FPR",
             sham_policy="saved in cases.csv, excluded from primary aggregates and threshold fitting",
             real_scope="agreement with annotation-derived target-class change maps on known support; not semantic-state segmentation or independent event GT",
             aggregates=aggregates))
-        page = ['<!doctype html><meta charset="utf-8"><title>Crop development benchmark</title>',
+        page = ['<!doctype html><meta charset="utf-8"><title>Crop benchmark</title>',
                 '<style>body{font:16px system-ui;margin:24px}td{padding:6px;vertical-align:top}</style>',
                 '<h1>Frozen crop comparisons</h1><p>Reference / source / target (gray unknown) / score / prediction on known support.</p>',
-                '<p>Clean TRAIN thresholds; unchanged across nuisance conditions and VAL. Real targets are annotation-derived.</p><table>', *html_rows, '</table>']
+                '<p>Clean TRAIN thresholds; unchanged across evaluation splits. TRAIN is in-sample diagnostics. '
+                'Real targets are annotation-derived; checkpoint independence requires its own provenance.</p><table>', *html_rows, '</table>']
         (out / "gallery.html").write_text('\n'.join(page), encoding="utf-8")
         data.fp.verify()
-        summary = dict(kind="crop_development_benchmark", status="completed", protocol=PROTOCOL,
+        summary = dict(kind=run_kind, status="completed", protocol=protocol,
             selected_pair_count=data.selection["selected_pair_count"], methods=args.methods,
             cases_by_branch=dict(Counter(c["branch"] for c in data.cases)),
             case_method_evaluations=processed, computed_maps=computed, reused_map_reads=reused,
-            threshold_split="clean TRAIN", evaluation_split="VAL; TRAIN diagnostics also saved", test_used=False,
+            threshold_split="clean TRAIN", evaluation_split=("; ".join("TRAIN diagnostics" if part == "train" else part.upper() + " evaluation"
+                                                                      for part in args.splits)
+                                                            if raw_export else "VAL; TRAIN diagnostics also saved"),
+            test_used="test" in actual_splits,
             targets_are_annotation_derived="real" in args.branches, categories=data.categories,
             metrics_path="metrics.json", cases_path="cases.csv", classes_path="classes.csv", gallery_path="gallery.html",
             val_overall=[r for r in aggregates if r["split"] == "val" and r["target_type"] == "event"
                          and r["scenario_id"] == "all" and r["hypothesis"] == "all"])
+        if raw_export:
+            summary.update(selected_by_split=data.selection["selected_by_split"], coverage_by_split=data.coverage,
+                           complete_requested_splits=data.selection["complete_requested_splits"],
+                           overall_by_split={part: [r for r in aggregates if r["split"] == part
+                               and r["target_type"] == "event" and r["scenario_id"] == "all" and r["hypothesis"] == "all"]
+                               for part in actual_splits})
         write_json(out / "verified_inputs.json", data.fp.files)
         write_json(out / "summary.json", summary)
         store.finish("completed", summary=summary, artifact_sha256={p.relative_to(out).as_posix(): sha256(p)
@@ -572,13 +752,18 @@ def run(args):
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    cli.add_argument("--dataset-run", required=True, help="Completed augmented crop run")
+    inputs = cli.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--dataset-run", help="Completed augmented crop run (existing TRAIN/VAL protocol)")
+    inputs.add_argument("--crops", help="Completed native crop export; evaluate all requested crop IDs")
     cli.add_argument("--targets-run", help="Completed prepare targets --crops export; required for the real branch")
     cli.add_argument("--out", required=True)
-    cli.add_argument("--branches", nargs="+", choices=("synthetic", "real"), default=["synthetic", "real"])
+    cli.add_argument("--branches", nargs="+", choices=("synthetic", "real"),
+                     help="Default: both augmented branches, or real only for --crops")
+    cli.add_argument("--splits", nargs="+", choices=("train", "val", "test"),
+                     help="With --crops: default train val test; train is required for calibration")
     cli.add_argument("--methods", nargs="+", choices=ALL_METHODS, default=["rgb_diff", "ssim"])
     cli.add_argument("--methods-config", help="Existing local source/weights/worker-Python method options")
-    cli.add_argument("--max-pairs-per-split", type=int, default=0, help="SHA-ranked smoke subset; 0 uses all frozen TRAIN/VAL pairs")
+    cli.add_argument("--max-pairs-per-split", type=int, default=0, help="SHA-ranked smoke subset; 0 uses all pairs in the input protocol")
     cli.add_argument("--device", default="cpu")
     cli.add_argument("--trust-checkpoint", action="store_true")
     cli.add_argument("--gallery-limit", type=int, default=48)

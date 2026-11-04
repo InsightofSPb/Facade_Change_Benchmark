@@ -96,6 +96,22 @@ class RealTemporalReportTests(unittest.TestCase):
         self.quiet.__exit__(None, None, None)
         self.temporary.cleanup()
 
+    def test_full_geometric_scope_is_reported_without_gt_selection_claim(self):
+        manifest_path = self.prepared / 'manifest.json'
+        manifest = read_json(manifest_path)
+        manifest['selection_policy'] = dict(mode='all-geometric', gt_used_for_selection=False)
+        atomic_json(manifest_path, manifest)
+        run = read_json(self.run / 'run.json')
+        run['manifest_sha256'] = sha256(manifest_path)
+        atomic_json(self.run / 'run.json', run)
+        result = night_report.report(self.run)
+        provenance = read_json(Path(result['out']) / 'provenance.json')
+        self.assertFalse(provenance['selected_gt_enriched_cohort'])
+        self.assertEqual(provenance['selection_policy']['mode'], 'all-geometric')
+        self.assertIn('includes TRAIN', provenance['pooled_split_scope'])
+        self.assertIn('без отбора по GT', provenance['warnings'][0])
+        self.assertIn('TRAIN — диагностика', provenance['warnings'][1])
+
     def test_three_modes_targets_and_facade_exposure_are_distinct(self):
         with patch('subprocess.Popen', side_effect=AssertionError('Reporting must not infer')):
             result = night_report.report(self.run)

@@ -1,6 +1,7 @@
 import importlib.util
 import importlib
 import contextlib
+import csv
 import io
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from PIL import Image
 from facade_change.hypothesis_benchmark import (
     THRESHOLDS, _building_macro, _calibrate, _case_metrics, _counts, run_hypothesis_benchmark,
 )
+from facade_change import crop_benchmark as benchmark
 from facade_change.io import finish_record, read_json, run_record, sha256, write_json
 
 
@@ -638,6 +640,194 @@ class CropDevelopmentMetricTests(unittest.TestCase):
         self.assertEqual(row["f1"], .5)
         self.assertEqual(row["building_count"], 3)
         self.assertEqual(row["f1_building_count"], 2)
+
+
+class FullCropBenchmarkTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.crops, self.targets = self.root / "crops", self.root / "targets"
+        self.crops.mkdir()
+        self.targets.mkdir()
+        self.categories = [{"id": 4, "name": "ORNAMENT_INTACT"}, {"id": 9, "name": "CRACK"}]
+        split = dict(mode="reviewed", development_only=False,
+                     building_assignments={"b-" + part: part for part in ("train", "val", "test")})
+        self.rows, self.events = [], []
+        for part_index, part in enumerate(("train", "val", "test")):
+            for variant, state in enumerate(("positive", "stable", "unknown")):
+                pair = f"{part}-{variant}-a-{part}-{variant}-b"
+                reference_id, source_id = f"{part}-{variant}-a", f"{part}-{variant}-b"
+                directory = self.crops / pair / "tile"
+                directory.mkdir(parents=True)
+                reference = np.full((16, 16, 3), 10 + part_index * 20 + variant, np.uint8)
+                source = reference.copy()
+                source[:, :8] += 80 if state == "positive" else 5
+                support = np.ones((16, 16), bool)
+                support[-1] = False
+                for name, array in (("reference_rgb", reference), ("source_rgb", source),
+                                    ("reference_support", support.astype(np.uint8) * 255),
+                                    ("source_support", support.astype(np.uint8) * 255),
+                                    ("geometric_overlap", support.astype(np.uint8) * 255)):
+                    Image.fromarray(array).save(directory / (name + ".png"))
+                artifacts = {path.name: sha256(path) for path in directory.iterdir()}
+                row = dict(dataset_crop_id=pair + "/tile", pair_id=pair, crop_id="tile", path=pair + "/tile",
+                           building_id="b-" + part, view_id="v-" + part, split=part,
+                           reference_id=reference_id, source_id=source_id, reference_year=2010, source_year=2020,
+                           reference_rgb=pair + "/tile/reference_rgb.png", source_rgb=pair + "/tile/source_rgb.png",
+                           geometric_overlap=pair + "/tile/geometric_overlap.png", tile_shape=[16, 16],
+                           bbox_canvas_xyxy=[0, 0, 16, 16], valid_fraction=float(support.mean()),
+                           reference_to_crop=np.eye(3).tolist(), source_to_crop=np.eye(3).tolist(),
+                           dense_geometry=None, source_image_sha256={"reference": artifacts["reference_rgb.png"],
+                                                                    "source": artifacts["source_rgb.png"]},
+                           artifact_sha256=artifacts)
+                write_json(directory / "crop.json", row)
+                self.rows.append(row)
+                layers = np.zeros((2, 16, 16), np.uint8)
+                if state == "positive":
+                    layers[1, :, :8] = 1
+                elif state == "unknown":
+                    layers[:] = 255
+                layers[:, ~support] = 255
+                target = np.full((16, 16), 255, np.uint8)
+                target[np.all(layers == 0, axis=0)] = 0
+                target[np.any(layers == 1, axis=0)] = 1
+                target_path = self.targets / f"{part}-{state}.npz"
+                np.savez_compressed(target_path, target=target, class_targets=layers,
+                                    category_ids=np.array([4, 9]))
+                self.events.append(dict(dataset_crop_id=row["dataset_crop_id"], pair_id=pair,
+                    building_id=row["building_id"], view_id=row["view_id"], split=part,
+                    previous_year=2010, current_year=2020, target_path=target_path.name,
+                    target_sha256=sha256(target_path)))
+        self.index = dict(schema_version=1, split=split, categories=self.categories, crops=self.rows,
+                          input_sha256={"manifest": "fixture"})
+        write_json(self.crops / "split.json", split)
+        write_json(self.crops / "summary.json", dict(index_path="index.json", crop_count=len(self.rows)))
+        self.save_crops()
+        self.target_index = dict(crop_index_sha256=sha256(self.crops / "index.json"), events=self.events,
+                                contract=dict(categories=self.categories, target_channels=[0, 1]))
+        self.save_targets()
+        silence = contextlib.redirect_stdout(io.StringIO())
+        silence.__enter__()
+        self.addCleanup(silence.__exit__, None, None, None)
+
+    def save_crops(self):
+        write_json(self.crops / "index.json", self.index)
+        write_json(self.crops / "run.json", dict(kind="crop_dataset", status="completed", artifact_sha256={
+            path.relative_to(self.crops).as_posix(): sha256(path)
+            for path in self.crops.rglob("*") if path.is_file() and path.name != "run.json"}))
+
+    def save_targets(self):
+        write_json(self.targets / "index.json", self.target_index)
+        write_json(self.targets / "run.json", dict(kind="crop_annotation_targets", status="completed", artifact_sha256={
+            path.relative_to(self.targets).as_posix(): sha256(path)
+            for path in self.targets.rglob("*") if path.is_file() and path.name != "run.json"}))
+
+    def args(self, *extra):
+        return benchmark.parser().parse_args(["--crops", str(self.crops), "--targets-run", str(self.targets),
+            "--out", str(self.root / "run"), "--gallery-limit", "3", "--methods", "rgb_diff", *extra])
+
+    def test_all_splits_stable_unknown_and_class_metrics(self):
+        result = benchmark.run(self.args("--methods", "rgb_diff", "ssim"))
+        self.assertEqual(result["computed_maps"], 18)
+        self.assertEqual(result["selected_by_split"], dict(train=3, val=3, test=3))
+        self.assertTrue(result["test_used"])
+        self.assertTrue(result["complete_requested_splits"])
+        self.assertEqual(set(result["overall_by_split"]), {"train", "val", "test"})
+        for counts in result["coverage_by_split"].values():
+            self.assertEqual((counts["known_pairs"], counts["positive_pairs"], counts["unknown_pairs"]), (2, 1, 1))
+        with (self.root / "run/cases.csv").open() as stream:
+            rows = list(csv.DictReader(stream))
+        unknown = [r for r in rows if r["valid_pixels"] == "0"]
+        self.assertEqual(len(unknown), 6)
+        self.assertTrue(all(r["f1"] == "" and r["fpr"] == "" for r in unknown))
+        thresholds = read_json(self.root / "run/threshold_selection.json")
+        self.assertTrue(all(m["real"]["selection_split"] == "train" for m in thresholds["methods"].values()))
+        with (self.root / "run/classes.csv").open() as stream:
+            self.assertEqual(len(list(csv.DictReader(stream))), 36)
+
+    def test_test_labels_do_not_change_thresholds(self):
+        benchmark.run(self.args())
+        before = read_json(self.root / "run/threshold_selection.json")
+        for event in self.events:
+            if event["split"] != "test":
+                continue
+            path = self.targets / event["target_path"]
+            with np.load(path) as arrays:
+                layers = arrays["class_targets"].copy()
+            known = np.all(layers != 255, axis=0)
+            layers[:, known] = 1 - layers[:, known]
+            target = np.full((16, 16), 255, np.uint8)
+            target[np.all(layers == 0, axis=0)] = 0
+            target[np.any(layers == 1, axis=0)] = 1
+            np.savez_compressed(path, target=target, class_targets=layers, category_ids=np.array([4, 9]))
+            event["target_sha256"] = sha256(path)
+        self.save_targets()
+        benchmark.run(self.args("--out", str(self.root / "changed-test")))
+        self.assertEqual(before, read_json(self.root / "changed-test/threshold_selection.json"))
+
+    def test_bad_targets_and_leakage_fail_before_model(self):
+        self.target_index["crop_index_sha256"] = "wrong"
+        self.save_targets()
+        with patch.object(benchmark, "make_scorer", side_effect=AssertionError("Model started")):
+            with self.assertRaisesRegex(ValueError, "different crop snapshot"):
+                benchmark.run(self.args())
+        self.target_index["crop_index_sha256"] = sha256(self.crops / "index.json")
+        self.save_targets()
+        self.rows[3]["source_image_sha256"]["reference"] = self.rows[0]["source_image_sha256"]["reference"]
+        self.save_crops()
+        with patch.object(benchmark, "make_scorer", side_effect=AssertionError("Model started")):
+            with self.assertRaisesRegex(ValueError, "leaks between"):
+                benchmark.run(self.args())
+
+    def test_missing_targets_and_invalid_geometry_fail_before_model(self):
+        removed = self.events.pop()
+        self.save_targets()
+        with self.assertRaisesRegex(ValueError, "cover every"):
+            benchmark.run(self.args())
+        self.events.append(removed)
+        self.save_targets()
+        row = self.rows[0]
+        path = self.crops / row["path"] / "geometric_overlap.png"
+        Image.fromarray(np.full((16, 16), 255, np.uint8)).save(path)
+        row["artifact_sha256"]["geometric_overlap.png"] = sha256(path)
+        write_json(self.crops / row["path"] / "crop.json", row)
+        self.save_crops()
+        self.target_index["crop_index_sha256"] = sha256(self.crops / "index.json")
+        self.save_targets()
+        with patch.object(benchmark, "make_scorer", side_effect=AssertionError("Model started")):
+            with self.assertRaisesRegex(ValueError, "geometry, alpha"):
+                benchmark.run(self.args())
+
+    def test_resume_reuses_maps_and_reproduces_metrics(self):
+        store = importlib.import_module("facade_change.2026-10-14_temporal_experiment").RunStore
+        original_save = store.save_unit
+        calls = []
+
+        def interrupt(instance, record, arrays):
+            result = original_save(instance, record, arrays)
+            calls.append(record["unit_id"])
+            if len(calls) == 4:
+                raise KeyboardInterrupt
+            return result
+
+        with patch.object(store, "save_unit", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                benchmark.run(self.args())
+        result = benchmark.run(self.args("--resume"))
+        self.assertEqual(result["computed_maps"], 5)
+        benchmark.run(self.args("--out", str(self.root / "fresh")))
+        self.assertEqual(read_json(self.root / "run/metrics.json"), read_json(self.root / "fresh/metrics.json"))
+        with self.assertRaisesRegex(ValueError, "completed outputs"):
+            benchmark.run(self.args("--resume"))
+
+    def test_explicit_train_requirement_and_smoke_selection(self):
+        with self.assertRaisesRegex(ValueError, "including train"):
+            benchmark.run(self.args("--splits", "val", "test"))
+        data = benchmark.ExportCrops(self.crops, self.targets, ["train", "val", "test"], 1)
+        self.assertEqual(len(data.cases), 3)
+        self.assertFalse(data.selection["complete_requested_splits"])
+        self.assertEqual(data.selection["selected_by_split"], dict(train=1, val=1, test=1))
 
 
 if __name__ == "__main__":

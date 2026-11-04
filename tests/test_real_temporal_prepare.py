@@ -3,6 +3,7 @@ import importlib
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +11,10 @@ import numpy as np
 from PIL import Image
 
 from facade_change.io import finish_record, run_record, sha256, write_json
-from scripts.real_eval.night_prepare import audit, prepare, _select
+from scripts.real_eval.night_prepare import audit, prepare, _select, _rank_view
+from facade_change.segmentation.data import PreparedData
+from scripts.real_eval.night_common import load_frame, load_prepared
+from scripts.real_eval.real_gt_metrics import derive_labels
 from scripts.real_eval.robustness_common import read_json
 
 
@@ -164,6 +168,86 @@ class RealTemporalPreparationTests(unittest.TestCase):
         write_json(coco, document)
         with self.assertRaisesRegex(ValueError, "COCO hash"):
             prepare(self.root / "audit", self.root / "prepared", tile_size=8, stride=8, min_known_pixels=4)
+
+    def test_all_geometric_keeps_positive_stable_unknown_and_all_splits(self):
+        self.audit()
+        rasterizations = Counter()
+        original = PreparedData._rasterize
+
+        def count_rasterizations(data, image_id, height, width):
+            rasterizations[image_id] += 1
+            return original(data, image_id, height, width)
+
+        with patch.object(PreparedData, "_rasterize", count_rasterizations), patch(
+                "scripts.real_eval.night_prepare._select", side_effect=AssertionError("GT selection invoked")):
+            result = prepare(self.root / "audit", self.root / "full", tile_size=8, stride=8,
+                             selection_mode="all-geometric", gallery_limit=3)
+        self.assertEqual(result["coverage"]["facades"], 4)
+        self.assertEqual(result["coverage"]["sequences"], 24)
+        self.assertEqual(result["coverage"]["frames"], 72)
+        self.assertEqual(result["coverage"]["previous_pairs"], 48)
+        self.assertEqual({s["split"] for s in result["sequences"]}, {"train", "val", "test"})
+        self.assertFalse(result["selection_policy"]["gt_used_for_selection"])
+        self.assertTrue(result["selection_policy"]["complete_audited_buildings"])
+        self.assertIsNone(result["selection_policy"]["max_facades"])
+        self.assertIsNone(result["selection_policy"]["min_known_pixels"])
+        self.assertEqual(result["gallery_policy"]["shown_sequences"], 3)
+        self.assertEqual(len(rasterizations), 12)
+        self.assertEqual(set(rasterizations.values()), {2})  # once for inspection, once for all windows
+        root, manifest = load_prepared(self.root / "full")
+        types = Counter()
+        for sequence in manifest["sequences"]:
+            self.assertEqual([f["year"] for f in sequence["frames"]], [2000, 2001, 2002])
+            frames = [load_frame(root, frame) for frame in sequence["frames"]]
+            x, y, width, height = sequence["crop_xywh"]
+            for frame_info, arrays in zip(sequence["frames"], frames):
+                original_path = self.input["images"][frame_info["image_id"] - 1]["image_path"]
+                with Image.open(original_path) as original_image:
+                    expected_rgb = np.asarray(original_image)[y:y+height, x:x+width]
+                np.testing.assert_array_equal(arrays["rgb"], expected_rgb)
+                self.assertTrue(arrays["support"].all())
+            labels = derive_labels(frames[0]["packed"], frames[1]["packed"],
+                                   frames[0]["support"] & frames[1]["support"], 2)
+            types["changed" if np.any(labels == 1) else "unknown" if np.all(labels == 255) else "stable"] += 1
+        self.assertEqual(types, Counter(changed=5, stable=11, unknown=8))
+        gallery = (self.root / "full" / "gallery.html").read_text()
+        self.assertIn("Показано 3 из 24", gallery)
+        self.assertIn("нет известной области", gallery)
+
+    def test_all_geometric_selection_does_not_depend_on_annotations(self):
+        self.audit()
+        first = prepare(self.root / "audit", self.root / "full", tile_size=8, stride=8,
+                        selection_mode="all-geometric", gallery_limit=0)
+        coco = self.input["dataset"] / "coco.json"
+        annotations = read_json(coco)
+        annotations["annotations"] = []
+        write_json(coco, annotations)
+        dataset_path = self.input["dataset"] / "dataset.json"
+        metadata = read_json(dataset_path)
+        metadata["source_coco_sha256"] = sha256(coco)
+        write_json(dataset_path, metadata)
+        self.audit(name="unknown-audit")
+        second = prepare(self.root / "unknown-audit", self.root / "unknown-full", tile_size=8, stride=8,
+                         selection_mode="all-geometric", gallery_limit=0)
+        self.assertEqual([s["sequence_id"] for s in first["sequences"]],
+                         [s["sequence_id"] for s in second["sequences"]])
+        self.assertTrue(all(s["selection_statistics"]["known_union_pixels"] == 0 for s in second["sequences"]))
+
+    def test_all_geometric_rejects_selection_caps_and_retains_geometry_gate(self):
+        audit_result = self.audit()
+        for options in ({"max_facades": 1}, {"crops_per_facade": 1}, {"min_known_pixels": 1}):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "all-geometric does not accept"):
+                prepare(self.root / "audit", self.root / "full", selection_mode="all-geometric", **options)
+        parent = audit_result["sequences"][0]
+        support = np.ones((16, 24), bool)
+        support[:, :8] = False
+        empty = np.zeros((16, 24), np.uint16)
+        with patch("scripts.real_eval.night_prepare._warp", return_value=dict(support=support, packed=empty)):
+            candidates, _ = _rank_view(type("Data", (), {"categories": [1, 2]})(), parent, 8, 8, .8, None,
+                                       "all-geometric")
+        self.assertEqual(sum(c["status"] == "eligible" for c in candidates), 4)
+        self.assertEqual({c["exclusion_reason"] for c in candidates if c["status"] == "excluded"},
+                         {"low_common_support"})
 
     def test_prepare_detects_changed_rgb_and_saves_failure(self):
         self.audit()

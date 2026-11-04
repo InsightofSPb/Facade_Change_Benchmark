@@ -21,7 +21,7 @@ ALL_METHODS = LEGACY_METHODS + EXTERNAL_METHODS
 
 LEGACY_OPTIONS = {
     "compression_tile_size", "compression_stride", "zstd_level", "lzma_preset",
-    "checkpoint_path", "device", "dataset_fingerprint", "trust_checkpoint",
+    "checkpoint_path", "device", "dataset_fingerprint", "trust_checkpoint", "evaluation_split",
 }
 
 _EXTERNAL_ADAPTERS = {
@@ -61,7 +61,7 @@ def make_method(method, **options):
             from .msdzip import MSDZipScorer
             return MSDZipScorer(method.removeprefix("msdzip_"), **{
                 key: value for key, value in options.items()
-                if key in {"checkpoint_path", "device", "dataset_fingerprint", "trust_checkpoint"}
+                if key in {"checkpoint_path", "device", "dataset_fingerprint", "trust_checkpoint", "evaluation_split"}
             })
         from .compression import ResidualCompressionScorer
         return ResidualCompressionScorer(method, **{
