@@ -147,6 +147,31 @@ class SemanticCheckpointRelocationTests(unittest.TestCase):
             self.module._checked_run(self.root, **options)
         self.load.assert_not_called()
 
+    def test_changed_source_is_allowed_only_with_boolean_opt_in(self):
+        options = self.relocate()
+        (options["source_root"] / "hubconf.py").write_text("# current source\n")
+        for flag in (False, "true"):
+            with self.subTest(flag=flag), self.assertRaises(ValueError):
+                self.module._checked_run(self.root, **options, allow_source_change=flag)
+            self.load.assert_not_called()
+        _, _, config, saved = self.module._checked_run(self.root, **options, allow_source_change=True)
+        self.assertEqual(config, self.config)
+        self.assertEqual(saved["config"], self.config)
+        self.load.assert_called_once_with(options["head_checkpoint"], map_location="cpu", weights_only=True)
+
+    def test_source_opt_in_keeps_backbone_and_head_hash_checks(self):
+        options = self.relocate()
+        (options["source_root"] / "hubconf.py").write_text("# current source\n")
+        for name in ("backbone_checkpoint", "head_checkpoint"):
+            with self.subTest(name=name):
+                path = options[name]
+                original = path.read_bytes()
+                path.write_bytes(b"different weights")
+                with self.assertRaises(ValueError):
+                    self.module._checked_run(self.root, **options, allow_source_change=True)
+                self.load.assert_not_called()
+                path.write_bytes(original)
+
     def test_adapter_loads_verified_copies_and_records_actual_head_path(self):
         from facade_change.methods.dinov2 import _source_provenance
 
@@ -167,6 +192,20 @@ class SemanticCheckpointRelocationTests(unittest.TestCase):
         self.assertEqual(scorer.metadata["training_run"], str(self.root))
         self.assertEqual(scorer.metadata["head_checkpoint"]["path"], str(options["head_checkpoint"]))
         self.assertEqual(read_json(self.root / "config.json"), self.config)
+        self.assertTrue(scorer.metadata["source_compatibility"]["matches_training"])
+        self.assertFalse(scorer.metadata["source_compatibility"]["allow_source_change"])
+        (options["source_root"] / "hubconf.py").write_text("# current source\n")
+        provenance["sources"] = _source_provenance(options["source_root"])
+        with patch.dict(sys.modules, stubs):
+            scorer = semantic.SemanticDINOScorer(training_run=self.root, **options, allow_source_change=True)
+        audit = scorer.metadata["source_compatibility"]
+        self.assertFalse(audit["matches_training"])
+        self.assertTrue(audit["allow_source_change"])
+        self.assertNotEqual(audit["training_python_tree_sha256"], audit["current_python_tree_sha256"])
+        self.assertEqual(audit["current_python_tree_sha256"], provenance["sources"]["python_tree_sha256"])
+        provenance["checkpoint"]["sha256"] = "wrong"
+        with patch.dict(sys.modules, stubs), self.assertRaisesRegex(ValueError, "Loaded semantic backbone"):
+            semantic.SemanticDINOScorer(training_run=self.root, **options, allow_source_change=True)
 
 
 class AuxiliaryProtocolTests(unittest.TestCase):

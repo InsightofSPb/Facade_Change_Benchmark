@@ -86,7 +86,9 @@ def _copy_weight(source, target, checksum):
 
 
 def consolidate(source_run, models, anychange_source, out_config, device="cuda:0", *, prepared=None,
-                dino_search_root=None):
+                dino_search_root=None, use_current_dino_source=None):
+    if dino_search_root is not None and use_current_dino_source is not None:
+        raise ValueError("Choose either historical source search or the current DINO source")
     source_record, contracts = _contracts(source_run, prepared)
     source_hash = sha256(source_record)
     provenance_files = {}
@@ -176,6 +178,23 @@ def consolidate(source_run, models, anychange_source, out_config, device="cuda:0
     source_cache = {}
     for method, expected in (("dinov2", metadata["dinov2"]["sources"]),
                              ("semantic_dino", semantic["backbone_provenance"]["sources"])):
+        if use_current_dino_source is not None:
+            current = Path(use_current_dino_source).expanduser().resolve()
+            if (not (current / "hubconf.py").is_file()
+                    or not (current / "dinov2/models/vision_transformer.py").is_file()):
+                raise ValueError(f"Current DINO source requires hubconf.py and dinov2/models/vision_transformer.py: {current}")
+            if current not in source_cache:
+                source_cache[current] = dino_sources(current)
+            actual = source_cache[current]
+            options[method]["source_root"] = str(current)
+            if method == "semantic_dino":
+                options[method]["allow_source_change"] = True
+            source_audits[method] = dict(path=str(current), python_tree_sha256=actual["python_tree_sha256"],
+                training_python_tree_sha256=expected["python_tree_sha256"],
+                matches_training=actual["python_tree_sha256"] == expected["python_tree_sha256"],
+                policy="use_current_source", python_file_count=actual["python_file_count"])
+            print(f"USING CURRENT {method} source: {current} ({actual['python_file_count']} Python files)", flush=True)
+            continue
         print(f"EXPECTED {method}: {expected['python_tree_sha256']} "
               f"({expected.get('python_file_count', '?')} Python files)", flush=True)
         candidates = [root / "dinov2/source", Path(expected["path"]), *discovered]
@@ -283,11 +302,15 @@ def main():
                         help="Root containing torchange/models/segment_any_change")
     parser.add_argument("--out-config", required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--dino-search-root", help="Search local hubconf.py trees and accept only exact recorded source hashes")
+    dino_source = parser.add_mutually_exclusive_group()
+    dino_source.add_argument("--dino-search-root", help="Search local trees for exact recorded source hashes")
+    dino_source.add_argument("--use-current-dino-source",
+                             help="Use this current DINO implementation; record historical source differences without blocking")
     args = parser.parse_args()
     try:
         consolidate(args.source_run, args.models, args.anychange_source, args.out_config, args.device,
-                    prepared=args.prepared, dino_search_root=args.dino_search_root)
+                    prepared=args.prepared, dino_search_root=args.dino_search_root,
+                    use_current_dino_source=args.use_current_dino_source)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(1, f"Model consolidation failed: {error}\n")
 

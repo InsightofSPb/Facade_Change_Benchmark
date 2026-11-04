@@ -62,7 +62,7 @@ cd /home/sasha/Facade_Change_Benchmark
 python -s -u scripts/2026-11-04-consolidate-models.py \
   --prepared runs/2026-10-17-night-prepared-001 \
   --models models \
-  --dino-search-root /home/sasha \
+  --use-current-dino-source models/dinov2/source \
   --anychange-source /home/sasha/miniconda3/envs/lposs310/lib/python3.10/site-packages \
   --out-config configs/2026-11-04-models.local.json
 ```
@@ -84,10 +84,16 @@ AnyChange получает установленное дерево исходн�
 отдельно. Наличие одинакового имени файла само по себе не подтверждает совпадение
 весов или реализации.
 
-`--dino-search-root` ищет другие локальные копии DINOv2 по `hubconf.py`.
-Каталог принимается только при точном совпадении сохранённого хеша Python-дерева.
-При несовпадении выводятся ожидаемый и фактический хеши и число Python-файлов.
-Перенос целого каталога сам по себе хеш не меняет: абсолютный путь в него не входит.
+По решению владельца используем текущую реализацию DINOv2 из `models/dinov2/source`.
+`--use-current-dino-source` записывает её фактический хеш и разрешает отличие от
+исторических исходников, в том числе для Semantic DINO. Совпадение старого
+Python-дерева больше не является условием этого запуска. Веса backbone и головы
+остаются прежними; совместимость их загрузки проверяется при пилоте.
+Отличия исходников сохраняются в consolidation audit и `source_compatibility`
+метаданных Semantic DINO. Старые результаты не подменяются результатами нового кода.
+
+Для точного повторения старой реализации отдельно доступен
+`--dino-search-root /home/sasha`; этот режим несовместим с `--use-current-dino-source`.
 
 Пилот всех методов:
 

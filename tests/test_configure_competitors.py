@@ -271,13 +271,15 @@ class ModelConsolidationTests(unittest.TestCase):
     def snapshot(self):
         return {path: sha256(path) for path in self.root.rglob("*") if path.is_file()}
 
-    def consolidate(self, prepared=None, dino_search_root=None, output_stream=None):
+    def consolidate(self, prepared=None, dino_search_root=None, output_stream=None,
+                    use_current_dino_source=None):
         with patch.object(BUNDLE, "geoscd_sources", side_effect=self.geo_sources), \
                 patch.object(BUNDLE.Path, "home", return_value=self.root), \
                 contextlib.redirect_stdout(output_stream if output_stream is not None else io.StringIO()):
             return BUNDLE.consolidate(self.source_run if prepared is None else None,
                                       self.models, self.anychange, self.output, "cpu", prepared=prepared,
-                                      dino_search_root=dino_search_root)
+                                      dino_search_root=dino_search_root,
+                                      use_current_dino_source=use_current_dino_source)
 
     def assert_preflight_failure(self, message):
         with patch.object(BUNDLE, "_copy_weight") as copy:
@@ -405,6 +407,43 @@ class ModelConsolidationTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         for text in (expected, actual, str(different), "EXPECTED", "DIFF"):
             self.assertIn(text, captured.getvalue())
+
+    def test_explicit_current_dino_source_keeps_weights_and_records_source_change(self):
+        expected = self.contract["models"]["dinov2"]["expected_metadata"]["sources"]["python_tree_sha256"]
+        self.file(self.dino_source / "dinov2/models/vision_transformer.py", b"class CurrentModel: pass\n")
+        actual = BUNDLE.dino_sources(self.dino_source)["python_tree_sha256"]
+        self.assertNotEqual(expected, actual)
+        self.assert_preflight_failure("no DINO source tree matching")
+        original_record = (self.source_run / "run.json").read_bytes()
+        with patch.object(BUNDLE.subprocess, "run", side_effect=AssertionError("Unexpected source search")):
+            report = self.consolidate(use_current_dino_source=self.dino_source)
+        config = read_json(self.output)["methods"]
+        for method in ("dinov2", "semantic_dino"):
+            self.assertEqual(config[method]["source_root"], str(self.dino_source))
+            audit = report["source_audits"][method]
+            self.assertEqual(audit["python_tree_sha256"], actual)
+            self.assertEqual(audit["training_python_tree_sha256"], expected)
+            self.assertFalse(audit["matches_training"])
+            self.assertEqual(audit["policy"], "use_current_source")
+        self.assertTrue(config["semantic_dino"]["allow_source_change"])
+        self.assertNotIn("allow_source_change", config["dinov2"])
+        self.assertEqual(config["semantic_dino"]["training_run"], str(self.training))
+        self.assertEqual(len({entry["path"] for entry in report["weight_relocations"].values()}), 8)
+        for entry in report["weight_relocations"].values():
+            self.assertEqual(sha256(entry["path"]), entry["sha256"])
+        self.assertEqual((self.source_run / "run.json").read_bytes(), original_record)
+
+    def test_explicit_current_dino_source_still_rejects_incomplete_layout(self):
+        malformed = self.root / "incomplete-source"
+        self.file(malformed / "dinov2/models/vision_transformer.py", b"class Model: pass\n")
+        before = self.snapshot()
+        with patch.object(BUNDLE, "_copy_weight") as copy:
+            with self.assertRaisesRegex(ValueError, "Current DINO source requires hubconf.py"):
+                self.consolidate(use_current_dino_source=malformed)
+        copy.assert_not_called()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.audit.exists())
+        self.assertEqual(self.snapshot(), before)
 
     def test_missing_method_or_conflicting_recorded_hash_rejected(self):
         original = deepcopy(self.contract)

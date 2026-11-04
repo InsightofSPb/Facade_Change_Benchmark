@@ -44,7 +44,7 @@ IMMUTABLE_METADATA = ("method", "output_kind", "checkpoint", "checkpoints", "wei
                       "representation", "tile_size", "stride", "score_formula", "category_to_channel",
                       "ontology", "ontology_sha256", "model_config", "evaluation_split_audit",
                       "training_run", "training_status", "head_checkpoint", "backbone_provenance",
-                      "checkpoint_epoch", "checkpoint_selection", "checkpoint_origin_audit",
+                      "checkpoint_epoch", "checkpoint_selection", "checkpoint_origin_audit", "source_compatibility",
                       "checkpoint_path", "checkpoint_sha256", "checkpoint_dataset_verified", "input_sha256",
                       "reviewed_split", "buildings", "source_sha256", "source_commit", "model_args",
                       "window_groups", "protocol")
