@@ -218,7 +218,8 @@ class SemanticDINOScorer:
         from ..segmentation.evaluate import bernoulli_entropy
 
         reference, source, support = validate_rgb_inputs(reference, source, support)
-        before, after = self._probabilities(reference), self._probabilities(source)
+        before = self._probabilities(reference)
+        after = before if np.array_equal(reference, source) else self._probabilities(source)
         delta = after - before
         scores = mask_scores(np.abs(delta).max(axis=0), support)
         arrays = {"semantic_delta": delta,

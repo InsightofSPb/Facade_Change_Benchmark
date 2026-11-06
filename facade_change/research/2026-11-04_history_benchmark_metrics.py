@@ -32,24 +32,16 @@ def slice_targets(data, arrays):
     return np.stack(result)
 
 
-def collect(data, samples, prediction, native=False, block_size=256, fusion=None):
-    """Merge each view/year-transition pixel once, with bounded canvas memory.
-
-    The histogram permits exact strict-threshold counts on a fixed 1/2048 grid.
-    Only AP is approximated by score binning. Raw float maps remain available.
-    """
+def merged_blocks(data, samples, prediction, native_flags, block_size=256):
+    """Yield jointly merged channels before any nonlinear fusion or threshold."""
     grouped = defaultdict(list)
     for sample in samples:
         grouped[tuple(sample[k] for k in ("building_id", "view_id", "previous_year", "current_year"))].append(sample)
     count_slices = len(slices(data))
-    flags = [native] if fusion is None else [row["native"] for row in fusion]
-    histograms = {}
-    coverage = dict(crop_candidates=len(samples), crop_candidates_with_known_pixels=0,
-                    spatial_transitions=len(grouped), geometric_pixels=0, known_pixels=0,
-                    conflicting_overlap_pixels=0)
-    coverage["crop_candidates_with_known_pixels"] = sum(s["known_pixels"] > 0 for s in samples)
+    flags = list(native_flags)
+    if not flags or block_size < 1:
+        raise ValueError("Need channels and a positive block size")
     for key, rows in sorted(grouped.items()):
-        histogram = histograms.setdefault(key[0], np.zeros((count_slices, 2, BINS), np.int64))
         blocks = defaultdict(list)
         for row in rows:
             x, y, width, height = row["bbox_xywh"]
@@ -63,8 +55,6 @@ def collect(data, samples, prediction, native=False, block_size=256, fusion=None
             conflict = np.zeros(truth.shape, bool)
             for row in selected:
                 values, available = prediction(row)
-                if fusion is None:
-                    values = values[None]
                 arrays = data.target(row["event_id"])
                 common = arrays["support"]
                 if (values.shape != (len(flags), *common.shape)
@@ -101,16 +91,36 @@ def collect(data, samples, prediction, native=False, block_size=256, fusion=None
             for channel, is_native in enumerate(flags):
                 if not is_native:
                     scores[channel] /= np.maximum(counts, 1)
-            merged = (np.all(scores > np.array([r["threshold"] for r in fusion])[:, None, None], axis=0)
-                      if fusion is not None else scores[0])
-            coverage["geometric_pixels"] += int(geometric.sum())
-            coverage["known_pixels"] += int(((truth[0] != 255) & geometric).sum())
-            coverage["conflicting_overlap_pixels"] += int((conflict[0] & geometric).sum())
-            for channel, target in enumerate(truth):
-                known = (target != 255) & geometric
-                quantized = np.ceil(merged[known] * (BINS - 1)).astype(np.int64)
-                for label in (0, 1):
-                    histogram[channel, label] += np.bincount(quantized[target[known] == label], minlength=BINS)
+            yield key, (bx, by), scores, truth, geometric, conflict
+
+
+def collect(data, samples, prediction, native=False, block_size=256, fusion=None):
+    """Exact grid-threshold counts after the shared spatial overlap merge."""
+    flags = [native] if fusion is None else [row["native"] for row in fusion]
+
+    def channels(row):
+        values, support = prediction(row)
+        return (values[None] if fusion is None else values), support
+
+    histograms = {}
+    coverage = dict(crop_candidates=len(samples),
+        crop_candidates_with_known_pixels=sum(s["known_pixels"] > 0 for s in samples),
+        spatial_transitions=len({tuple(s[k] for k in ("building_id", "view_id", "previous_year", "current_year"))
+                                 for s in samples}),
+        geometric_pixels=0, known_pixels=0, conflicting_overlap_pixels=0)
+    for key, _, scores, truth, geometric, conflict in merged_blocks(
+            data, samples, channels, flags, block_size):
+        histogram = histograms.setdefault(key[0], np.zeros((len(slices(data)), 2, BINS), np.int64))
+        merged = (np.all(scores > np.array([r["threshold"] for r in fusion])[:, None, None], axis=0)
+                  if fusion is not None else scores[0])
+        coverage["geometric_pixels"] += int(geometric.sum())
+        coverage["known_pixels"] += int(((truth[0] != 255) & geometric).sum())
+        coverage["conflicting_overlap_pixels"] += int((conflict[0] & geometric).sum())
+        for channel, target in enumerate(truth):
+            known = (target != 255) & geometric
+            quantized = np.ceil(merged[known] * (BINS - 1)).astype(np.int64)
+            for label in (0, 1):
+                histogram[channel, label] += np.bincount(quantized[target[known] == label], minlength=BINS)
     coverage["known_fraction"] = (coverage["known_pixels"] / coverage["geometric_pixels"]
                                   if coverage["geometric_pixels"] else None)
     return histograms, coverage

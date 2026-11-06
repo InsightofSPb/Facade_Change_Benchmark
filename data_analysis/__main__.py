@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import argparse
-
-from .runner import run_analysis
+import importlib
+import sys
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "history-fusion":
+        return importlib.import_module("data_analysis.2026-11-06_history_fusion").main(argv[1:])
+    from .runner import run_analysis
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", required=True, help="Complete original H0/H1 benchmark with saved maps")
     parser.add_argument("--out", required=True, help="New output directory")
