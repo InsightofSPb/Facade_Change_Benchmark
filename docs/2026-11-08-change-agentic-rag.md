@@ -34,6 +34,12 @@ SSIM и LZMA, три режима Qwen и последовательная пе�
 `data_analysis/2026-11-06_history_fusion.py`, проверяются контракт методов, порядок
 признаков, файлы модели, TRAIN fit и VAL threshold. Рецепт, которому нужны недоступные
 исторические признаки, явно отклоняется. Новый fit и настройка на TEST не выполняются.
+Рассчитанный fusion сохраняется также как отдельное свидетельство инструмента карт:
+score map, предсказанная маска, support, variant, порог с источником его выбора,
+хеши модели и ссылки на входные методы. Он доступен `fixed_context` и агенту через
+`get_maps`; исходные методы и baseline для сравнения сохраняются отдельно. `pair`
+не получает fusion. Preview fusion выбирается первым в существующем лимите карт;
+остальные preview выбираются по порядку evidence IDs, сводки всех методов сохраняются.
 
 ## Данные и границы вывода
 
@@ -48,6 +54,27 @@ raw наблюдения нужен тот же anchor или сохранённ
 положительной меткой изменения. Даты, известные только до года, трактуются
 консервативно как конец этого года при сравнении с точной датой.
 
+Во всех трёх режимах к двум неизменённым RGB-кропам добавляется явно обозначенная
+категориальная карта геометрической поддержки: общая часть, только reference,
+только source и отсутствие поддержки обоих кадров. Сохраняются бинарные маски,
+их хеши и размеры поддержанных областей. Часть только в source является впервые
+наблюдаемой, а не доказательством временного изменения. Карта — отдельное изображение
+в бюджете; это не маска физических окклюзий.
+
+Общая система пикселей кропа называется `region_crop_pixels`; старое эквивалентное
+имя `canonical_crop` нормализуется явно. `observation_native` относится к конкретному
+`observation_id`, а `anchor_native` — к `anchor_sha256`. Эти решётки не считаются
+эквивалентными без реального преобразования. Для уверенного вывода с bbox действует
+консервативное правило: ограничивающий прямоугольник перенесённого bbox на решётке
+кропа должен целиком лежать в общей поддержке. Для повёрнутого или перспективного
+bbox проверяется весь этот прямоугольник, включая пространство между ним и контуром.
+Полностью или частично неподдержанный bbox не подтверждает `change`/`no_change`;
+без общей поддержки эти решения запрещены и при отсутствии bbox. Бинарная маска
+из текстовой локализации не создаётся. Неопределённый ответ может сохранить bbox
+с явно измеренной долей поддержки. Уверенная локализация без проверяемого bbox
+отклоняется. Новые RGB-свидетельства имеют версионированные ID; старые записи
+хранилища с `canonical_crop` остаются неизменными.
+
 История исключает текущую пару, будущие и недатированные сведения, проверяет доступность
 цепочки свидетельств. Прогноз модели, измерение, `agent_hypothesis` и
 `human_confirmation` — разные типы. Подтверждение требует автора и источника.
@@ -60,6 +87,9 @@ raw наблюдения нужен тот же anchor или сохранённ
 временных интервалов и индикаторов заполнения; это не обученная модель деградации.
 Без эмбеддингов точная история и лексический поиск работают; векторный поиск возвращает
 явную нехватку представления. Пустой корпус не заполняется фиктивными векторами.
+Ограничения запроса применяются до проверки файлов исключённых записей: недоступный
+RGB будущего наблюдения не ломает прошлый запрос. Артефакты выбранных записей и
+используемого query-вектора по-прежнему проверяются строго.
 
 База знаний первоначально содержит только `configs/semantic_class_groups.json`,
 помеченный как проектная таксономия с датой доступности 2026-10-11. Для более раннего
@@ -84,7 +114,8 @@ cutoff этот документ недоступен. Учебники и по�
 
 ## Режимы и ресурсы
 
-* `pair`: два изображения, даты и минимальные метаданные; без истории и инструментов.
+* `pair`: два исходных RGB, карта геометрической поддержки, даты и минимальные
+  метаданные; без истории, оценок методов и адаптивных инструментов.
 * `fixed_context`: та же модель, детерминированно добавленные история, карты и знания.
   Все сводки методов сохраняются; не более двух preview-карт попадают в prompt.
 * `agent`: та же исходная пара; модель выбирает разрешённые инструменты истории,
@@ -98,6 +129,8 @@ cutoff этот документ недоступен. Учебники и по�
 Переполнение даёт явное завершение с недостатком данных; precision и разрешение
 не уменьшаются автоматически. При изменении бюджета согласуйте лимиты `models.qwen`
 с `budgets` в новой конфигурации.
+Начальный пакет обычного анализа пары занимает три изображения. Повторное открытие
+пары и дополнительные маски/наложения тоже входят в лимиты.
 
 Qwen закреплён на `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`, BF16/SDPA,
 `enable_thinking=False`, greedy decoding, batch 1. Размер изображения для процессора
@@ -107,6 +140,9 @@ BF16 autocast, resolution 1008, без интерактивности и ком�
 установленные исходники и checkpoint; поле `masks_logits` этой версии трактуется
 как результат sigmoid. Исходные маски и SAM3 сохраняются отдельно, включая
 обратное преобразование в координаты наблюдения и anchor.
+При SAM3-запросе к найденному TRAIN-аналогу результат привязан к области и наблюдению
+этого аналога, с их геометрией, provenance и датой доступности результата. Он не
+становится предсказанием текущего фасада.
 
 В `sequential` смена модели завершает принадлежащий приложению worker. CPU-диалог,
 артефакты и evidence остаются на диске, Qwen восстанавливает входы без переноса KV-cache.
@@ -120,35 +156,35 @@ BF16 autocast, resolution 1008, без интерактивности и ком�
 Команды ниже выполняются в Bash. Использованы предоставленные владельцем абсолютные
 пути. Реальные изображения, готовые histories и fusion в Cloud отсутствуют; их пути
 нужно задать явно. Не запускайте эти команды в неисправной среде `main`.
+Пути `/ЗАМЕНИТЕ/...` и подписанные заглавными буквами значения в командах — явные
+места для ваших действительных данных, дат и ID; замените их до запуска. Даты имеют
+формат `YYYY` или `YYYY-MM-DD`. Это не имена существующих в Cloud файлов.
 
 ```bash
 cd /home/sasha/Facade_Change_Benchmark
 git fetch origin
 git switch codex/2026-11-08-change-agentic-rag
 git pull --ff-only
-PY=/home/sasha/miniconda3/envs/change-agentic-rag/bin/python
-CFG=/home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic.local.json
-RUNS=/home/sasha/Facade_Change_Benchmark/runs
-"$PY" -m facade_change.agentic configure --out "$CFG" --gpu-mode sequential
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic configure --out /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --gpu-mode sequential
 ```
 
 `configure` отказывается перезаписывать файл. Для повторного опыта выберите новое имя
 конфига/каталога. Родительскому CPU-процессу нужны зависимости `requirements-cpu.txt`;
 Qwen/SAM3 используют свои заданные интерпретаторы. Если зависимости CPU отсутствуют
 в `change-agentic-rag`, используйте существующий рабочий интерпретатор с этими
-зависимостями как `PY`; пути workers в конфигурации менять не требуется.
+зависимостями, заменив только абсолютный путь Python в командах; пути workers
+в конфигурации менять не требуется.
 
 Чтобы включить готовые детекторы вместо минимальной диагностики, создайте другой конфиг.
 Путь методов взят из документа подготовки 2026-11-04; существование файла проверяется
 на вашей машине. Он не создаётся автоматически из предположений:
 
 ```bash
-: "${DETECTOR_PY:?Укажите абсолютный путь проверенного Python существующих детекторов}"
-"$PY" -m facade_change.agentic configure \
-  --out /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-methods.local.json \
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic configure \
+  --out /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-methods-fixes.local.json \
   --methods-config /home/sasha/Facade_Change_Benchmark/configs/2026-11-04-models.local.json \
   --methods ssim lzma_abs anychange semantic_dino dinov2 lpips \
-  --alignment-python "$DETECTOR_PY" --detector-python "$DETECTOR_PY"
+  --alignment-python '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/python' --detector-python '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/python'
 ```
 
 `--detector-python` явно переопределяет Python всех выбранных методов; если существующий
@@ -165,24 +201,20 @@ Qwen/SAM3 используют свои заданные интерпретат�
    `--load-model` дополнительно загружает модели последовательно, но не проверяет качество.
 
 ```bash
-"$PY" -c 'import numpy, PIL, cv2, scipy, pycocotools; print("CPU imports OK")'
-"$PY" -m facade_change.agentic check --config "$CFG" \
-  --roles qwen sam3 --out "$RUNS/2026-11-08-agentic-check-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -c 'import numpy, PIL, cv2, scipy, pycocotools; print("CPU imports OK")'
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic check --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json \
+  --roles qwen sam3 --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-check-fixes-001"
 ```
 
-2. Новая пара без GT. Задайте `REFERENCE`, `SOURCE`, `REFERENCE_DATE`, `SOURCE_DATE`,
-   `BUILDING_ID`, `VIEW_ID` действительными значениями. Даты должны быть подтверждены;
-   более ранний кадр — reference. Это параметризованная команда, а не выдуманные пути.
+2. Новая пара без GT. Замените подписанные параметры действительными путями, датами
+   и ID здания/вида. Даты должны быть подтверждены; более ранний кадр — reference.
 
 ```bash
-: "${REFERENCE:?Абсолютный путь раннего RGB}" "${SOURCE:?Абсолютный путь позднего RGB}"
-: "${REFERENCE_DATE:?Подтверждённый YYYY или YYYY-MM-DD}" "${SOURCE_DATE:?Подтверждённая дата}"
-: "${BUILDING_ID:?ID физического здания}" "${VIEW_ID:?ID вида}"
-"$PY" -m facade_change.agentic run --config "$CFG" \
-  --reference "$REFERENCE" --source "$SOURCE" \
-  --reference-date "$REFERENCE_DATE" --source-date "$SOURCE_DATE" \
-  --building-id "$BUILDING_ID" --view-id "$VIEW_ID" --modes pair \
-  --out "$RUNS/2026-11-08-agentic-pair-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic run --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json \
+  --reference '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/РАННЕМУ_RGB' --source '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/ПОЗДНЕМУ_RGB' \
+  --reference-date 'ПОДТВЕРЖДЁННАЯ_РАННЯЯ_ДАТА' --source-date 'ПОДТВЕРЖДЁННАЯ_ПОЗДНЯЯ_ДАТА' \
+  --building-id 'ПРОВЕРЕННЫЙ_ID_ЗДАНИЯ' --view-id 'ПРОВЕРЕННЫЙ_ID_ВИДА' --modes pair \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-pair-fixes-001"
 ```
 
 Опционально задайте `--split train|val|test`, только если принадлежность проверена,
@@ -195,11 +227,9 @@ Qwen/SAM3 используют свои заданные интерпретат�
 3. Реальная история минимум с тремя датами из существующего `history_features`:
 
 ```bash
-: "${HISTORIES:?Абсолютный каталог готовых canonical histories}"
-: "${TRACK_ID:?Существующий track_id из его manifest.json}"
-"$PY" -m facade_change.agentic history --config "$CFG" \
-  --histories "$HISTORIES" --track-id "$TRACK_ID" --min-dates 3 \
-  --available-at observation_date --out "$RUNS/2026-11-08-agentic-history-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic history --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json \
+  --histories '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/CANONICAL_HISTORIES' --track-id 'СУЩЕСТВУЮЩИЙ_TRACK_ID' --min-dates 3 \
+  --available-at observation_date --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-history-fixes-001"
 ```
 
 `observation_date` — явное ретроспективное допущение доступности снимка в дату съёмки.
@@ -212,11 +242,11 @@ Qwen/SAM3 используют свои заданные интерпретат�
 4. Все три режима на одной зафиксированной паре:
 
 ```bash
-"$PY" -m facade_change.agentic run --config "$CFG" \
-  --reference "$REFERENCE" --source "$SOURCE" \
-  --reference-date "$REFERENCE_DATE" --source-date "$SOURCE_DATE" \
-  --building-id "$BUILDING_ID" --view-id "$VIEW_ID" \
-  --modes pair fixed_context agent --out "$RUNS/2026-11-08-agentic-all-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic run --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json \
+  --reference '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/РАННЕМУ_RGB' --source '/ЗАМЕНИТЕ/АБСОЛЮТНЫМ/ПУТЁМ/К/ПОЗДНЕМУ_RGB' \
+  --reference-date 'ПОДТВЕРЖДЁННАЯ_РАННЯЯ_ДАТА' --source-date 'ПОДТВЕРЖДЁННАЯ_ПОЗДНЯЯ_ДАТА' \
+  --building-id 'ПРОВЕРЕННЫЙ_ID_ЗДАНИЯ' --view-id 'ПРОВЕРЕННЫЙ_ID_ВИДА' \
+  --modes pair fixed_context agent --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-all-fixes-001"
 ```
 
 Вместо реальной пары доступен `smoke --kind models` с тремя процедурными изображениями.
@@ -225,8 +255,8 @@ Qwen/SAM3 используют свои заданные интерпретат�
 5. Принудительная последовательность настоящих вызовов Qwen → SAM3 → Qwen:
 
 ```bash
-"$PY" -m facade_change.agentic smoke --config "$CFG" --kind handoff \
-  --out "$RUNS/2026-11-08-agentic-handoff-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic smoke --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --kind handoff \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-handoff-fixes-001"
 ```
 
 Синтетический цветной участок проверяет передачу ресурсов, не обнаружение реальных
@@ -236,8 +266,8 @@ Qwen/SAM3 используют свои заданные интерпретат�
 6. Освобождение Qwen, SAM3 и восстановление Qwen из CPU-сообщений:
 
 ```bash
-"$PY" -m facade_change.agentic smoke --config "$CFG" --kind recovery \
-  --out "$RUNS/2026-11-08-agentic-recovery-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic smoke --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --kind recovery \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-recovery-fixes-001"
 ```
 
 Этот вариант принудительно использует sequential и перечитывает сохранённый transcript.
@@ -248,8 +278,8 @@ Qwen/SAM3 используют свои заданные интерпретат�
 7. Максимальный настроенный входной контекст:
 
 ```bash
-"$PY" -m facade_change.agentic smoke --config "$CFG" --kind context \
-  --out "$RUNS/2026-11-08-agentic-context-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic smoke --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --kind context \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-context-fixes-001"
 ```
 
 Заполняются `max_images` и текст до `max_input_tokens` с измерением настоящим процессором.
@@ -262,13 +292,13 @@ Qwen/SAM3 используют свои заданные интерпретат�
 8. Сравнение baseline и трёх режимов, затем отдельный отчёт:
 
 ```bash
-"$PY" -m facade_change.agentic compare \
-  --runs "$RUNS/2026-11-08-agentic-all-001" \
-  --cases "$RUNS/2026-11-08-agentic-all-001/input_manifest.json" \
-  --out "$RUNS/2026-11-08-agentic-comparison-001"
-"$PY" -m facade_change.agentic report \
-  --run "$RUNS/2026-11-08-agentic-all-001" \
-  --out "$RUNS/2026-11-08-agentic-report-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic compare \
+  --runs "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-all-fixes-001" \
+  --cases "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-all-fixes-001/input_manifest.json" \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-comparison-fixes-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic report \
+  --run "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-all-fixes-001" \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-report-fixes-001"
 ```
 
 `--labels /абсолютный/labels.json` добавляется только к `compare`. Без него precision,
@@ -276,6 +306,13 @@ recall и IoU неизвестны; таблицы состояния и зат�
 `{"label_scope":"region_temporal_change","provenance":{...},"cases":[{"case_id":"...","change":true}]}`.
 Неизвестное изменение — `null`. Для пиксельного сравнения нужны реальные `mask_path`,
 `support_path`, `mask_task:"temporal_change"` и совпадающая `coordinate_system`.
+На общей решётке используйте `coordinate_system:"region_crop_pixels"`: она подходит
+и для baseline-маски, и для bbox VLM. Эквивалентное старое имя `canonical_crop`
+также принимается. Для native-координат обязательно укажите владельца решётки;
+оцениватель не подменяет одно изображение другим по совпадению размеров.
+Для старой разметки кропов без `region_id` область берётся из фиксированного случая;
+явно указанный чужой `region_id` отклоняется. Native-владелец требуется и в разметке,
+и в предсказании.
 Текст Qwen и семантическая маска SAM3 не превращаются автоматически в temporal mask.
 
 Когорта берётся из входного manifest, независимо от успешности подготовки. Неподготовленные
@@ -290,6 +327,13 @@ Jina использует реальные `encode_image` / `encode_text(task="r
 локальные веса и закреплённый удалённый код. Нужны `torch`, `transformers`,
 `huggingface_hub`, `einops`, `timm`, Pillow и зависимости закреплённой реализации.
 Flash-attention/xformers по умолчанию отключены. Адаптер не устанавливает пакеты.
+`models.jina.max_text_tokens` по умолчанию равен 512; эффективный предел — минимум
+этого значения, `tokenizer.model_max_length` и 8192. До кодирования считается полный
+текст со специальными токенами и префиксом инструкции для `retrieval.query`, полученным
+из закреплённой модели. Encoder получает явные `max_length`, `truncation=False`,
+`padding=True`, `add_special_tokens=True`: превышение отклоняется, текст не усекается
+молча. Политика входит в provenance, описание пространства и идентичность кеша.
+Больший явно настроенный предел требует локальной проверки настоящей модели и памяти.
 Кроме весов `jinaai/jina-clip-v2` нужны локальные code/config snapshots:
 
 | Ресурс | Revision |
@@ -305,14 +349,13 @@ Flash-attention/xformers по умолчанию отключены. Адапт�
 Индекс, содержащий только целевую пару, корректно даст пустой результат после исключений.
 
 ```bash
-"$PY" -m facade_change.agentic check --config "$CFG" --roles jina --load-model \
-  --out "$RUNS/2026-11-08-agentic-jina-check-001"
-: "${CUTOFF:?Дата доступности корпуса YYYY-MM-DD}"
-"$PY" -m facade_change.agentic index --config "$CFG" --encoder jina \
-  --cutoff "$CUTOFF" --out "$RUNS/2026-11-08-agentic-jina-index-001"
-"$PY" -m facade_change.agentic search --config "$CFG" --encoder jina \
-  --query 'crack in plaster' --cutoff "$CUTOFF" --exclude-building "$BUILDING_ID" \
-  --out "$RUNS/2026-11-08-agentic-jina-query-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic check --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --roles jina --load-model \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-jina-check-fixes-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic index --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --encoder jina \
+  --cutoff 'ПОДТВЕРЖДЁННАЯ_ДАТА_CUTOFF' --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-jina-index-fixes-001"
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic search --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --encoder jina \
+  --query 'crack in plaster' --cutoff 'ПОДТВЕРЖДЁННАЯ_ДАТА_CUTOFF' --exclude-building 'ПРОВЕРЕННЫЙ_ID_ЗДАНИЯ' \
+  --out "/home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-jina-query-fixes-001"
 ```
 
 Для автоматического получения query-вектора агентом задайте
@@ -320,7 +363,7 @@ Flash-attention/xformers по умолчанию отключены. Адапт�
 `history_features.DinoEncoder`; `--retrieval-encoder dino` и `index --encoder dino`
 требуют корректной секции `models.dino` из существующего methods config. Импорт готовых
 DINO features не требует вычисления новых векторов. Текстовый поиск без Jina:
-`search --config "$CFG" --query 'crack' --cutoff "$CUTOFF"`.
+`search --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-08-agentic-fixes.local.json --query 'crack' --cutoff 'ПОДТВЕРЖДЁННАЯ_ДАТА_CUTOFF'`.
 
 ## Артефакты и проверка в Cloud
 
@@ -343,9 +386,9 @@ retrieval, SAM3 и retry входят в расходы режима. Непом
 Доступный CPU-пример без моделей:
 
 ```bash
-"$PY" -m facade_change.agentic smoke --kind cpu \
-  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-cpu-001
-"$PY" -s -B -m unittest discover -s tests -v
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -m facade_change.agentic smoke --kind cpu \
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-08-agentic-cpu-fixes-001
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -s -B -m unittest discover -s tests -v
 ```
 
 CPU smoke действительно выполняет SIFT, SSIM, LZMA на трёх процедурных RGB и двух
