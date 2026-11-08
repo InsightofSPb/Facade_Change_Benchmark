@@ -32,7 +32,7 @@ def slice_targets(data, arrays):
     return np.stack(result)
 
 
-def merged_blocks(data, samples, prediction, native_flags, block_size=256):
+def merged_blocks(data, samples, prediction, native_flags, block_size=256, logit_channels=()):
     """Yield jointly merged channels before any nonlinear fusion or threshold."""
     grouped = defaultdict(list)
     for sample in samples:
@@ -41,6 +41,9 @@ def merged_blocks(data, samples, prediction, native_flags, block_size=256):
     flags = list(native_flags)
     if not flags or block_size < 1:
         raise ValueError("Need channels and a positive block size")
+    if any(i < 0 or i >= len(flags) or flags[i] for i in logit_channels):
+        raise ValueError("Logit channels must be continuous channels in the supplied array")
+    bounded = [i for i in range(len(flags)) if i not in logit_channels]
     for key, rows in sorted(grouped.items()):
         blocks = defaultdict(list)
         for row in rows:
@@ -60,7 +63,7 @@ def merged_blocks(data, samples, prediction, native_flags, block_size=256):
                 if (values.shape != (len(flags), *common.shape)
                         or available.dtype != bool or available.shape != common.shape
                         or np.any(common & ~available) or not np.isfinite(values[:, common]).all()
-                        or np.any(values[:, common] < 0) or np.any(values[:, common] > 1)):
+                        or np.any(values[bounded][:, common] < 0) or np.any(values[bounded][:, common] > 1)):
                     raise ValueError("A method/mode lacks scores on the fixed common evaluation support")
                 for channel, is_native in enumerate(flags):
                     if is_native and not np.isin(values[channel, common], (0, 1)).all():

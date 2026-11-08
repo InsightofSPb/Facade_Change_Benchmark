@@ -10,6 +10,8 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "history-fusion":
         return importlib.import_module("data_analysis.2026-11-06_history_fusion").main(argv[1:])
+    if argv and argv[0] == "variability-memory":
+        return importlib.import_module("data_analysis.2026-11-08_variability_memory").main(argv[1:])
     from .runner import run_analysis
 
     parser = argparse.ArgumentParser(description=__doc__)

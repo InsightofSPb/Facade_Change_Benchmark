@@ -21,6 +21,7 @@ METHODS, MODES = benchmark.METHODS, benchmark.MODES
 DATE = "2026-11-06"
 PREFIX = DATE + "_"
 SPLITS = ("train", "val", "test")
+training = importlib.import_module("data_analysis.2026-11-08_fusion_training")
 
 
 class Source:
@@ -164,7 +165,10 @@ def semantic_context(source, store, device=None):
     return dict(observations=done, events=len(data.samples), newly_computed=computed, target_labels_used=False)
 
 
-def training_sample(source, store, limit, seed):
+def training_sample(source, store, limit, seed, context=None):
+    context = store if context is None else context
+    if limit == 0:
+        return training.all_pixels(source, store, context)
     unit_id = PREFIX + "train-sample"
     cached = store.read_unit(unit_id)
     if cached:
@@ -174,7 +178,7 @@ def training_sample(source, store, limit, seed):
         rng = np.random.default_rng(int(digest([seed, building])[:16], 16))
         chosen_x, chosen_y, keys = None, None, np.empty(0)
         samples = [s for s in source.data.samples if s["building_id"] == building]
-        for _, _, scores, truth, geometric, _ in source.blocks(samples, store):
+        for _, _, scores, truth, geometric, _ in source.blocks(samples, context):
             valid = geometric & (truth[0] != 255)
             x = scores[:, valid].T.astype(np.float32)
             y = truth[0, valid]
@@ -292,16 +296,22 @@ def fit_models(source, store, specifications, sample, l2):
     class_index = {c["name"]: i for i, c in enumerate(source.data.categories)}
     groups = [[class_index[name] for name in group["categories"]] for group in source.data.groups]
     raw = sample["x"][:, :len(source.columns)]
-    low, high = np.quantile(raw, [.01, .99], axis=0)
+    # A single column at a time also bounds the quantile workspace for memmaps.
+    low, high = np.array([np.quantile(raw[:, i], [.01, .99])
+                          for i in range(raw.shape[1])]).T
     for i, native in enumerate(source.native):
         if native:
             low[i], high[i] = 0, 1
     normalizer = dict(low=low, high=high)
-    normalized = normalize(raw, normalizer)
-    context = sample["x"][:, len(source.columns):]
-    unique, counts = np.unique(sample["buildings"], return_counts=True)
-    weights = {b: 1 / n for b, n in zip(unique, counts)}
-    sample_weight = np.array([weights[b] for b in sample["buildings"]])
+    streaming = "ranges" in sample
+    if not streaming:
+        normalized = normalize(raw, normalizer)
+        context = sample["x"][:, len(source.columns):]
+        unique, counts = np.unique(sample["buildings"], return_counts=True)
+        weights = {b: 1 / n for b, n in zip(unique, counts)}
+        sample_weight = np.array([weights[b] for b in sample["buildings"]])
+    sample_hash = (sample["pixels_sha256"] if streaming
+                   else digest(sample["buildings"].tolist()))
     models = {}
     for item in specifications:
         if not item["kind"].startswith("stack"):
@@ -312,10 +322,14 @@ def fit_models(source, store, specifications, sample, l2):
             models[item["id"]] = cached[1]
             continue
         print(f"Fit TRAIN: {item['id']}", flush=True)
-        x = design(normalized, context, item, groups)
-        model = fit_logistic(x, sample["y"], sample_weight, l2)
+        if streaming:
+            import sys
+            model = training.fit_streaming(sample, normalizer, item, groups, sys.modules[__name__], l2)
+        else:
+            x = design(normalized, context, item, groups)
+            model = fit_logistic(x, sample["y"], sample_weight, l2)
         store.save_unit(dict(unit_id=unit_id, kind="logistic_fusion", split="train",
-            variant=item, l2=l2, sample_sha256=digest(sample["buildings"].tolist()),
+            variant=item, l2=l2, sample_sha256=sample_hash,
             weighting="equal total weight per building; no class rebalancing"), model)
         models[item["id"]] = model
     return normalizer, groups, models
@@ -342,9 +356,10 @@ def predict(raw, context, item, normalizer, groups, models, component_thresholds
     return expit(logits)
 
 
-def building_histograms(source, store, specifications, normalizer, groups, models, split):
+def building_histograms(source, store, specifications, normalizer, groups, models, split, context=None):
     """One building in memory; completed histogram units survive interruption."""
     result, overall = [], {}
+    context_reader = store if context is None else context
     thresholds = np.array([source.thresholds[m][mode]["threshold"] for mode, m in source.columns])
     for building in sorted(b for b, part in source.assignments.items() if part == split):
         unit_id = PREFIX + "hist-" + split + "-" + digest(building)[:20]
@@ -356,7 +371,7 @@ def building_histograms(source, store, specifications, normalizer, groups, model
         else:
             hist = np.zeros((len(specifications), len(metrics.slices(source.data)), 2, metrics.BINS), np.int64)
             samples = [s for s in source.data.samples if s["building_id"] == building]
-            for block_number, (_, _, scores, truth, geometric, _) in enumerate(source.blocks(samples, store), 1):
+            for block_number, (_, _, scores, truth, geometric, _) in enumerate(source.blocks(samples, context_reader), 1):
                 valid = geometric & np.any(truth != 255, axis=0)
                 if not valid.any():
                     continue
@@ -453,12 +468,22 @@ def select_fpr_thresholds(specifications, overall, selected, budget=.05):
 
 
 def operating_points(store, specifications, units, selected, split, budget=.05):
+    import csv
+
     values = defaultdict(list)
+    details = []
     for building, unit_id in units:
         histograms = store.read_unit(unit_id)[1]["histograms"]
         for i, item in enumerate(specifications):
-            values[item["id"]].append(metrics.metrics(
-                histograms[i, 0], selected[item["id"]]["threshold"], item["native"]))
+            result = metrics.metrics(histograms[i, 0], selected[item["id"]]["threshold"], item["native"])
+            values[item["id"]].append(result)
+            details.append(dict(method=item["method"], mode=item["mode"], split=split,
+                building_id=building, threshold=selected[item["id"]]["threshold"], **result))
+    with (store.out / ("2026-11-08_fpr05_per_building-" + split + ".csv")).open(
+            "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(details[0]))
+        writer.writeheader()
+        writer.writerows(details)
     rows = []
     for item in specifications:
         row = dict(method=item["method"], mode=item["mode"], split=split,
@@ -467,6 +492,11 @@ def operating_points(store, specifications, units, selected, split, budget=.05):
         for name in metrics.METRICS:
             numbers = [r[name] for r in values[item["id"]] if r[name] is not None]
             row[name] = float(np.mean(numbers)) if numbers else None
+            row[name + "_buildings"] = len(numbers)
+        for name in ("f1", "iou"):
+            positive = [r[name] for r in values[item["id"]] if r["positive_pixels"] > 0]
+            row[name + "_positive"] = float(np.mean(positive)) if positive else None
+            row[name + "_positive_buildings"] = len(positive)
         row["actual_fpr_within_budget"] = row["fpr"] is not None and row["fpr"] <= budget + 1e-12
         rows.append(row)
     return rows
@@ -587,11 +617,17 @@ def run(args):
         raise ValueError("Output must be separate from the original run")
     if out == source.data.root or out in source.data.root.parents or source.data.root in out.parents:
         raise ValueError("Output must be separate from preparation")
-    if args.sample_per_building < 1 or args.l2 <= 0:
-        raise ValueError("--sample-per-building and --l2 must be positive")
+    if args.sample_per_building < 0 or args.l2 <= 0:
+        raise ValueError("--sample-per-building must be >= 0 (0 means all); --l2 must be positive")
     config = dict(source=str(source.root), source_sha256=source.hashes,
         seed=args.seed, sample_per_building=args.sample_per_building, l2=args.l2,
         semantic_device=args.semantic_device, all_pairs=args.all_pairs)
+    cached_context = None
+    if getattr(args, "semantic_cache", None):
+        cached_context = training.SemanticCache(args.semantic_cache, source)
+        if out == cached_context.out or out in cached_context.out.parents or cached_context.out in out.parents:
+            raise ValueError("Output must be separate from the read-only semantic cache")
+        config.update(semantic_cache=str(cached_context.out), semantic_cache_sha256=cached_context.hashes)
     if (out / "run.json").exists() and read_json(out / "run.json").get("status") == "completed":
         if read_json(out / "request.json") != config:
             raise ValueError("Completed output has different inputs/options; choose a new --out")
@@ -612,19 +648,24 @@ def run(args):
         store.contract(dict(protocol="canonical-history-fusion-v1", config=config,
             prepared_sha256=source.data.fp.files[str(source.data.root / "index.json")],
             code={Path(__file__).name: sha256(__file__), Path(metrics.__file__).name: sha256(metrics.__file__),
-                  semantic_file.name: sha256(semantic_file)},
+                  semantic_file.name: sha256(semantic_file), Path(training.__file__).name: sha256(training.__file__)},
             numeric_environment=dict(numpy=np.__version__, scipy=scipy.__version__),
             variants=specifications, fit_split="train", threshold_split="val",
             test_previously_inspected=True, checkpoint_exposure=source.summary.get("checkpoint_exposure", {}),
             semantic_input="max endpoint sigmoid; EARLIEST uses first/current, others previous/current",
             test_used_for_fit=False, target_scope=source.summary["target_scope"]))
-        context = semantic_context(source, store, args.semantic_device)
-        sample = training_sample(source, store, args.sample_per_building, args.seed)
+        if cached_context:
+            context = dict(observations=len(source.data.observations), events=len(source.data.samples),
+                           newly_computed=0, target_labels_used=False, reused_from=str(cached_context.out))
+        else:
+            context = semantic_context(source, store, args.semantic_device)
+        context_reader = cached_context or store
+        sample = training_sample(source, store, args.sample_per_building, args.seed, context_reader)
         normalizer, groups, models = fit_models(source, store, specifications, sample, args.l2)
         write_json(out / (PREFIX + "normalizer.json"),
                    {k: v.tolist() for k, v in normalizer.items()})
         val_units, overall = building_histograms(
-            source, store, specifications, normalizer, groups, models, "val")
+            source, store, specifications, normalizer, groups, models, "val", context_reader)
         selected = select_thresholds(source, specifications, overall)
         write_json(out / (PREFIX + "thresholds.json"), selected)
         fpr_selected = select_fpr_thresholds(specifications, overall, selected)
@@ -638,7 +679,8 @@ def run(args):
         write_json(out / (PREFIX + "selection.json"), selection)
         store.event("selection_frozen_before_test", selection=selection)
         for split in ("train", "test"):
-            units, _ = building_histograms(source, store, specifications, normalizer, groups, models, split)
+            units, _ = building_histograms(source, store, specifications, normalizer, groups, models, split,
+                                          context_reader)
             a, r = reports(source, store, specifications, units, selected, split)
             aggregates.extend(a)
             rows.extend(r)
@@ -646,6 +688,8 @@ def run(args):
         parity = check_baseline_parity(source, aggregates, rows)
         deltas, baseline = comparisons(aggregates, rows, args.seed)
         source.verify()
+        if cached_context:
+            cached_context.verify()
         summary = dict(kind="canonical_history_fusion", status="completed",
             source=str(source.root), source_sha256=source.hashes, variants=len(specifications),
             rows=len(aggregates), context=context, selection=selection, baseline=baseline,
@@ -671,7 +715,8 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="New analysis directory, separate from source")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--semantic-device", help="Default: same device as the source run")
-    parser.add_argument("--sample-per-building", type=int, default=4000)
+    parser.add_argument("--sample-per-building", type=int, default=4000, help="0: all known TRAIN pixels")
+    parser.add_argument("--semantic-cache", help="Read-only completed fusion run; prohibit semantic inference")
     parser.add_argument("--l2", type=float, default=.01, help="Fixed TRAIN ridge penalty, not TEST tuned")
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--all-pairs", action="store_true", help="Add every unordered pair of seven methods")
