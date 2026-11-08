@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 
-from facade_change.io import read_json, write_json
+from facade_change.io import read_json, sha256, write_json
 
 fusion = importlib.import_module("data_analysis.2026-11-06_history_fusion")
 memory = importlib.import_module("data_analysis.2026-11-08_variability_memory")
@@ -19,6 +19,31 @@ original = previous_tests.original
 
 
 class StreamingTests(unittest.TestCase):
+    def test_progress_resume_accepts_only_the_pinned_code_transition(self):
+        migration = read_json(Path(memory.__file__).with_name("2026-11-08_memory_progress_compatibility.json"))
+        runner = Path(memory.__file__).name
+        current = dict(protocol="canonical-variability-memory-v1", config=dict(epochs=10),
+                       code={runner: sha256(memory.__file__), "model.py": "unchanged"})
+        self.assertEqual(current["code"][runner], migration["after_sha256"])
+        legacy = {**current, "code": {**current["code"], runner: migration["before_sha256"]}}
+        with tempfile.TemporaryDirectory() as directory:
+            store = fusion.data_module.Store(Path(directory) / "resume", current["config"])
+            try:
+                store.contract(legacy)
+                before = (store.out / "experiment_contract.json").read_bytes()
+                memory.pin_contract(store, current)
+                self.assertEqual(before, (store.out / "experiment_contract.json").read_bytes())
+                events = (store.out / "events.jsonl").read_text()
+                self.assertIn("progress_only_code_update", events)
+                for changed in (
+                        {**current, "config": dict(epochs=30)},
+                        {**current, "code": {**current["code"], "model.py": "changed"}},
+                        {**current, "code": {**current["code"], runner: "future-non-progress-edit"}}):
+                    with self.assertRaisesRegex(ValueError, "changed"):
+                        memory.pin_contract(store, changed)
+            finally:
+                store.close()
+
     def test_streamed_objective_matches_dense_semantic_interactions(self):
         rng = np.random.default_rng(7)
         raw = rng.random((173, 4)).astype(np.float32)
@@ -175,7 +200,7 @@ class MemoryTests(unittest.TestCase):
                 return dict(observations=len(source.data.observations), procedural_test_double=True)
 
             args = Namespace(run=args.run, fusion=str(root / "fusion"), out=str(root / "memory"),
-                             device="cpu", epochs=1, hidden=4, batch_size=2, lr=.001,
+                             device="cpu", epochs=10, hidden=4, batch_size=2, lr=.001,
                              seeds=[13], history_shift_tokens=[1], resume=False)
             with mock.patch.object(memory, "prepare_features", side_effect=fake_features), mock.patch.object(
                     fusion, "RemoteScorer", side_effect=AssertionError("Detector inference repeated")):
@@ -188,10 +213,16 @@ class MemoryTests(unittest.TestCase):
             status = read_json(root / "memory/run.json")
             status["status"] = "interrupted"
             write_json(root / "memory/run.json", status)
+            contract_path = root / "memory/experiment_contract.json"
+            legacy = read_json(contract_path)
+            migration = read_json(Path(memory.__file__).with_name("2026-11-08_memory_progress_compatibility.json"))
+            legacy["code"][Path(memory.__file__).name] = migration["before_sha256"]
+            write_json(contract_path, legacy)
             args.resume = True
             with mock.patch.object(memory, "prepare_features", side_effect=fake_features):
                 resumed = memory.run(args)
             self.assertEqual(result["results"], resumed["results"])
+            self.assertEqual(read_json(contract_path), legacy)
 
 
 if __name__ == "__main__":

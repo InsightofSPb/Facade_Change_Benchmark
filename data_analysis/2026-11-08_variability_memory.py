@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 import numpy as np
+from tqdm import tqdm
 
 from facade_change import history_features
 from facade_change.io import read_json, sha256, write_json
@@ -20,6 +21,33 @@ fusion = importlib.import_module("data_analysis.2026-11-06_history_fusion")
 benchmark, metrics = fusion.benchmark, fusion.metrics
 PREFIX = "2026-11-08_"
 MODES = ("pair", "mean", "convgru", "convgru-last")
+
+
+def progress(items=None, **options):
+    """Nested terminal bars, with fewer updates and no cursor-up in log files."""
+    terminal = sys.stderr.isatty()
+    if not terminal:
+        options["position"] = 0
+    options.setdefault("leave", False)
+    return tqdm(items, dynamic_ncols=True, mininterval=.5 if terminal else 5., **options)
+
+
+def pin_contract(store, contract):
+    path = store.out / "experiment_contract.json"
+    if path.exists():
+        previous = read_json(path)
+        migration_path = Path(__file__).with_name("2026-11-08_memory_progress_compatibility.json")
+        migration = read_json(migration_path)
+        runner = Path(__file__).name
+        legacy = {**contract, "code": {**contract["code"], runner: migration["before_sha256"]}}
+        # Pin both endpoints: a future scientific edit cannot inherit this exception.
+        if previous == legacy and contract["code"][runner] == migration["after_sha256"]:
+            store.contract(previous)
+            store.event("progress_only_code_update", previous_code=previous["code"],
+                        executing_code=contract["code"], compatibility_sha256=sha256(migration_path),
+                        computation_unchanged=True)
+            return
+    store.contract(contract)
 
 
 class FrozenStack:
@@ -86,26 +114,29 @@ def prepare_features(source, store, device):
     write_json(path, contract)
     encoder, computed = None, 0
     try:
-        for number, identifier in enumerate(sorted(source.data.observations), 1):
-            unit = PREFIX + "features-" + identifier
-            cached = store.read_unit(unit)
-            if cached:
-                if cached[0]["encoder_sha256"] != sha256(path):
-                    raise ValueError("Cached features have a different encoder contract")
-                continue
-            rgb, support = source.data.frame(identifier)
-            valid = history_features.supported_patches(support)
-            if not valid.any():
-                arrays = dict(patch_tokens=np.zeros((256, 384), np.float16), patch_support=valid)
-            else:
-                if encoder is None:
-                    encoder = history_features.DinoEncoder(settings, device, contract)
-                arrays = encoder.encode([rgb], [support], save_patch_tokens=True)[0]
-            store.save_unit(dict(unit_id=unit, kind="frozen_observation_features",
-                observation_id=identifier, encoder_sha256=sha256(path), target_labels_used=False), arrays)
-            computed += 1
-            if number % 25 == 0 or number == len(source.data.observations):
-                print(f"Frozen DINO features: {number}/{len(source.data.observations)}", flush=True)
+        observations = progress(sorted(source.data.observations), desc="Frozen DINO features",
+                                unit="observation", position=1)
+        with observations:
+            for identifier in observations:
+                unit = PREFIX + "features-" + identifier
+                cached = store.read_unit(unit)
+                if cached:
+                    if cached[0]["encoder_sha256"] != sha256(path):
+                        raise ValueError("Cached features have a different encoder contract")
+                    observations.set_postfix(new=computed, refresh=False)
+                    continue
+                rgb, support = source.data.frame(identifier)
+                valid = history_features.supported_patches(support)
+                if not valid.any():
+                    arrays = dict(patch_tokens=np.zeros((256, 384), np.float16), patch_support=valid)
+                else:
+                    if encoder is None:
+                        encoder = history_features.DinoEncoder(settings, device, contract)
+                    arrays = encoder.encode([rgb], [support], save_patch_tokens=True)[0]
+                store.save_unit(dict(unit_id=unit, kind="frozen_observation_features",
+                    observation_id=identifier, encoder_sha256=sha256(path), target_labels_used=False), arrays)
+                computed += 1
+                observations.set_postfix(new=computed, refresh=False)
     finally:
         if encoder:
             encoder.close()
@@ -175,7 +206,7 @@ class Inputs:
         return result & arrays["support"] & (arrays["target"] == 1)
 
 
-def evaluate(inputs, models, split, history_shift=0):
+def evaluate(inputs, models, split, history_shift=0, label=None, position=2):
     """Merge raw scores and correction logits before applying the frozen fusion."""
     import torch
     names = [*fusion.METHODS, "stack", *models]
@@ -199,7 +230,16 @@ def evaluate(inputs, models, split, history_shift=0):
     flags = [m == "anychange" for m in fusion.METHODS] + [False] * len(models) + [True]
     blocks = metrics.merged_blocks(inputs.source.data, samples, lambda row: prediction(row["event_id"]),
                                    flags, logit_channels=range(7, 7 + len(models)))
-    for key, _, scores, truth, geometric, _ in blocks:
+    block_keys = set()
+    for row in samples:
+        x, y, width, height = row["bbox_xywh"]
+        key = tuple(row[k] for k in ("building_id", "view_id", "previous_year", "current_year"))
+        block_keys.update((*key, bx, by)
+                          for bx in range(x // 256, (x + width - 1) // 256 + 1)
+                          for by in range(y // 256, (y + height - 1) // 256 + 1))
+    description = label or f"Evaluate {split.upper()} shift={history_shift}"
+    for key, _, scores, truth, geometric, _ in progress(
+            blocks, total=len(block_keys), desc=description, unit="block", position=position):
         valid = geometric & np.any(truth != 255, axis=0)
         if not valid.any():
             continue
@@ -282,12 +322,15 @@ def train(inputs, store, args, mode, seed):
     counts = Counter(s["building_id"] for s in samples)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
     best, state, best_epoch = (-1., -1.), None, None
-    for epoch in range(1, args.epochs + 1):
+    epochs = progress(range(1, args.epochs + 1), desc=f"{mode} seed={seed}", unit="epoch", position=2)
+    for epoch in epochs:
         order = np.random.default_rng(seed + epoch).permutation(len(samples))
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.
-        for number, index in enumerate(order, 1):
+        batches = progress(order, desc=f"TRAIN {mode} seed={seed} epoch={epoch}/{args.epochs}",
+                           unit="crop", position=3)
+        for number, index in enumerate(batches, 1):
             row = samples[index]
             features = inputs.tensors(row)
             arrays = inputs.source.data.target(row["event_id"])
@@ -303,11 +346,13 @@ def train(inputs, store, args, mode, seed):
             group_size = min(args.batch_size, len(samples) - ((number - 1) // args.batch_size) * args.batch_size)
             (loss / group_size).backward()
             loss_total += float(loss.detach())
+            batches.set_postfix(BCE=f"{loss_total / number:.5f}", refresh=False)
             if number % args.batch_size == 0 or number == len(samples):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-        val = evaluate(inputs, {mode: model}, "val")
+        val = evaluate(inputs, {mode: model}, "val",
+                       label=f"VAL {mode} seed={seed} epoch={epoch}/{args.epochs}", position=3)
         thresholds = calibrate(val, inputs.frozen)
         rows = [metrics.metrics(h[0], thresholds[mode]["threshold"]) for h in val[mode].values()]
         score = fixed_macro(rows)
@@ -317,8 +362,9 @@ def train(inputs, store, args, mode, seed):
             state = {k: v.detach().cpu().numpy().copy() for k, v in model.state_dict().items()}
         store.event("memory_epoch", mode=mode, seed=seed, epoch=epoch,
                     train_bce=loss_total / len(samples), val=score)
-        print(f"{mode} seed={seed} epoch={epoch}/{args.epochs}: BCE={loss_total / len(samples):.6f}, "
-              f"VAL recall={score['recall']:.5f}, FPR={score['fpr']:.5f}", flush=True)
+        epochs.set_postfix(recall=f"{score['recall']:.5f}", FPR=f"{score['fpr']:.5f}", refresh=False)
+        tqdm.write(f"{mode} seed={seed} epoch={epoch}/{args.epochs}: BCE={loss_total / len(samples):.6f}, "
+                   f"VAL recall={score['recall']:.5f}, FPR={score['fpr']:.5f}")
     if state is None:
         raise ValueError("No valid memory checkpoint")
     record = store.save_unit(dict(unit_id=identifier, kind="causal_variability_head", mode=mode, seed=seed,
@@ -373,8 +419,11 @@ def run(args):
             or not args.seeds or len(set(args.seeds)) != len(args.seeds)
             or any(s < 1 or s > 15 for s in args.history_shift_tokens)):
         raise ValueError("Need positive dimensions/epochs/lr and distinct seeds")
-    source = fusion.Source(args.run)
-    frozen = FrozenStack(args.fusion, source)
+    with progress(total=2, desc="Validate source and frozen fusion", unit="input", position=0) as validation:
+        source = fusion.Source(args.run)
+        validation.update(1)
+        frozen = FrozenStack(args.fusion, source)
+        validation.update(1)
     out = Path(args.out).expanduser().resolve()
     for original in (source.root, source.data.root, source.data.history_root, frozen.root):
         if out == original or out in original.parents or original in out.parents:
@@ -406,9 +455,10 @@ def run(args):
     store = fusion.data_module.Store(out, config, resume=args.resume)
     store.record["kind"] = "canonical_variability_memory"
     write_json(out / "run.json", store.record)
+    stages = progress(total=4, desc="Memory 1/4: frozen features", unit="stage", position=0, leave=True)
     try:
         model_module = importlib.import_module("facade_change.research.2026-11-08_variability_memory_model")
-        store.contract(dict(protocol="canonical-variability-memory-v1", config=config,
+        pin_contract(store, dict(protocol="canonical-variability-memory-v1", config=config,
             code={Path(path).name: sha256(path) for path in
                   (__file__, model_module.__file__, metrics.__file__, fusion.__file__, history_features.__file__,
                    fusion.data_module.__file__, importlib.import_module(
@@ -422,38 +472,57 @@ def run(args):
             f1_cohort="fixed GT-positive facades; negative-only facades retained for FPR",
             training_caveat="crop BCE may repeat overlap pixels; evaluation merges them exactly"))
         features = prepare_features(source, store, args.device)
+        stages.update(1)
+        stages.set_description("Memory 2/4: train heads")
         inputs = Inputs(source, store, frozen, args.device)
         checkpoints = []
-        for seed in args.seeds:
-            for mode in MODES:
-                model, record = train(inputs, store, args, mode, seed)
-                checkpoints.append({k: record[k] for k in ("unit_id", "mode", "seed", "selected_epoch", "parameters")})
-                del model
+        with progress(total=len(args.seeds) * len(MODES), desc="Train heads", unit="model", position=1) as heads:
+            for seed in args.seeds:
+                for mode in MODES:
+                    heads.set_description(f"Train heads: {mode} seed={seed}")
+                    model, record = train(inputs, store, args, mode, seed)
+                    checkpoints.append({k: record[k] for k in
+                                        ("unit_id", "mode", "seed", "selected_epoch", "parameters")})
+                    del model
+                    heads.update(1)
         store.event("all_memory_checkpoints_frozen_before_test", checkpoints=checkpoints)
+        stages.update(1)
+        stages.set_description("Memory 3/4: final evaluation")
         aggregate, rows, robustness, returns = [], [], [], []
-        for seed in args.seeds:
-            models = {mode: load_model(store, PREFIX + f"model-{mode}-{seed}", args, mode)[0] for mode in MODES}
-            val = evaluate(inputs, models, "val")
-            thresholds = calibrate(val, frozen)
-            write_json(out / (PREFIX + f"thresholds-{seed}.json"), thresholds)
-            for split in ("val", "train", "test"):
-                hist = val if split == "val" else evaluate(inputs, models, split)
-                frozen.parity(hist["stack"], split)
-                a, r = reporting(source.data, hist, thresholds, split, seed)
-                aggregate.extend(a)
-                rows.extend(r)
-                for name, buildings in hist.items():
-                    for building, histogram in buildings.items():
-                        value = metrics.metrics(histogram[-1], thresholds[name]["threshold"], name == "anychange")
-                        returns.append(dict(method=name, seed=seed, split=split, building_id=building,
-                            threshold=thresholds[name]["threshold"], candidate_pixels=value["positive_pixels"],
-                            detected_pixels=value["tp"], recall=value["recall"],
-                            scope="annotation-matched return to a known older state; not reviewed events"))
-            for shift in args.history_shift_tokens:
-                hist = evaluate(inputs, models, "test", history_shift=shift)
-                a, _ = reporting(source.data, hist, thresholds, "test", seed)
-                robustness.extend(dict(history_shift_tokens=shift, approximate_pixels=14 * shift, **r) for r in a)
-            del models
+        with progress(total=len(args.seeds) * (3 + len(args.history_shift_tokens)),
+                      desc="Final evaluation", unit="split", position=1) as evaluations:
+            for seed in args.seeds:
+                models = {mode: load_model(store, PREFIX + f"model-{mode}-{seed}", args, mode)[0] for mode in MODES}
+                evaluations.set_description(f"Final evaluation seed={seed} VAL")
+                val = evaluate(inputs, models, "val", label=f"Final VAL seed={seed}")
+                thresholds = calibrate(val, frozen)
+                write_json(out / (PREFIX + f"thresholds-{seed}.json"), thresholds)
+                for split in ("val", "train", "test"):
+                    evaluations.set_description(f"Final evaluation seed={seed} {split.upper()}")
+                    hist = val if split == "val" else evaluate(
+                        inputs, models, split, label=f"Final {split.upper()} seed={seed}")
+                    frozen.parity(hist["stack"], split)
+                    a, r = reporting(source.data, hist, thresholds, split, seed)
+                    aggregate.extend(a)
+                    rows.extend(r)
+                    for name, buildings in hist.items():
+                        for building, histogram in buildings.items():
+                            value = metrics.metrics(histogram[-1], thresholds[name]["threshold"], name == "anychange")
+                            returns.append(dict(method=name, seed=seed, split=split, building_id=building,
+                                threshold=thresholds[name]["threshold"], candidate_pixels=value["positive_pixels"],
+                                detected_pixels=value["tp"], recall=value["recall"],
+                                scope="annotation-matched return to a known older state; not reviewed events"))
+                    evaluations.update(1)
+                for shift in args.history_shift_tokens:
+                    evaluations.set_description(f"History shift={shift} seed={seed}")
+                    hist = evaluate(inputs, models, "test", history_shift=shift,
+                                    label=f"TEST shift={shift} seed={seed}")
+                    a, _ = reporting(source.data, hist, thresholds, "test", seed)
+                    robustness.extend(dict(history_shift_tokens=shift, approximate_pixels=14 * shift, **r) for r in a)
+                    evaluations.update(1)
+                del models
+        stages.update(1)
+        stages.set_description("Memory 4/4: reports and verification")
         comparisons = paired_comparisons(rows, args.seeds)
         write_csv(out / (PREFIX + "metrics.csv"), aggregate)
         write_csv(out / (PREFIX + "per_building.csv"), rows)
@@ -477,13 +546,15 @@ def run(args):
                              f"F1={row['f1']:.5f} recall={row['recall']:.5f} FPR={row['fpr']:.5f}")
         report = "\n".join(lines) + "\n"
         (out / (PREFIX + "report.txt")).write_text(report, encoding="utf-8")
-        print(report, flush=True)
+        tqdm.write(report)
         store.finish("completed", summary_sha256=sha256(out / (PREFIX + "summary.json")))
+        stages.update(1)
         return summary
     except BaseException as exc:
         store.finish("interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", error=str(exc))
         raise
     finally:
+        stages.close()
         store.close()
 
 
