@@ -28,9 +28,21 @@ def source_snapshot():
     return result
 
 
-def new_run(out, config, kind):
+def new_run(out, config, kind, progress=None):
     module = importlib.import_module("facade_change.2026-10-14_temporal_experiment")
     journal = module.RunStore(out, config, resume=False)
+    if progress is not None:
+        record_event = journal.event
+
+        def observed_event(kind, **values):
+            record = record_event(kind, **values)
+            try:
+                progress(kind, **values)
+            except Exception:
+                pass  # Terminal diagnostics must not change the recorded run.
+            return record
+
+        journal.event = observed_event
     journal.record["kind"] = kind
     write_json(journal.out / "run.json", journal.record)
     write_json(journal.out / "config.json", config)
@@ -65,7 +77,7 @@ def _case_id(spec):
     return digest(identity)[:24]
 
 
-def run_cases(config, pairs, out, *, pool_factory=None):
+def run_cases(config, pairs, out, *, pool_factory=None, progress=None):
     """Prepare once; free detector workers before starting any VLM worker.
 
     A failed case remains in the fixed cohort and report. No model error can
@@ -87,21 +99,32 @@ def run_cases(config, pairs, out, *, pool_factory=None):
     if len(set(identifiers)) != len(identifiers):
         raise ValueError("Duplicate pair IDs in fixed cohort")
     config = copy.deepcopy(config)
-    journal = new_run(out, config, "agentic_facade_analysis")
+    journal = new_run(out, config, "agentic_facade_analysis", progress=progress)
     started = time.monotonic()
     case_records, manifest_cases, errors = [], [], []
+    counts = {"completed": 0, "abstained": 0, "error": 0}
+
+    def count(status, amount=1):
+        key = status if status in counts else "error"
+        counts[key] += amount
+
     try:
         with RegionStore(config["store_root"]) as regions:
-            for identifier, supplied in zip(identifiers, pairs):
+            for case_index, (identifier, supplied) in enumerate(zip(identifiers, pairs), 1):
                 spec = {**supplied, "case_id": identifier}
                 case_dir = journal.out / "cases" / identifier
-                journal.event("case_started", case_id=identifier)
+                preparation_started = time.monotonic()
+                journal.event("case_started", case_id=identifier, index=case_index, total=len(pairs))
                 try:
                     case = prepare_case(config, spec, case_dir, regions)
                     case["case_id"] = identifier
                     write_json(case_dir / "case.json", case)
                     journal.event("case_prepared", case_id=identifier,
-                                  artifact_sha256=sha256(case_dir / "case.json"))
+                                  artifact_sha256=sha256(case_dir / "case.json"), status=case.get("status"),
+                                  elapsed_seconds=time.monotonic()-preparation_started,
+                                  limitations=case.get("limitations"),
+                                  error=[value for value in [case.get("baseline", {}).get("error"),
+                                      *(row.get("error") for row in case.get("maps", []))] if value])
                     if case.get("status") in {"error", "failed", "completed_with_errors"}:
                         errors.append({"case_id": identifier, "stage": "prepare", "status": case["status"],
                                        "limitations": case.get("limitations", [])})
@@ -114,8 +137,11 @@ def run_cases(config, pairs, out, *, pool_factory=None):
                             "limitations": [f"{type(exc).__name__}: {exc}"]}
                     write_json(case_dir / "case.json", case)
                     errors.append({"case_id": identifier, "stage": "prepare", "error": str(exc)})
-                    journal.event("case_failed", case_id=identifier, error=str(exc))
+                    journal.event("case_failed", case_id=identifier, error=str(exc),
+                                  elapsed_seconds=time.monotonic()-preparation_started)
                 case_records.append(case)
+                if not config["modes"]:
+                    count(case.get("status"))
                 # Freeze the cohort independently of success, failure or produced observation IDs.
                 manifest_cases.append({"case_id": identifier, "building_id": supplied["building_id"],
                     "view_id": supplied["view_id"], "split": supplied.get("split", "unassigned"),
@@ -133,12 +159,16 @@ def run_cases(config, pairs, out, *, pool_factory=None):
             model_pool = (pool_factory or ModelPool)(config["models"], journal.out / "worker_logs",
                 gpu_mode=config["gpu_mode"], timeout=config["worker_timeout"],
                 cache_dir=Path(config["cache_root"]) / "models")
+            if hasattr(model_pool, "progress"):
+                model_pool.progress = journal.event
             try:
                 for case in case_records:
                     if case.get("status") in {"error", "failed"} or not case.get("source_observation_id"):
+                        count("error", len(config["modes"]))
                         continue
                     for mode in config["modes"]:
                         mode_started = time.monotonic()
+                        journal.event("mode_started", case_id=case["case_id"], mode=mode)
                         mode_out = journal.out / "cases" / case["case_id"] / "modes" / mode
                         mode_out.mkdir(parents=True, exist_ok=False)
                         service = ToolService(regions, index, knowledge, model_pool, case, mode_out,
@@ -148,7 +178,11 @@ def run_cases(config, pairs, out, *, pool_factory=None):
                             result = run_reasoning(mode, case, service, model_pool, mode_out,
                                 budgets=config["budgets"], event=journal.event)
                             journal.event("mode_completed", case_id=case["case_id"], mode=mode,
-                                          status=result.get("status"), decision=result.get("decision"))
+                                          status=result.get("status"), decision=result.get("decision"),
+                                          reason=result.get("reason"), error=result.get("error"),
+                                          limitations=result.get("limitations"),
+                                          elapsed_seconds=time.monotonic()-mode_started)
+                            count(result.get("status"))
                             if result.get("status") in {"error", "failed"}:
                                 errors.append({"case_id": case["case_id"], "mode": mode,
                                                "status": result["status"], "limitations": result.get("limitations", [])})
@@ -159,7 +193,9 @@ def run_cases(config, pairs, out, *, pool_factory=None):
                                 "case_id": case["case_id"], "region_id": case.get("region_id"),
                                 "decision": "insufficient_data", "evidence_ids": [],
                                 "limitations": [error]})
-                            journal.event("mode_failed", case_id=case["case_id"], mode=mode, error=error)
+                            count("error")
+                            journal.event("mode_failed", case_id=case["case_id"], mode=mode, error=error,
+                                          elapsed_seconds=time.monotonic()-mode_started)
                         finally:
                             # Same initial live-model state for every mode. Durable input-bound caches remain explicit.
                             model_pool.close()
@@ -177,8 +213,11 @@ def run_cases(config, pairs, out, *, pool_factory=None):
                    "real_vlm_requested": bool(config["modes"]),
                    "cost_scope": "shared preparation once; each mode's incremental interpretation and tools",
                    "cost_regime": "workers unloaded between modes; explicit content-bound caches may be warm",
+                   "outcome_counts": counts, "count_unit": "режимы" if config["modes"] else "случаи",
+                   "report_path": str(journal.out / "report/report.html"),
                    "scope": "Configured model execution; quality requires separate labelled evaluation"}
         write_json(journal.out / "summary.json", summary)
+        journal.event("report_started", report_path=summary["report_path"])
         render_report(journal.out)
         complete_run(journal, "completed_with_errors" if errors else "completed", summary=summary)
         return summary

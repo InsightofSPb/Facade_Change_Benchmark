@@ -406,7 +406,9 @@ def run_reasoning(mode, case, tools, model_pool, out, budgets=None, event=None, 
             "parameters": {"mode": mode, "budgets": config}, "artifacts": []})
         result["hypothesis_evidence_id"] = hypothesis["evidence_id"]
         state.update(phase="done", result=result)
-        trace("completed", status=result["status"], decision=result["decision"])
+        trace("completed", status=result["status"], decision=result["decision"],
+              reason=result.get("reason"), error=result.get("error"),
+              limitations=result.get("limitations", []), elapsed_seconds=elapsed())
         persist()
         write_json(destination / "result.json", result)
         return result
@@ -424,7 +426,9 @@ def run_reasoning(mode, case, tools, model_pool, out, budgets=None, event=None, 
         persist()
         trace("tool_requested", name=name, arguments=arguments)
         tools.remaining_model_calls = config["max_model_calls"] - state["costs"]["model_requests"]
+        tool_started = time.monotonic()
         result = tools.execute(name, arguments, timeout_seconds=config["max_seconds"] - elapsed())
+        tool_elapsed = time.monotonic() - tool_started
         state["costs"]["tool_calls"] += 1
         state["actions"][key] = state["actions"].get(key, 0) + 1
         account("tool", result.get("usage"), name=name, status=result["status"], source_usage=result.get("source_usage"))
@@ -438,7 +442,8 @@ def run_reasoning(mode, case, tools, model_pool, out, budgets=None, event=None, 
         state["phase"] = "ready"
         trace("tool_returned", name=name, arguments=arguments, status=result["status"],
               evidence_ids=[row["evidence_id"] for row in result.get("evidence", ())],
-              usage=result.get("usage", {}), error=result.get("error"))
+              usage=result.get("usage", {}), error=result.get("error"), reason=result.get("reason"),
+              limitations=result.get("limitations", []), elapsed_seconds=tool_elapsed)
         persist()
         return result, None
 
@@ -478,18 +483,23 @@ def run_reasoning(mode, case, tools, model_pool, out, budgets=None, event=None, 
         state["phase"] = "qwen_pending"
         state["request_sha256"] = digest({key: value for key, value in request.items() if key != "timeout_seconds"})
         persist()
-        trace("model_requested", request_sha256=state["request_sha256"], images=len(images))
+        trace("model_requested", request_sha256=state["request_sha256"], images=len(images),
+              role="qwen", op="generate")
         # No second runtime retry: ModelPool owns the single identical OOM retry.
+        model_started = time.monotonic()
         try:
             response = model_pool.call("qwen", request)
         except (OSError, RuntimeError, ValueError) as exc:
+            trace("model_returned", role="qwen", op="generate", status="error", usage={},
+                  error=f"{type(exc).__name__}: {exc}", elapsed_seconds=time.monotonic() - model_started)
             return stop("model_call_failed", f"{type(exc).__name__}: {exc}")
+        model_elapsed = time.monotonic() - model_started
         costs["qwen_calls"] += 1
         state["last_model_provenance"] = response.get("provenance", {"status": "not_reported"})
         account("qwen", {**response.get("usage", {}), "model_requests": 1}, status=response.get("status"),
                 cache_key=response.get("cache_key"), provenance=response.get("provenance"), source_usage=response.get("source_usage"))
         trace("model_returned", status=response.get("status"), usage=response.get("usage", {}),
-              error=response.get("error"))
+              error=response.get("error"), role="qwen", op="generate", elapsed_seconds=model_elapsed)
         state["phase"] = "ready"
         if response.get("status") != "ok":
             return stop("model_request_failed", response.get("error", "Unknown Qwen error"))

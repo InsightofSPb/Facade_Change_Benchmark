@@ -221,11 +221,12 @@ class ModelPool:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.workers, self.events, self._worker_options = {}, [], {}
+        self.progress = None
         self._pool_id = uuid.uuid4().hex
         self._lock = threading.Lock()
 
     def _event(self, **values):
-        """Persist owned-process lifecycle alongside the run's worker logs."""
+        """Persist model/lifecycle events; an optional parent observer is diagnostic."""
         record = {"schema_version": 1, "pool_id": self._pool_id,
                   "event_id": f"{self._pool_id}:{len(self.events) + 1}",
                   "timestamp_utc": datetime.now(timezone.utc).isoformat(), **values}
@@ -234,7 +235,21 @@ class ModelPool:
             stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if self.progress is not None:
+            try:
+                self.progress(values["event"], **copy.deepcopy({key: value for key, value in values.items() if key != "event"}))
+            except Exception:
+                # Terminal diagnostics must not change a model result or GPU ownership.
+                pass
         return record
+
+    def _call_event(self, **values):
+        # Additional request diagnostics are best-effort. Existing lifecycle
+        # journal failures retain their original handling in _event's callers.
+        try:
+            self._event(**values)
+        except Exception:
+            pass
 
     def _key(self, role, payload, deadline=None):
         options = self.models[role]
@@ -300,7 +315,26 @@ class ModelPool:
 
     def call(self, role, payload):
         with self._lock:
-            return self._call(role, copy.deepcopy(payload))
+            operation = payload.get("op") if isinstance(payload, dict) else None
+            started = time.monotonic()
+            self._call_event(event="pool_model_requested", role=role, op=operation)
+            try:
+                result = self._call(role, copy.deepcopy(payload))
+            except BaseException as exc:
+                self._call_event(event="pool_model_returned", role=role, op=operation,
+                                 status="error", error=f"{type(exc).__name__}: {exc}",
+                                 elapsed_seconds=time.monotonic() - started, usage={})
+                raise
+            detail = result if isinstance(result, dict) else {}
+            usage = detail.get("usage", {})
+            usage = usage if isinstance(usage, dict) else {}
+            measured = {key: usage[key] for key in (
+                "input_tokens", "output_tokens", "images", "model_calls", "cache_hits", "model_loads",
+                "retries", "worker_starts", "incomplete", "unobserved_worker_cost") if key in usage}
+            self._call_event(event="pool_model_returned", role=role, op=operation,
+                             status=detail.get("status"), error=detail.get("error"), usage=measured,
+                             elapsed_seconds=time.monotonic() - started)
+            return result
 
     def _call(self, role, payload):
         started = time.monotonic()

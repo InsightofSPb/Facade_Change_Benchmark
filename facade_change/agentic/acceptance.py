@@ -39,7 +39,7 @@ def fixture(out):
     return pairs
 
 
-def run_smoke(config, out, kind="cpu"):
+def run_smoke(config, out, kind="cpu", progress=None):
     out = new_directory(out)
     pairs = fixture(out / "fixture")
     config = copy.deepcopy(config)
@@ -49,26 +49,29 @@ def run_smoke(config, out, kind="cpu"):
                   alignment={"method": "sift", "device": "cpu", "max_side": 512})
     if kind == "cpu":
         config["modes"] = []
-        result = run_cases(config, pairs, out / "analysis")
+        result = run_cases(config, pairs, out / "analysis", progress=progress)
         result["scope"] = "Real CPU SIFT/SSIM/LZMA + store/history/report; Qwen/SAM3 not executed"
     elif kind == "models":
         config["modes"] = ["pair", "fixed_context", "agent"]
-        result = run_cases(config, pairs, out / "analysis")
+        result = run_cases(config, pairs, out / "analysis", progress=progress)
         result["scope"] = "Real configured Qwen on procedural images, not accuracy evaluation"
     else:
-        result = model_acceptance(config, pairs[0], out / "acceptance", kind)
+        result = model_acceptance(config, pairs[0], out / "acceptance", kind, progress=progress)
     write_json(out / "verification.json", result)
     return result
 
 
-def model_acceptance(config, pair, out, kind):
+def model_acceptance(config, pair, out, kind, progress=None):
     from .models import ModelPool
     if kind not in {"handoff", "recovery", "context"}:
         raise ValueError("Unknown acceptance kind")
-    journal = new_run(out, {"config": config, "kind": kind, "pair": pair}, "agentic_model_acceptance")
+    journal = new_run(out, {"config": config, "kind": kind, "pair": pair},
+                      "agentic_model_acceptance", progress=progress)
     pool = ModelPool(config["models"], journal.out / "worker_logs",
                      gpu_mode="sequential" if kind == "recovery" else config["gpu_mode"],
                      timeout=config["worker_timeout"], cache_dir=None)
+    if hasattr(pool, "progress"):
+        pool.progress = journal.event
     started = time.monotonic()
     responses = []
     messages = [{"role": "user", "content": [
@@ -139,9 +142,12 @@ def model_acceptance(config, pair, out, kind):
         result = {"status": "completed", "kind": kind, "elapsed_seconds": time.monotonic() - started,
                   "responses": responses, "context_measurement": context_measurement,
                   "requested_limits": options,
+                  "outcome_counts": {"completed": 1, "abstained": 0, "error": 0},
+                  "count_unit": "проверки", "report_path": None,
                   "scope": "Only measured input/output lengths are verified; early EOS does not verify a full output-token budget"}
         write_json(journal.out / "summary.json", result)
-        complete_run(journal, "completed")
+        complete_run(journal, "completed", summary={key: result[key] for key in (
+            "outcome_counts", "count_unit", "report_path", "elapsed_seconds")})
         return result
     except BaseException as exc:
         complete_run(journal, "failed", error=str(exc))

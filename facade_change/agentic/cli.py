@@ -2,13 +2,150 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
+import os
+import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 from ..io import read_json, write_json
 from .config import ROOT, defaults, import_method_options, load_config, write_new_config
+
+
+HEARTBEAT_SECONDS = 15.0
+
+
+class TerminalProgress:
+    """A compact stderr view of existing events; it never controls execution."""
+    def __init__(self, quiet=False, stream=None, heartbeat_interval=None):
+        self.quiet, self.stream = quiet, stream if stream is not None else sys.stderr
+        self.interval = HEARTBEAT_SECONDS if heartbeat_interval is None else heartbeat_interval
+        self.started = time.monotonic()
+        self.case = self.mode = self.task = None
+        self.stage = self.pending_model = None
+        self.stage_started = self.last_output = self.started
+        self._lock, self._stop = threading.RLock(), threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def brief(value, limit=350):
+        if isinstance(value, dict):
+            value = ": ".join(str(value[k]) for k in ("code", "message", "error") if value.get(k))
+        elif isinstance(value, (list, tuple)):
+            value = "; ".join(TerminalProgress.brief(v, 150) for v in value[:3])
+        text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))
+        return text if len(text) <= limit else text[:limit] + "…"
+
+    def _write(self, message):
+        context = " / ".join(str(v) for v in (self.case, self.mode) if v) or self.task or "agentic"
+        try:
+            print(f"[agentic +{time.monotonic()-self.started:.1f}s] {context}: {message}",
+                  file=self.stream, flush=True)
+            self.last_output = time.monotonic()
+        except (OSError, ValueError):
+            self._stop.set()  # A closed diagnostic stream cannot fail inference.
+
+    def _begin(self, stage):
+        self.stage, self.stage_started = stage, time.monotonic()
+        self._write(stage)
+
+    def _heartbeat(self):
+        while not self._stop.wait(self.interval):
+            with self._lock:
+                if self.stage and time.monotonic() - self.last_output >= self.interval:
+                    self._write(f"ожидание: {self.stage}; прошло {time.monotonic()-self.stage_started:.1f}s")
+
+    @staticmethod
+    def _details(values):
+        parts = []
+        for name in ("decision", "reason", "error", "limitations"):
+            if values.get(name):
+                parts.append(f"{name}={TerminalProgress.brief(values[name])}")
+        duration = values.get("elapsed_seconds")
+        if isinstance(duration, (int, float)):
+            parts.append(f"{duration:.1f}s")
+        return "; ".join(parts)
+
+    def __call__(self, event, **values):
+        if self.quiet or self._stop.is_set():
+            return
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._heartbeat, name="agentic-progress", daemon=True)
+                self._thread.start()
+            if values.get("case_id"):
+                self.case = values["case_id"]
+            if values.get("mode"):
+                self.mode = values["mode"]
+            if event == "command_started":
+                self.task = values["task"]
+                self._begin(f"начало; результаты: {values.get('out')}")
+            elif event == "history_started":
+                self._begin("импорт истории и проверка сохранённых данных")
+            elif event == "case_started":
+                self.mode = None
+                self._begin(f"подготовка случая {values.get('index', '?')}/{values.get('total', '?')}")
+            elif event in {"case_prepared", "case_failed"}:
+                self.stage = None
+                self._write(f"подготовка: {values.get('status', 'error' if event == 'case_failed' else 'completed')}; "
+                            + self._details(values))
+            elif event == "mode_started":
+                self._begin("начало режима")
+            elif event in {"agent_model_requested", "pool_model_requested"}:
+                role, op = values.get("role", "qwen"), values.get("op", "generate")
+                if event == "pool_model_requested" and self.pending_model == (role, op, "agent"):
+                    return  # Same call is also represented by the reasoning trace.
+                self.pending_model = (role, op, "agent" if event.startswith("agent_") else "pool")
+                self._begin(f"модель {role}: запрос {op}")
+            elif event in {"agent_model_returned", "pool_model_returned"}:
+                role, op = values.get("role", "qwen"), values.get("op", "generate")
+                if event == "pool_model_returned" and self.pending_model == (role, op, "agent"):
+                    return
+                self.stage = self.pending_model = None
+                usage = values.get("usage") or {}
+                tokens = " ".join(f"{key}={usage[key]}" for key in ("input_tokens", "output_tokens")
+                                  if usage.get(key) is not None)
+                if usage.get("incomplete") or usage.get("unobserved_worker_cost"):
+                    tokens = "токены: учёт неполный"
+                self._write(f"модель {role}: {values.get('status', 'unknown')} {tokens}; " + self._details(values))
+            elif event == "agent_tool_requested":
+                self._begin(f"инструмент {values.get('name')}: вызов")
+            elif event == "agent_tool_returned":
+                self.stage = None
+                self._write(f"инструмент {values.get('name')}: {values.get('status')}; " + self._details(values))
+            elif event == "agent_validation_error":
+                self._write("ошибка валидации: " + self.brief(values.get("error")))
+            elif event == "resource_missing":
+                self._write(f"ресурс отсутствует: {values.get('method')}/{values.get('field')}: "
+                            + self.brief(values.get("path")))
+            elif event in {"mode_completed", "mode_failed"}:
+                self.stage = self.pending_model = None
+                self._write(f"результат: {values.get('status', 'error')}; " + self._details(values))
+                self.mode = None
+            elif event == "report_started":
+                self.case = self.mode = None
+                self._begin("формирование HTML-отчёта")
+            elif event in {"completed", "completed_with_errors", "failed", "interrupted"}:
+                self.stage = self.pending_model = None
+                self.case = self.mode = None
+                summary = values.get("summary") or {}
+                counts = summary.get("outcome_counts")
+                if counts is not None:
+                    self._write("итог: " + " ".join(f"{key}={counts.get(key, 0)}"
+                                for key in ("completed", "abstained", "error"))
+                                + f" ({summary.get('count_unit', 'результаты')}); " + self._details(summary))
+                    self._write("HTML: " + str(summary.get("report_path") or "не создаётся для этой команды"))
+                elif values.get("error"):
+                    self._write(f"{event}: " + self.brief(values["error"]))
+
+    def close(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.)
 
 
 def parser():
@@ -28,6 +165,8 @@ def parser():
     for name in ("run", "history", "check", "index", "search", "knowledge-import", "smoke"):
         task = tasks.add_parser(name)
         task.add_argument("--config")
+        if name in {"run", "history", "smoke", "check"}:
+            task.add_argument("--quiet", action="store_true", help="Disable terminal progress; final JSON stays on stdout")
         if name != "search":
             task.add_argument("--out", required=True)
         if name == "run":
@@ -114,14 +253,28 @@ def _pairs(arguments):
     return [pair]
 
 
-def check(config, out, roles, load_model=False):
+def check(config, out, roles, load_model=False, progress=None):
     from .models import ModelPool
     from .runner import new_run, complete_run
-    journal = new_run(out, {"configuration": config, "roles": roles, "load_model": load_model}, "agentic_preflight")
+    check_started = time.monotonic()
+    journal = new_run(out, {"configuration": config, "roles": roles, "load_model": load_model},
+                      "agentic_preflight", progress=progress)
     pool = ModelPool(config["models"], journal.out / "worker_logs", gpu_mode="sequential",
                      timeout=config["worker_timeout"])
+    observed_pool = hasattr(pool, "progress")
+    if observed_pool:
+        pool.progress = journal.event
     try:
-        results = {role: pool.call(role, {"op": "check", "load_model": load_model}) for role in roles}
+        results = {}
+        for role in roles:
+            started = time.monotonic()
+            if not observed_pool:
+                journal.event("pool_model_requested", role=role, op="check")
+            results[role] = pool.call(role, {"op": "check", "load_model": load_model})
+            if not observed_pool:
+                journal.event("pool_model_returned", role=role, op="check", status=results[role].get("status"),
+                              error=results[role].get("error"), usage=results[role].get("usage", {}),
+                              elapsed_seconds=time.monotonic()-started)
         missing = []
         for method in config["methods"]:
             for key, value in config["method_options"].get(method, {}).items():
@@ -131,9 +284,15 @@ def check(config, out, roles, load_model=False):
         status = "completed" if all(row.get("status") == "ok" for row in results.values()) and not missing else "failed"
         summary = {"status": status, "roles": results, "missing_method_resources": missing,
                    "model_execution": load_model,
+                   "outcome_counts": {"completed": sum(row.get("status") == "ok" for row in results.values()),
+                                      "abstained": 0, "error": sum(row.get("status") != "ok" for row in results.values()) + len(missing)},
+                   "count_unit": "проверки ресурсов", "report_path": None,
+                   "elapsed_seconds": time.monotonic()-check_started,
                    "scope": "Imports/cache availability; not real facade accuracy or full context validation"}
+        for item in missing:
+            journal.event("resource_missing", **item)
         write_json(journal.out / "summary.json", summary)
-        complete_run(journal, status)
+        complete_run(journal, status, summary=summary)
         return summary
     except BaseException as exc:
         complete_run(journal, "failed", error=str(exc))
@@ -143,9 +302,44 @@ def check(config, out, roles, load_model=False):
         journal.close()
 
 
+def _analysis_task(arguments, config, progress):
+    # Legacy history verification writes progress to Python stdout. Redirect
+    # only the parent operation, leaving the final JSON and subprocess pipes alone.
+    sink = open(os.devnull, "w") if arguments.quiet else contextlib.nullcontext(sys.stderr)
+    with sink as stream, contextlib.redirect_stdout(stream):
+        if arguments.task == "run":
+            from .runner import run_cases
+            if arguments.modes:
+                if "none" in arguments.modes and len(arguments.modes) != 1:
+                    raise ValueError("--modes none cannot be combined with other modes")
+                config["modes"] = [] if arguments.modes == ["none"] else arguments.modes
+            return run_cases(config, _pairs(arguments), arguments.out, progress=progress)
+        if arguments.task == "smoke":
+            from .acceptance import run_smoke
+            return run_smoke(config, arguments.out, arguments.kind, progress=progress)
+        if arguments.task == "check":
+            return check(config, arguments.out, arguments.roles, arguments.load_model, progress=progress)
+        from .pipeline import pairs_from_history
+        from .retrieval import SearchIndex
+        from .store import RegionStore
+        from .runner import run_cases
+        progress("history_started")
+        with RegionStore(config["store_root"]) as store:
+            store.import_histories(arguments.histories, available_at=arguments.available_at)
+            if arguments.features:
+                SearchIndex(store).import_history_features(arguments.features)
+        pairs = pairs_from_history(arguments.histories, arguments.track_id, arguments.min_dates,
+                                   available_at=arguments.available_at)
+        return run_cases(config, pairs, arguments.out, progress=progress)
+
+
 def main(argv=None):
     arguments = parser().parse_args(argv)
+    progress = None
     try:
+        if arguments.task in {"run", "history", "smoke", "check"}:
+            progress = TerminalProgress(quiet=arguments.quiet)
+            progress("command_started", task=arguments.task, out=arguments.out)
         if arguments.task == "configure":
             config = import_method_options(defaults(), arguments.methods_config, arguments.methods, arguments.semantic_run)
             config["gpu_mode"] = arguments.gpu_mode
@@ -175,30 +369,8 @@ def main(argv=None):
             result = compare_runs(arguments.runs, arguments.out, arguments.cases, arguments.labels)
         else:
             config = load_config(arguments.config)
-            if arguments.task == "run":
-                from .runner import run_cases
-                if arguments.modes:
-                    if "none" in arguments.modes and len(arguments.modes) != 1:
-                        raise ValueError("--modes none cannot be combined with other modes")
-                    config["modes"] = [] if arguments.modes == ["none"] else arguments.modes
-                result = run_cases(config, _pairs(arguments), arguments.out)
-            elif arguments.task == "smoke":
-                from .acceptance import run_smoke
-                result = run_smoke(config, arguments.out, arguments.kind)
-            elif arguments.task == "check":
-                result = check(config, arguments.out, arguments.roles, arguments.load_model)
-            elif arguments.task == "history":
-                from .pipeline import pairs_from_history
-                from .retrieval import SearchIndex
-                from .store import RegionStore
-                from .runner import run_cases
-                with RegionStore(config["store_root"]) as store:
-                    store.import_histories(arguments.histories, available_at=arguments.available_at)
-                    if arguments.features:
-                        SearchIndex(store).import_history_features(arguments.features)
-                pairs = pairs_from_history(arguments.histories, arguments.track_id, arguments.min_dates,
-                                           available_at=arguments.available_at)
-                result = run_cases(config, pairs, arguments.out)
+            if progress is not None:
+                result = _analysis_task(arguments, config, progress)
             elif arguments.task == "search":
                 from .retrieval import KnowledgeBase, SearchIndex
                 from .store import RegionStore
@@ -221,6 +393,9 @@ def main(argv=None):
     except (ValueError, FileNotFoundError, FileExistsError, RuntimeError) as exc:
         print(f"agentic: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if progress is not None:
+            progress.close()
 
 
 def _index_or_import(config, arguments):

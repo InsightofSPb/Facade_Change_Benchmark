@@ -8,7 +8,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from contextlib import nullcontext, redirect_stderr
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 
 import numpy as np
@@ -79,12 +79,45 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(FakeWorker.made[0].requests[0]["messages"], FakeWorker.made[2].requests[0]["messages"])
         self.assertTrue(all(w.closed for w in FakeWorker.made))
         records = [json.loads(line) for line in (self.root / "logs" / "pool.jsonl").read_text().splitlines()]
-        self.assertEqual([row["event"] for row in records],
+        lifecycle = [row for row in records if row["event"].startswith("worker_")]
+        self.assertEqual([row["event"] for row in lifecycle],
                          ["worker_started", "worker_released", "worker_started", "worker_released", "worker_started", "worker_released"])
-        self.assertEqual([row["role"] for row in records], ["qwen", "qwen", "sam3", "sam3", "qwen", "qwen"])
-        self.assertEqual(records[1]["reason"], "gpu_handoff")
-        self.assertTrue(all(row["timestamp_utc"] and "pid" in row for row in records))
+        self.assertEqual([row["role"] for row in lifecycle], ["qwen", "qwen", "sam3", "sam3", "qwen", "qwen"])
+        self.assertEqual(lifecycle[1]["reason"], "gpu_handoff")
+        self.assertTrue(all(row["timestamp_utc"] and "pid" in row for row in lifecycle))
         self.assertEqual(len({row["event_id"] for row in records}), len(records))
+
+    def test_parent_progress_observer_cannot_change_inference_or_worker_stdout(self):
+        observed, start_worker_counts, stdout = [], [], io.StringIO()
+        payload = self.payload()
+        original = copy.deepcopy(payload)
+        with self.pool() as pool, redirect_stdout(stdout):
+            def observer(event, **values):
+                observed.append((event, copy.deepcopy(values)))
+                if event == "pool_model_requested":
+                    start_worker_counts.append(len(FakeWorker.made))
+                # Broken terminal/callback is diagnostic, never a model failure.
+                values.clear()
+                raise OSError("closed terminal")
+            pool.progress = observer
+            result = pool.call("qwen", payload)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(payload, original)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(start_worker_counts, [0])
+        self.assertEqual(observed[0][0], "pool_model_requested")
+        returned = next(value for event, value in observed if event == "pool_model_returned")
+        self.assertEqual(returned["usage"]["input_tokens"], 10)
+        self.assertEqual(returned["usage"]["output_tokens"], 3)
+        self.assertGreaterEqual(returned["elapsed_seconds"], 0)
+        self.assertNotIn("text", returned)
+        self.assertNotIn("provenance", returned)
+        with self.pool() as pool:
+            pool.progress = lambda event, **values: observed.append((event, values))
+            with self.assertRaisesRegex(ValueError, "Model request must be an object"):
+                pool.call("qwen", [])
+        returned = [value for event, value in observed if event == "pool_model_returned"][-1]
+        self.assertEqual(returned["error"], "ValueError: Model request must be an object")
 
     def test_resident_pair_does_not_keep_third_heavy_model(self):
         with self.pool(gpu_mode="resident") as pool:
