@@ -129,12 +129,23 @@ def _supported_localization(localization, record, case, support, support_record)
     bbox = result.get("bbox_xyxy")
     if bbox is None:
         return result
-    if (not isinstance(bbox, list) or len(bbox) != 4
-            or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in bbox)
-            or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
-        raise ValueError("Invalid localization bounding box")
+
+    def bbox_error(reason):
+        return ValueError(
+            f"Invalid localization bounding box: bbox_xyxy={bbox!r}; {reason}; "
+            f"coordinate_system={coordinate}; allowed bounds [left, top, right, bottom]={bounds!r}. "
+            "Return four finite numbers with right > left and bottom > top, or explicitly return "
+            "localization: null if coordinates cannot be estimated; other decision/evidence requirements still apply.")
+
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise bbox_error("expected [left, top, right, bottom], exactly four numbers")
+    if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in bbox):
+        raise bbox_error("all four coordinates must be finite numbers, not booleans")
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        raise bbox_error(f"width={bbox[2] - bbox[0]:g} (right-left), height={bbox[3] - bbox[1]:g} (bottom-top); "
+                         "both must be strictly positive")
     if bounds is None or bbox[0] < bounds[0] or bbox[1] < bounds[1] or bbox[2] > bounds[2] or bbox[3] > bounds[3]:
-        raise ValueError("Localization exceeds or lacks the cited coordinate grid")
+        raise bbox_error("Localization exceeds or lacks the cited coordinate grid")
     if transform.shape != (3, 3) or not np.isfinite(transform).all() or np.linalg.matrix_rank(transform) != 3:
         raise ValueError("Localization needs a finite invertible transform to the region grid")
     corners = np.array([[bbox[0], bbox[1], 1.], [bbox[2], bbox[1], 1.],
@@ -252,6 +263,9 @@ def _system(mode):
         "localization:null or {evidence_id,coordinate_system,bbox_xyxy,observation_id?,anchor_sha256?}, limitations:list, "
         "missing_information:list. Coordinates must refer to region_crop_pixels, observation_native or "
         "anchor_native. Native frames identify the observation or anchor image respectively. "
+        "bbox_xyxy = [left, top, right, bottom]: four finite numbers in the declared coordinate system, "
+        "with right > left and bottom > top. If coordinates cannot be estimated, explicitly return "
+        "localization: null; all other decision and evidence requirements still apply. "
         "A box is a model hypothesis; never claim a pixel mask unless supplied by a tool. "
         "Keep visible_difference to a short description, semantic_interpretation concise, and include only "
         "relevant limitations/missing_information (empty lists if none). Do not repeat metadata or the prompt. "
