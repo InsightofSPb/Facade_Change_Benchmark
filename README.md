@@ -8,6 +8,9 @@
 [протокол и команды от 2026-11-08](docs/2026-11-08-variability-memory.md).
 После остановки обучения `python -m data_analysis memory-evaluate` оценивает
 завершённый seed из сохранённых признаков и моделей без повторного обучения.
+`python -m data_analysis memory-followups` добавляет подмену истории у одного
+checkpoint, сравнение линейного фьюзинга с MLP и память межкадровых переходов
+на том же кэше: [протокол и команда](docs/2026-11-08-memory-followups.md).
 
 ## Основной workflow
 
