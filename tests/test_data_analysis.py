@@ -493,3 +493,14 @@ class CachedAnalysisTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def load_tests(loader, suite, pattern):
+    # unittest discovery ignores filenames containing date hyphens. Keep the
+    # requested dated sources and include their contracts in the standard suite.
+    import importlib
+    from pathlib import Path
+    for path in sorted(Path(__file__).parent.glob("test_2026-11-08_history_scenarios_*.py")):
+        module = importlib.import_module("tests." + path.stem)
+        suite.addTests(loader.loadTestsFromModule(module))
+    return suite
