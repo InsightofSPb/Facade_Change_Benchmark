@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import shlex
 import subprocess
 import sys
 import time
@@ -20,7 +21,8 @@ from facade_change.io import read_json, sha256, write_json
 
 PREFIX = "2026-11-08_"
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs/2026-11-08_history_three_scenarios.json"
+LEGACY_CONFIG = ROOT / "configs/2026-11-08_history_three_scenarios.json"
+DEFAULT_CONFIG = ROOT / "configs/2026-11-09_history_three_scenarios_reduced.json"
 Store = importlib.import_module("facade_change.2026-10-14_temporal_experiment").RunStore
 
 
@@ -33,8 +35,9 @@ def modules():
 
 
 def resolve_config(path=None, *, device=None, memory_run=None, smoke=False):
-    defaults = read_json(DEFAULT_CONFIG)
     supplied = read_json(path) if path else {}
+    legacy = supplied.get("protocol") == "history-three-scenarios-v1"
+    defaults = read_json(LEGACY_CONFIG if legacy else DEFAULT_CONFIG)
     unknown = set(supplied) - set(defaults)
     if unknown:
         raise ValueError(f"Unknown configuration keys: {sorted(unknown)}")
@@ -59,13 +62,24 @@ def resolve_config(path=None, *, device=None, memory_run=None, smoke=False):
     if set(config["practical"]) != set(defaults["practical"]):
         raise ValueError("Practical thresholds must specify all documented keys, with no unknown keys")
     config["smoke"] = bool(smoke)
+    if config.get("matrix_protocol") == "reduced-v2":
+        if not 1 <= config["epochs"] <= 60:
+            raise ValueError("Primary epochs must be explicitly between 1 and 60")
+        if type(config["fusion_epochs"]) is not int or not 1 <= config["fusion_epochs"] <= 10:
+            raise ValueError("Fusion epochs must be explicitly between 1 and 10 (default 5)")
+        if config["effective_batch"] != 8:
+            raise ValueError("The reduced protocol uses effective_batch=8")
+        if config["patience"] != 12:
+            raise ValueError("The reduced protocol uses primary F1 patience=12")
     if smoke:
         config.update(epochs=2, patience=2, effective_batch=2, amp=False)
+        if not legacy:
+            config["fusion_epochs"] = 1
     return config
 
 
 def source_snapshot():
-    files = [Path(__file__), ROOT / "data_analysis/__main__.py", DEFAULT_CONFIG]
+    files = [Path(__file__), ROOT / "data_analysis/__main__.py", DEFAULT_CONFIG, LEGACY_CONFIG]
     files += list((ROOT / "facade_change/research").glob("2026-11-08_history_scenarios_*.py"))
     files += list((ROOT / "data_analysis").glob("2026-11-08_history_scenarios_*.py"))
     # Existing adapters/evaluator are part of the scientific implementation too.
@@ -109,7 +123,10 @@ def hardware(config, *, require_available=False):
         raise RuntimeError("Insufficient free RAM; close other tasks or choose a later launch. Budget unchanged.")
     if str(config["device"]).startswith("cuda"):
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA unavailable in this interpreter; use the saved DINO worker or --device cpu")
+            result["cuda_status"] = "NOT_MEASURED: CUDA unavailable in this interpreter"
+            if require_available:
+                raise RuntimeError("CUDA unavailable in this interpreter; real CUDA preflight must run locally")
+            return result
         free, total = torch.cuda.mem_get_info(config["device"])
         result.update(free_vram_bytes=free, total_vram_bytes=total,
                       gpu_name=torch.cuda.get_device_name(config["device"]))
@@ -273,7 +290,7 @@ def safe_output(out, config):
     return out
 
 
-def report_only(out):
+def report_only(out, *, event_id=None, methods=None):
     """No dataset loading, encoder, model, optimizer or source-run dependency."""
     import fcntl
     out = Path(out).expanduser().resolve()
@@ -285,6 +302,8 @@ def report_only(out):
         except BlockingIOError as exc:
             raise RuntimeError("Cannot rebuild report while the run is active") from exc
         reporter = importlib.import_module("data_analysis.2026-11-08_history_scenarios_report")
+        if event_id is not None:
+            return reporter.render_event(out, event_id, methods=methods)
         return reporter.report_only(out)
 
 
@@ -315,13 +334,192 @@ def local_smoke(out, config, ledger):
                  interpretation="implementation fixture, not facade-history evidence")
 
 
+def _continue_command(args, report_path):
+    mode = "resume" if args.mode == "resume" else "full"
+    command = [sys.executable, "-s", "-u", "-m", "data_analysis", "history-scenarios", mode,
+               "--config", str(Path(args.config or DEFAULT_CONFIG).resolve()),
+               "--out", str(Path(args.out).resolve()), "--preflight-report", str(report_path)]
+    if args.device:
+        command += ["--device", args.device]
+    if args.memory_run:
+        command += ["--memory-run", args.memory_run]
+    if args.synthetic:
+        command += ["--synthetic"]
+    return shlex.join(command)
+
+
+def _reduced_matrix(training, config):
+    return training.matrix_contract(config)
+
+
+def _frozen_json(path, value):
+    """Verify an existing scientific contract without rewriting its bytes."""
+    if Path(path).exists():
+        if read_json(path) != value:
+            raise ValueError(f"Frozen scientific contract differs: {path}")
+        return
+    write_json(path, value)
+
+
+def run_reduced(args, config):
+    """Schema-2 orchestration: a measured resource gate precedes real training."""
+    import numpy as np
+    import torch
+    preflight = importlib.import_module("facade_change.research.2026-11-08_history_scenarios_preflight")
+    progress_module = importlib.import_module("facade_change.research.2026-11-08_history_scenarios_progress")
+    data_module, model_module, training, reporter = modules()
+    out = safe_output(args.out, config)
+    previous = read_json(out / "request.json") if (out / "request.json").exists() else None
+    if args.mode == "resume" and previous is None:
+        raise ValueError("Resume requires an existing run")
+    if previous and previous.get("smoke") and not config["smoke"]:
+        config = resolve_config(args.config, device=args.device, memory_run=args.memory_run, smoke=True)
+    old_status = read_json(out / "run.json").get("status") if (out / "run.json").exists() else None
+    continue_preflight = args.mode == "full" and old_status in ("preflight_completed", "preflight_not_measured")
+    store = Store(out, config, resume=args.mode == "resume" or continue_preflight)
+    dataset = None
+    try:
+        torch.set_num_threads(config["cpu_threads"])
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.use_deterministic_algorithms(True, warn_only=str(config["device"]).startswith("cuda"))
+        snapshot = source_snapshot()
+        matrix = _reduced_matrix(training, config)
+        store.record["kind"] = "history_three_scenarios"
+        write_json(out / "run.json", store.record)
+        contract = dict(protocol=config["protocol"], config=config, source=snapshot,
+                        torch=str(torch.__version__), numpy=np.__version__, matrix=matrix,
+                        fit_split="train", selection_split="val", schema_version=2,
+                        training_seeds=[13], synthetic=config["smoke"], test_previously_inspected=True)
+        store.contract(contract)
+        for suffix, value in (("resolved_matrix.json", matrix), ("resolved_config.json", config)):
+            _frozen_json(out / (PREFIX + suffix), value)
+        _frozen_json(out / (PREFIX + "training_contract.json"), dict(
+            primary_optimizer="AdamW", primary_options=training.options(config),
+            fusion_optimizer="Adam", fusion_lr=config["fusion_lr"],
+            fusion_weight_decay=config["fusion_weight_decay"], fusion_epochs=config["fusion_epochs"],
+            fusion_loss="known-pixel masked BCE; equal physical-building contribution",
+            fusion_selection=config["fusion_selection"], detection_selection=config["detection_selection"],
+            retention=config["checkpoint_retention"], normalizer="TRAIN fitted; shared frozen transform",
+            forecast_inputs="strictly past before current observation; signed deltas; real year intervals",
+            model_bits="quantized logistic model bits/component; no actual bitstream size claim",
+            thresholds="VAL-only .05/.10/.15; no extra fit per budget",
+            seed=13, test_scope=config["test_scope"], target_scope=config["target_scope"]))
+        store.event("matrix_frozen_before_training", planned_fit_counts=matrix["planned_fit_counts"],
+                    matrix_sha256=sha256(out / (PREFIX + "resolved_matrix.json")))
+        resources = hardware(config)
+        write_json(out / (PREFIX + "hardware.json"), resources)
+        report_path = out / (PREFIX + "resource_report.json")
+        # Unavailable owner data/CUDA is a truthful preflight result in Cloud.
+        try:
+            dataset = (data_module.SyntheticData() if config["smoke"] else data_module.ScenarioData(
+                config["memory_run"], benchmark_run=config["benchmark_run"], fusion_run=config["fusion_run"]))
+            dataset.__enter__()
+            if str(config["device"]).startswith("cuda") and not resources["cuda_available"]:
+                raise RuntimeError("CUDA unavailable; owner hardware profile is NOT_MEASURED")
+        except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+            if args.mode not in ("preflight", "full"):
+                raise
+            report = preflight.unavailable_report(config, out, source_snapshot=snapshot,
+                                                  reason=str(exc), hardware=resources)
+            store.finish("preflight_not_measured", resource_report=str(report_path), reason=str(exc))
+            print(f"Preflight NOT_MEASURED: {exc}\nResource report: {report_path}", flush=True)
+            print("After completing a compatible local preflight, continue with:\n" +
+                  _continue_command(args, report_path), flush=True)
+            return report
+        with device_lock(config):
+            hardware(config, require_available=True)
+            if hasattr(dataset, "prepare_missing"):
+                with progress_module.stage("prepare-cache", ledger=store):
+                    dataset.prepare_missing(store, config["device"], splits=("train", "val"))
+            dataset.verify()
+            summary = dataset.summary(inspect_targets=False)
+            availability = {key: summary.pop(key) for key in ("effective_cache_index_sha256",
+                "missing_feature_observations", "prepared_feature_observations") if key in summary}
+            write_json(out / (PREFIX + "cache_availability.json"), availability)
+            data_path = out / (PREFIX + "data_contract.json")
+            if data_path.exists() and read_json(data_path) != summary:
+                raise ValueError("Data/source snapshot changed on resume; use a new run")
+            _frozen_json(data_path, summary)
+            store.event("data_verified", data_sha256=sha256(data_path))
+            supplied_path = getattr(args, "preflight_report", None)
+            if not supplied_path and args.mode == "resume" and report_path.exists():
+                supplied_path = str(report_path)
+            resource_report = read_json(supplied_path) if supplied_path and Path(supplied_path).exists() else None
+            compatible, reasons = (preflight.compatible(resource_report, dataset, config, snapshot, resources)
+                                   if resource_report else (False, ["No measured preflight report supplied"]))
+            needs_profile = args.mode == "preflight" or (not config["smoke"] and not compatible)
+            if needs_profile:
+                with progress_module.stage("preflight", ledger=store):
+                    resource_report = preflight.run_preflight(dataset, config, out,
+                        source_snapshot=snapshot, hardware=resources)
+                ready, report_reasons = preflight.compatible(resource_report, dataset, config, snapshot, resources)
+                store.event("preflight_completed_without_training", previous_report_rejection=reasons,
+                            report_compatible=ready, reasons=report_reasons,
+                            report_sha256=sha256(report_path))
+                store.finish("preflight_completed" if ready else "preflight_not_measured",
+                             resource_report=str(report_path), planned_fit_counts=matrix["planned_fit_counts"])
+                print(f"Only preflight completed; no primary or fusion training started.\nResource report: {report_path}", flush=True)
+                print("Continue explicitly with:\n" + _continue_command(args, report_path), flush=True)
+                return resource_report
+            if not config["smoke"]:
+                observed = hardware(config, require_available=True)
+                checks = preflight.check_resources(resource_report, config, out, hardware=observed)
+                store.event("preflight_accepted", source_path=str(supplied_path), checks=checks,
+                            source_sha256=sha256(supplied_path))
+                if Path(supplied_path).resolve() != report_path.resolve():
+                    write_json(report_path, resource_report)
+                # Keep a local audit trail, while the original profile remains immutable.
+                write_json(out / (PREFIX + "preflight_acceptance.json"), checks)
+            else:
+                store.event("synthetic_resource_gate_exempt", reason="CPU implementation fixture; not real resource evidence")
+            if hasattr(dataset, "prepare_missing"):
+                with progress_module.stage("prepare-export-cache", ledger=store):
+                    dataset.prepare_missing(store, config["device"])
+            evidence_path = out / (PREFIX + "previous_evidence.json")
+            if not evidence_path.exists():
+                write_json(evidence_path, old_evidence(config))
+            records = training.train_all(dataset, out, config, ledger=store, resume=args.mode == "resume")
+            if source_snapshot() != snapshot:
+                raise ValueError("Source changed during training; freeze the checkout before resuming")
+            manifest = training.export_all(dataset, records, out, config, ledger=store, resume=args.mode == "resume")
+            dataset.verify()
+            if source_snapshot() != snapshot:
+                raise ValueError("Source changed during evaluation; results cannot be marked complete")
+            with progress_module.stage("report", ledger=store):
+                result = reporter.build_report(dataset, manifest, out, {**config, "matrix": matrix}, records)
+            artifacts = {str(p.relative_to(out)): sha256(p) for p in out.glob(PREFIX + "*") if p.is_file()}
+            partial = any(r.get("status", "").upper() in ("ERROR", "INCOMPLETE") for r in records)
+            store.finish("completed_partial" if partial else "completed", report_artifacts=artifacts,
+                         scientific_claim="synthetic fixture only" if config["smoke"] else "exploratory")
+            return result
+    except BaseException as exc:
+        if args.mode in ("preflight", "full") and not (out / (PREFIX + "resource_report.json")).exists():
+            preflight.unavailable_report(config, out, source_snapshot=source_snapshot(),
+                reason=f"{type(exc).__name__}: {exc}", hardware=hardware(config))
+        store.finish("interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+                     error=f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        try:
+            if dataset is not None:
+                dataset.__exit__(None, None, None)
+        finally:
+            store.close()
+
+
 def run(args):
     import numpy as np
     import torch
     if args.mode == "report-only":
-        return report_only(args.out)
+        return report_only(args.out, event_id=getattr(args, "event_id", None),
+                           methods=getattr(args, "method", None))
     config = resolve_config(args.config, device=args.device, memory_run=args.memory_run,
                             smoke=args.mode == "smoke" or args.synthetic)
+    if config.get("matrix_protocol") == "reduced-v2":
+        return run_reduced(args, config)
     out = safe_output(args.out, config)
     if args.mode == "resume":
         if not (out / "request.json").exists():
@@ -447,6 +645,9 @@ def parser():
     result.add_argument("--memory-run", help="Override saved memory cache path")
     result.add_argument("--device", help="cpu or cuda:0; recorded and must match on resume")
     result.add_argument("--synthetic", action="store_true", help="Explicit synthetic fixture for preflight/resume testing")
+    result.add_argument("--preflight-report", help="Compatible measured resource JSON required before real full training")
+    result.add_argument("--event-id", help="In report-only, render any saved event without loading source models")
+    result.add_argument("--method", action="append", help="Optional method ID for --event-id; repeat to compare methods")
     result.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return result
 
@@ -455,6 +656,10 @@ def main(argv=None):
     cli = parser()
     args = cli.parse_args(argv)
     try:
+        if (args.event_id or args.method) and args.mode != "report-only":
+            raise ValueError("--event-id and --method apply only to report-only")
+        if args.method and not args.event_id:
+            raise ValueError("--method requires --event-id")
         # Preserve the owner's working encoder environment, as existing memory CLI does.
         if not args.worker and args.mode not in ("smoke", "report-only") and not args.synthetic:
             config = resolve_config(args.config, device=args.device, memory_run=args.memory_run)

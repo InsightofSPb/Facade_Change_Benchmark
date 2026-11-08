@@ -23,6 +23,8 @@ import numpy as np
 from facade_change.io import read_json, sha256, write_json
 
 metrics = importlib.import_module("facade_change.research.2026-11-04_history_benchmark_metrics")
+storage = importlib.import_module("facade_change.research.2026-11-08_history_scenarios_storage")
+_progress = importlib.import_module("facade_change.research.2026-11-08_history_scenarios_progress")
 PREFIX = "2026-11-08_"
 DEFAULT_PRACTICAL = dict(f1_gain=.02, iou_gain=.015, maximum_fpr_increase=.005,
                          maximum_recall_loss=.01, relative_fpr_reduction=.20,
@@ -33,7 +35,9 @@ class InsufficientData(ValueError):
     """Known coverage does not permit the stated metric or VAL selection."""
 
 
-def _canonical(dataset):
+def _canonical(dataset, split=None):
+    if split is not None and hasattr(dataset, "evaluation_for"):
+        return dataset.evaluation_for(split=split)
     return getattr(dataset, "evaluation_data", getattr(dataset, "canonical", getattr(getattr(dataset, "source", None), "data", dataset)))
 
 
@@ -107,11 +111,14 @@ def select_operating_points(histograms, budgets=(.05, .10, .15), frozen_threshol
 
 
 def summarize_histograms(data, histograms, threshold, method="model", split="val", budget=.05):
-    report = metrics.report(_canonical(data), histograms, threshold)
+    # Histogram reporting needs ontology metadata only. Re-adapting a full
+    # dataset here can read other splits during VAL checkpoint selection.
+    catalog = data if hasattr(data, "categories") and hasattr(data, "groups") else _canonical(data, split)
+    report = metrics.report(catalog, histograms, threshold)
     rows = [dict(method=method, split=split, val_fpr_budget=budget, threshold=threshold, **r)
             for r in report["per_building"]]
     aggregates = []
-    for kind, name, _ in metrics.slices(_canonical(data)):
+    for kind, name, _ in metrics.slices(catalog):
         subset = [r for r in rows if r["slice_type"] == kind and r["slice"] == name]
         aggregates.append(dict(method=method, split=split, val_fpr_budget=budget, threshold=threshold,
                                slice_type=kind, slice=name, **fixed_macro(subset)))
@@ -120,8 +127,10 @@ def summarize_histograms(data, histograms, threshold, method="model", split="val
 
 def evaluate_predictor(dataset, predict, split="val", spec=None, budget=.05, threshold=None):
     """Streaming training callback: inference occurs before evaluator accesses labels."""
-    data = (getattr(dataset, "canonical", _canonical(dataset)) if (spec or {}).get("original_full_support")
-            or (spec or {}).get("id") == "stack-original" else _canonical(dataset))
+    if (spec or {}).get("original_full_support") or (spec or {}).get("id") == "stack-original":
+        data = dataset.canonical if hasattr(dataset, "canonical") else _canonical(dataset, split)
+    else:
+        data = _canonical(dataset, split)
     samples = [row for row in data.samples if row["split"] == split]
     next_row = {row["event_id"]: row for row in samples}
     @lru_cache(maxsize=24)
@@ -129,6 +138,11 @@ def evaluate_predictor(dataset, predict, split="val", spec=None, budget=.05, thr
         result = predict(next_row[event_id])
         if isinstance(result, tuple):
             result = dict(score=result[0], support=result[1])
+        if (spec or {}).get("id") not in (None, "stack", "stack-original") and not result.get("fusion_parameters"):
+            extras = result.get("extras", {})
+            if not extras.get("fusion_parameters"):
+                result = {**result, "extras": {key: value for key, value in extras.items()
+                          if key not in ("stack_raw", "stack_raw7")}}
         return result
     if (spec or {}).get("scenario") == "C" or (spec or {}).get("task") == "progression":
         data = _ProgressionData(data, lambda row: prediction(row["event_id"]))
@@ -252,7 +266,7 @@ class SavedMapDataset:
 
     def target(self, event_id):
         record = self.records[event_id]
-        with np.load(_map_path(self.root, record), allow_pickle=False) as values:
+        with storage.open_arrays(self.root, record) as values:
             fields = ("target", "support", "class_targets", "before", "after")
             if any(key not in values for key in fields):
                 raise ValueError("Saved maps lack target/slice metadata for canonical report-only")
@@ -268,16 +282,24 @@ def _map_path(root, record):
     return path
 
 
+def _uses_raw_stack(record):
+    """Cached head inputs do not change a primary method's own saved prediction."""
+    return (not record.get("canonical_score") and
+            (record.get("method", record.get("id")) in ("stack", "stack-original") or
+             record.get("fusion_parameters") is not None))
+
+
 def _map_predictions(root, records):
     by_event = {row["event_id"]: row for row in records}
     if len(by_event) != len(records):
         raise ValueError("Duplicate method/split/event map")
     @lru_cache(maxsize=24)
     def load(event_id):
-        with np.load(_map_path(root, by_event[event_id]), allow_pickle=False) as value:
+        with storage.open_arrays(root, by_event[event_id]) as value:
             key = "score" if "score" in value else "scores"
             record = by_event[event_id]
-            extras = {k: value[k].copy() for k in ("stack_raw", "stack_raw7", "fusion_signal_logit") if k in value}
+            extras = ({k: value[k].copy() for k in ("stack_raw", "stack_raw7", "fusion_signal_logit") if k in value}
+                      if _uses_raw_stack(record) else {})
             return dict(score=np.asarray(value[key], np.float32), support=np.asarray(value["support"], bool),
                         extras=extras, stack_contract=record.get("stack_contract"),
                         fusion_parameters=record.get("fusion_parameters"))
@@ -287,7 +309,7 @@ def _map_predictions(root, records):
 def _prediction_diagnostics(root, records):
     grouped = defaultdict(lambda: defaultdict(lambda: [0., 0]))
     for record in records:
-        with np.load(_map_path(root, record), allow_pickle=False) as arrays:
+        with storage.open_arrays(root, record) as arrays:
             target, support = arrays["target"], arrays["support"].astype(bool)
             if "forecast_support" in arrays:
                 support = support & arrays["forecast_support"].astype(bool)
@@ -320,7 +342,7 @@ def _evaluation_data(dataset, root, records):
     """Use saved task targets if supplied, otherwise the existing canonical dataset."""
     data = _canonical(dataset)
     first = records[0]
-    with np.load(_map_path(root, first), allow_pickle=False) as arrays:
+    with storage.open_arrays(root, first) as arrays:
         has_targets = all(key in arrays for key in ("target", "class_targets", "before", "after", "support"))
     if has_targets and all(key in first for key in ("bbox_xywh", "view_id", "previous_year", "current_year")):
         return SavedMapDataset(root, records, data.categories, data.groups)
@@ -333,7 +355,7 @@ def _same_cohort(root, left, right):
     if set(a) != set(b):
         raise ValueError("Compared methods have different event IDs")
     for event in a:
-        with np.load(_map_path(root, a[event]), allow_pickle=False) as x, np.load(_map_path(root, b[event]), allow_pickle=False) as y:
+        with storage.open_arrays(root, a[event], fields=("target", "support")) as x, storage.open_arrays(root, b[event], fields=("target", "support")) as y:
             if any(not np.array_equal(x[key], y[key]) for key in ("target", "support")):
                 raise ValueError(f"Compared methods have different target/support: {event}")
         for key in ("building_id", "view_id", "bbox_xywh", "previous_year", "current_year"):
@@ -408,6 +430,7 @@ def build_report(dataset, manifest, out, config, records):
     """Bound report histogram RAM to one method/split; clean scratch on any exit."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    storage.verify_manifest(out, manifest)
     with tempfile.TemporaryDirectory(prefix=PREFIX + "histograms-", dir=out) as scratch:
         return _build_report(dataset, manifest, out, config, records, _HistogramSpool(scratch))
 
@@ -430,13 +453,14 @@ def _build_report(dataset, manifest, out, config, records, histograms):
     records = [_metadata(row) for row in (records or [])]
     metadata = {row["method"]: row for row in records}
     for row in manifest:
-        metadata.setdefault(row["method"], row)
+        metadata[row["method"]] = {**row, **metadata.get(row["method"], {})}
     matrix = config.get("matrix", config.get("resolved_matrix", []))
     if isinstance(matrix, dict):
-        matrix = matrix.get("variants", [])
+        matrix = [*matrix.get("variants", []), *matrix.get("fusion_variants", [])]
     for row in matrix:
         item = _metadata(row)
         metadata.setdefault(item["method"], {**item, "status": "incomplete"})
+    _annotate_reference_producers(out, metadata)
     if dataset is None:
         ontology = config.get("ontology", {})
         categories = config.get("categories", ontology.get("categories", []))
@@ -467,7 +491,8 @@ def _build_report(dataset, manifest, out, config, records, histograms):
                     frozen.setdefault(str(budget), {})[method] = dict(decision,
                         calibration_recall=decision.get("recall"), calibration_fpr=decision.get("fpr"),
                         threshold_origin="frozen before TEST")
-    for (method, split), maps in sorted(grouped.items()):
+    reduced = config.get("matrix_protocol") == "reduced-v2"
+    for (method, split), maps in _progress.progress(sorted(grouped.items()), stage="report-histograms"):
         current = _evaluation_data(dataset, out, maps)
         by_event, prediction = _map_predictions(out, maps)
         samples = [s for s in current.samples if s["split"] == split]
@@ -480,7 +505,16 @@ def _build_report(dataset, manifest, out, config, records, histograms):
             covered["baseline_original_counts_parity"] = "passed"
         summary, details = _prediction_diagnostics(out, maps)
         predictions[method, split] = summary
-        prediction_rows.extend(dict(method=method, split=split, **row) for row in details)
+        provenance = _checkpoint_fields(metadata.get(method, {}), metadata)
+        for row in details:
+            # A head may reference its parent's U/residual arrays. The producer
+            # of those diagnostics is the primary predictor, not the fusion head.
+            prediction_rows.append(dict(method=method, split=split, **row,
+                **{**provenance, "metric_checkpoint_id": provenance["prediction_checkpoint_id"],
+                   "producer_id": provenance["prediction_producer_id"]},
+                quantizer_step=config.get("quantizer_step", .1),
+                quantizer_applied=row["metric"].startswith(("U_", "nll_")),
+                feature_normalizer_artifact_sha256=metadata.get(method, {}).get("feature_normalizer_artifact_sha256")))
         del hist
     operating = {budget: {} for budget in budgets}
     # Interventions use their original checkpoint's threshold, even on VAL.
@@ -518,7 +552,7 @@ def _build_report(dataset, manifest, out, config, records, histograms):
                 if metadata.get(method, {}).get("scenario") == "A" else
                 metadata.get(method, {}).get("target_type", "annotation-derived latest change"))
             for row in (*macro, *rows):
-                row.update(target_type=target_type, overall_val_recall=selected.get("calibration_recall"),
+                row.update(**_checkpoint_fields(metadata.get(method, {}), metadata), target_type=target_type, overall_val_recall=selected.get("calibration_recall"),
                            overall_val_fpr=selected.get("calibration_fpr"))
             aggregates.extend(macro)
             per_building.extend(rows)
@@ -644,14 +678,20 @@ def _build_report(dataset, manifest, out, config, records, histograms):
                 equal_compute_claim=False)
             named_comparisons.append(comparison)
     semantic, semantic_buildings = semantic_state_metrics(dataset, out, manifest)
+    for row in (*semantic, *semantic_buildings):
+        row.update(**_checkpoint_fields(metadata.get(row["method"], {}), metadata))
     for row in details:
         if row["task"] == "semantic-state":
             row["task"] = "A-downstream-change"
             row["target_type"] = "annotation-derived latest change (semantic memory downstream)"
     main = [row for row in details if row["model"] in selected_main]
+    if reduced:
+        main, details, comparisons, reduced_selection = reduced_tables(
+            out, metadata, overall, per_building, predictions, grouped, config, errors)
+        selected_main = set(reduced_selection.values())
     main.extend(_semantic_main_rows(semantic, semantic_buildings, metadata,
         config.get("bootstrap_repeats", config.get("bootstrap_repetitions", 2000)),
-        config.get("practical", config.get("practical_thresholds"))))
+        config.get("practical", config.get("practical_thresholds")), control_policy="repeat" if reduced else None))
     if not main:
         main = [dict(task="matrix", model="not-started", control=None, f1=None, iou=None, recall=None,
                      fpr=None, delta_f1=None, ci_low=None, ci_high=None, prediction_vs_control="N/A",
@@ -662,7 +702,7 @@ def _build_report(dataset, manifest, out, config, records, histograms):
         lengths = [int(r.get("observations", r.get("history_length", r.get("frame", 2) + 1))) for r in current]
         cohorts[method] = dict(all=len(current), at_least_three_observations=sum(n >= 3 for n in lengths),
                                cohorts_identical=bool(current) and all(n >= 3 for n in lengths))
-    summary = dict(schema_version=1, training_seeds=[13], exploratory=True, main_table=main,
+    summary = dict(schema_version=2 if reduced else 1, training_seeds=[13], exploratory=True, main_table=main,
                    detailed_table=details, thresholds={str(k): v for k, v in operating.items()},
                    coverage={"/".join(k): v for k, v in coverage.items()}, cohorts=cohorts,
                    prediction_diagnostics={"/".join(k): v for k, v in predictions.items()},
@@ -677,18 +717,41 @@ def _build_report(dataset, manifest, out, config, records, histograms):
     _write_csv(out / (PREFIX + "detailed_table.csv"), details)
     _write_csv(out / (PREFIX + "metrics.csv"), aggregates)
     _write_csv(out / (PREFIX + "per_building.csv"), per_building)
+    for row in (*comparisons, *named_comparisons):
+        producer = _checkpoint_fields(metadata.get(row["method"], {}), metadata)
+        control = _checkpoint_fields(metadata.get(row["control"], {}), metadata)
+        row.update(metric_checkpoint_id=producer["metric_checkpoint_id"],
+                   control_checkpoint_id=control["metric_checkpoint_id"],
+                   producer_id=producer["producer_id"], control_producer_id=control["producer_id"],
+                   reference_contract_sha256=producer["reference_contract_sha256"],
+                   control_reference_contract_sha256=control["reference_contract_sha256"])
     _write_csv(out / (PREFIX + "comparisons.csv"), comparisons)
     _write_csv(out / (PREFIX + "ablation_comparisons.csv"), named_comparisons)
     _write_csv(out / (PREFIX + "prediction_metrics.csv"), prediction_rows)
     _write_csv(out / (PREFIX + "semantic_metrics.csv"), semantic)
     _write_csv(out / (PREFIX + "semantic_per_building.csv"), semantic_buildings)
+    if reduced:
+        summary["all_event_visuals"] = write_event_index(out, manifest)
+        summary["per_event_metrics"] = write_event_metrics(out, manifest, data, operating[.05], metadata)
+        matrix_record = config.get("matrix", {})
+        planned = matrix_record.get("planned_fit_counts", dict(primary=18, score_fusion=48, feature_fusion=8, total=74)) if isinstance(matrix_record, dict) else {}
+        planned_ids = {row.get("id", row.get("method")) for row in matrix}
+        completed_ids = {row["method"] for row in records if row.get("status") == "completed" and row["method"] in planned_ids}
+        summary["fit_counts"] = dict(planned=planned, actual_completed=len(completed_ids),
+            primary_completed=sum(not metadata[method].get("fusion_kind") for method in completed_ids),
+            fusion_completed=sum(bool(metadata[method].get("fusion_kind")) for method in completed_ids),
+            score_fusion_completed=sum(metadata[method].get("fusion_kind") in ("logreg", "score-mlp", "score-cnn") for method in completed_ids),
+            feature_fusion_completed=sum(metadata[method].get("fusion_kind") in ("feature-mlp", "cross-attention") for method in completed_ids),
+            source="completed training records, excluding fixed references and score-only variants")
     write_json(out / (PREFIX + "main_table.json"), main)
     write_json(out / (PREFIX + "report.json"), summary)
     write_json(out / (PREFIX + "thresholds.json"), summary["thresholds"])
     write_json(out / (PREFIX + "report_inputs.json"), dict(categories=data.categories, groups=data.groups,
                config=config, records=records, manifest=manifest))
-    columns = ("task", "target_type", "model", "control", "f1", "iou", "recall", "fpr", "delta_f1_ci",
-               "prediction_vs_control", "seconds", "status")
+    columns = (("task", "target_type", "model", "metric_checkpoint_id", "control", "f1", "iou", "recall", "fpr",
+                "delta_f1_ci", "delta_f1_stack", "buildings", "history_conclusion", "stack_practical_status") if reduced else
+               ("task", "target_type", "model", "control", "f1", "iou", "recall", "fpr", "delta_f1_ci",
+                "prediction_vs_control", "seconds", "status"))
     lines = ["ГЛАВНАЯ ТАБЛИЦА — exploratory TEST, пороги по VAL FPR ≤ 5%, seed=13", "",
              " | ".join(columns)]
     for row in main:
@@ -746,7 +809,7 @@ def _display_map(value, low, high, support=None):
     return Image.fromarray(np.uint8(rgb * 255)).resize((224, 224), Image.Resampling.NEAREST)
 
 
-def build_gallery(out, manifest, thresholds, limit=4, methods=None):
+def build_gallery(out, manifest, thresholds, limit=4, methods=None, *, event_ids=None, scales_override=None, directory=None):
     """Fixed common examples plus explicit failure gallery; TRAIN/VAL-only scales.
 
     RGB is shown only when it was actually saved/referenced. Missing RGB or
@@ -759,10 +822,11 @@ def build_gallery(out, manifest, thresholds, limit=4, methods=None):
         manifest = [row for row in manifest if row["method"] in set(methods)]
     keys = ("score", "l1", "cosine", "U", "G", "semantic_before", "semantic_after", "semantic_probability", "progression")
     samples = defaultdict(list)
-    for row in sorted(manifest, key=lambda r: (r["method"], r["event_id"])):
+    scale_records = [] if scales_override is not None else sorted(manifest, key=lambda r: (r["method"], r["event_id"]))
+    for row in _progress.progress(scale_records, stage="gallery-TRAIN-VAL-scales"):
         if row["split"] not in ("train", "val"):
             continue
-        with np.load(_map_path(out, row), allow_pickle=False) as arrays:
+        with storage.open_arrays(out, row) as arrays:
             for key in keys:
                 if key not in arrays or key == "score":
                     continue
@@ -780,21 +844,26 @@ def build_gallery(out, manifest, thresholds, limit=4, methods=None):
             radius = max(abs(low), abs(high), 1e-8)
             low, high = -radius, radius
         scales[key] = [float(low), float(max(high, low + 1e-8))]
-    test = [r for r in manifest if r["split"] == "test"]
+    if scales_override is not None:
+        scales = scales_override
+    test = [r for r in manifest if r["split"] == "test" or event_ids is not None]
     by_event = defaultdict(list)
     for row in test:
         by_event[row["event_id"]].append(row)
     # Hash order is deterministic and independent of model scores/targets.
     import hashlib
-    fixed = sorted(by_event, key=lambda event: hashlib.sha256(("13:" + event).encode()).hexdigest())[:limit]
+    fixed = (list(event_ids) if event_ids is not None else
+             sorted(by_event, key=lambda event: hashlib.sha256(("13:" + event).encode()).hexdigest())[:limit])
+    if set(fixed) - set(by_event):
+        raise ValueError("Requested event is absent from the saved scientific manifest")
     errors = []
-    for event, rows in by_event.items():
+    for event, rows in ([] if event_ids is not None else by_event.items()):
         score = 0.
         for row in rows:
             selected = thresholds.get(row["method"])
             if selected is None:
                 continue
-            with np.load(_map_path(out, row), allow_pickle=False) as arrays:
+            with storage.open_arrays(out, row) as arrays:
                 if "score" not in arrays:
                     continue
                 valid = arrays["support"].astype(bool) & (arrays["target"] != 255)
@@ -802,15 +871,19 @@ def build_gallery(out, manifest, thresholds, limit=4, methods=None):
                 score = max(score, float(np.mean(wrong[valid])) if valid.any() else 0.)
         errors.append((score, event))
     failures = [event for _, event in sorted(errors, key=lambda item: (-item[0], item[1]))[:limit]]
-    gallery = out / (PREFIX + "gallery")
-    gallery.mkdir(exist_ok=True)
+    gallery = Path(directory) if directory is not None else out / (PREFIX + "gallery")
+    gallery.mkdir(parents=True, exist_ok=True)
     entries = []
-    for role, events in (("fixed", fixed), ("failures", failures)):
-        for number, event in enumerate(events):
+    rendered = {}
+    for role, events in (("requested" if event_ids is not None else "fixed", fixed), ("failures", failures)):
+        for number, event in enumerate(_progress.progress(events, stage="gallery-" + role)):
+            if event in rendered:
+                entries.append(dict(rendered[event], role=role))
+                continue
             panels, missing = [], []
             rows = sorted(by_event[event], key=lambda r: (r["method"] not in ("stack", "stack-original"), r["method"]))
             for row in rows:
-                with np.load(_map_path(out, row), allow_pickle=False) as arrays:
+                with storage.open_arrays(out, row) as arrays:
                     support = arrays["support"].astype(bool)
                     if row is rows[0]:
                         if "rgb_history" in arrays or "history_rgb" in arrays:
@@ -860,7 +933,9 @@ def build_gallery(out, manifest, thresholds, limit=4, methods=None):
                 canvas.paste(picture, (x, y + 24))
             name = PREFIX + f"{role}-{number:03d}.png"
             canvas.save(gallery / name)
-            entries.append(dict(role=role, event_id=event, path=name, missing=sorted(set(missing))))
+            entry = dict(role=role, event_id=event, path=name, missing=sorted(set(missing)))
+            entries.append(entry)
+            rendered[event] = entry
     write_json(gallery / (PREFIX + "manifest.json"), dict(scales=scales, scale_source="TRAIN/VAL only; common per signal",
         fixed_policy="SHA256(13:event_id), independent of scores and targets",
         failure_policy="largest per-event maximum method error fraction at frozen VAL threshold; diagnostic only",
@@ -977,7 +1052,7 @@ class _SemanticClassData:
 
     @lru_cache(maxsize=24)
     def values(self, event):
-        with np.load(_map_path(self.root, self.records[event]), allow_pickle=False) as arrays:
+        with storage.open_arrays(self.root, self.records[event]) as arrays:
             return {key: arrays[key].copy() for key in ("semantic_probability", "semantic_target", "semantic_known", "support")}
 
     def target(self, event):
@@ -996,7 +1071,8 @@ def semantic_state_metrics(dataset, root, manifest):
     """Per-class multilabel state metrics at fixed .5, after spatial overlap merge."""
     grouped = defaultdict(list)
     for row in manifest:
-        if row.get("scenario", row.get("spec", {}).get("scenario")) == "A" and not row["method"].endswith("+stack"):
+        if (row.get("scenario", row.get("spec", {}).get("scenario")) == "A"
+                and not row.get("fusion_kind") and "+" not in row["method"]):
             grouped[row["method"], row["split"]].append(row)
     per_building, macro = [], []
     for (method, split), records in sorted(grouped.items()):
@@ -1021,10 +1097,13 @@ def semantic_state_metrics(dataset, root, manifest):
                 values[key] = _mean(r[key] for r in rows)
                 values[key + "_buildings"] = sum(r[key] is not None for r in rows)
             macro.append(values)
+    metadata = {row["method"]: row for row in manifest}
+    for row in (*macro, *per_building):
+        row.update(**_checkpoint_fields(metadata.get(row["method"], {}), metadata))
     return macro, per_building
 
 
-def _semantic_main_rows(semantic, per_building, metadata, bootstrap_repetitions, practical=None):
+def _semantic_main_rows(semantic, per_building, metadata, bootstrap_repetitions, practical=None, control_policy=None):
     methods = sorted({r["method"] for r in semantic})
     scores = {}
     for method in methods:
@@ -1034,7 +1113,8 @@ def _semantic_main_rows(semantic, per_building, metadata, bootstrap_repetitions,
             scores[method, split] = {metric: _mean(
                 _mean(r[metric] for r in subset if r["building_id"] == building) for building in buildings)
                 for metric in metrics.METRICS}
-    controls = [m for m in methods if metadata[m].get("control") in ("independent", "repeat")]
+    controls = [m for m in methods if metadata[m].get("control") in
+                (("repeat",) if control_policy == "repeat" else ("independent", "repeat"))]
     control = max(controls, key=lambda method: (scores[method, "val"]["f1"]
         if scores[method, "val"]["f1"] is not None else -1., method)) if controls else None
     result = []
@@ -1053,7 +1133,10 @@ def _semantic_main_rows(semantic, per_building, metadata, bootstrap_repetitions,
                     f1=_mean(r["f1"] for r in subset), semantic_f1=_mean(r["f1"] for r in subset)))
         ci = paired_bootstrap(paired_rows, method, control, metric="semantic_f1", repetitions=bootstrap_repetitions) if control else {}
         result.append(dict(task="semantic-state", model=method + "-semantic-state", control=control,
-            target_type="semantic state (multilabel; fixed threshold 0.5)", f1=current.get("f1"), iou=current.get("iou"),
+            target_type="semantic state (multilabel; fixed threshold 0.5)",
+            **_checkpoint_fields(metadata[method], metadata),
+            history_conclusion=practical_status(current, reference, practical), stack_practical_status="N/A",
+            f1=current.get("f1"), iou=current.get("iou"),
             precision=current.get("precision"), recall=current.get("recall"), fpr=current.get("fpr"),
             delta_f1=difference, ci_low=ci.get("ci_low"), ci_high=ci.get("ci_high"),
             bootstrap_supports_direction=ci.get("bootstrap_supports_direction"), prediction_vs_control="N/A",
@@ -1108,3 +1191,387 @@ def planned_comparisons(metadata, overall):
         ("C-history", "C-first", "progression_history_vs_first_current")):
         add(method, control, factor)
     return sorted(pairs)
+
+
+def _checkpoint_identity(value):
+    if isinstance(value, dict):
+        for key in ("state_sha256", "weights_sha256", "sha256", "checkpoint_id", "id", "path"):
+            if value.get(key) is not None:
+                return str(value[key])
+        return None
+    return str(value) if value is not None else None
+
+
+def _parent_method(method, row):
+    parent = row.get("parent_method") or row.get("base_method")
+    if parent:
+        return parent
+    return method.split("+", 1)[0].removesuffix("-residual")
+
+
+def _checkpoint_fields(row, metadata):
+    method = row.get("method", row.get("id", ""))
+    parent = _parent_method(method, row)
+    base = metadata.get(parent, row)
+    base_checkpoint = _checkpoint_identity(row.get("primary_checkpoint_id", row.get("base_checkpoint")))
+    base_checkpoint = base_checkpoint or _checkpoint_identity(base.get("checkpoint_sha256", base.get("checkpoint")))
+    head_checkpoint = _checkpoint_identity(row.get("fusion_checkpoint_id", row.get("fusion_checkpoint")))
+    if row.get("fusion_kind"):
+        head_checkpoint = head_checkpoint or _checkpoint_identity(row.get("checkpoint_sha256", row.get("checkpoint")))
+    fixed = method in ("stack", "stack-original", "A-independent") or row.get("control") == "copy-last"
+    producer_kind = "fixed_reference" if fixed else "trained_fusion" if row.get("fusion_kind") else "trained_primary"
+    base_producer = base_checkpoint or base.get("reference_producer_id") or ("reference:" + parent if fixed else None)
+    producer = head_checkpoint or base_checkpoint or row.get("reference_producer_id") or base_producer
+    return dict(primary_checkpoint_id=base_checkpoint, fusion_checkpoint_id=head_checkpoint,
+                metric_checkpoint_id=head_checkpoint or base_checkpoint,
+                prediction_checkpoint_id=base_checkpoint, producer_kind=producer_kind,
+                producer_id=producer, prediction_producer_id=base_producer,
+                reference_contract_sha256=row.get("reference_contract_sha256", base.get("reference_contract_sha256")),
+                reference_artifact_path=row.get("reference_artifact_path", base.get("reference_artifact_path")))
+
+
+def _annotate_reference_producers(out, metadata):
+    """Attribute fixed references without inventing neural checkpoints."""
+    out = Path(out)
+    normalizer = out / (PREFIX + "feature_normalization.json")
+    normalizer_hash = sha256(normalizer) if normalizer.exists() else None
+    for method, row in metadata.items():
+        if row.get("task") in ("actual-next", "h0"):
+            row["feature_normalizer_artifact_sha256"] = normalizer_hash
+        reference = None
+        if method.endswith("-copy-last") or row.get("control") == "copy-last":
+            candidate = out / (PREFIX + method + ".json")
+            if candidate.exists():
+                reference = sha256(candidate)
+                row["reference_artifact_path"] = candidate.name
+        elif method in ("stack", "stack-original"):
+            contract = row.get("stack_contract", row.get("source_stack_contract"))
+            if contract is not None:
+                reference = hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                                                     allow_nan=False).encode()).hexdigest()
+                row["reference_artifact_path"] = PREFIX + "report_inputs.json:manifest.stack_contract"
+        elif method == "A-independent":
+            candidate = out / (PREFIX + "data_contract.json")
+            if candidate.exists():
+                reference = sha256(candidate)
+                row["reference_artifact_path"] = candidate.name
+        else:
+            continue
+        row["reference_contract_sha256"] = reference
+        row["reference_producer_id"] = "reference:" + method + (":" + reference if reference else "")
+        row["reference_identity_status"] = "verified_saved_contract" if reference else "contract_unavailable"
+
+
+
+def _history_control(base, metadata):
+    if base == "A-learned":
+        return "A-repeat"
+    if base == "B-history":
+        return "B-regularized"
+    if base == "C-history":
+        return "C-latest"
+    row = metadata.get(base, {})
+    if row.get("control") != "history":
+        return None
+    suffix = "pair-only" if row.get("task") == "direct" else "last-only"
+    return base.removesuffix("-history") + "-" + suffix
+
+
+def _matched_history_control(method, row, metadata):
+    base = _parent_method(method, row)
+    control = _history_control(base, metadata)
+    if control is None:
+        return None
+    # Suffix preserves representation and exactly the same head/information.
+    suffix = method[len(base):] if method.startswith(base) else ""
+    if not suffix and row.get("fusion_kind"):
+        suffix = "+" + row["fusion_kind"]
+    return control + suffix
+
+
+def _val_f1_key(method, overall):
+    row = overall.get((method, "val", .05), {})
+    number = lambda key, fallback: row.get(key) if row.get(key) is not None else fallback
+    # min() gives a lexical-smallest deterministic tie break.
+    return (-number("f1", -float("inf")), number("fpr", float("inf")),
+            -number("iou", -float("inf")), -number("recall", -float("inf")), method)
+
+
+def _same_prediction_area(root, left, right, quantizer_step):
+    a, b = {r["event_id"]: r for r in left}, {r["event_id"]: r for r in right}
+    if set(a) != set(b):
+        raise ValueError("Prediction comparison has different event IDs")
+    for event in a:
+        for record in (a[event], b[event]):
+            if record.get("quantizer_step", quantizer_step) != quantizer_step:
+                raise ValueError("Prediction comparison uses different quantizers")
+        with storage.open_arrays(root, a[event]) as x, storage.open_arrays(root, b[event]) as y:
+            support_x, support_y = x["support"].astype(bool), y["support"].astype(bool)
+            if "forecast_support" in x:
+                support_x &= x["forecast_support"].astype(bool)
+            if "forecast_support" in y:
+                support_y &= y["forecast_support"].astype(bool)
+            if not np.array_equal(support_x, support_y):
+                raise ValueError("Prediction NLL comparisons require the same supported area")
+
+
+def reduced_tables(root, metadata, overall, per_building, predictions, grouped, config, errors=None):
+    """Nine VAL-selected history variants, with independent history/stack conclusions.
+
+    All primary/fusion variants remain in the detailed table. Residual is a
+    normal VAL candidate. A detector's prediction diagnostic comes exclusively
+    from its own primary checkpoint, never the separately retained NLL winner.
+    """
+    errors = errors or {}
+    repetitions = config.get("bootstrap_repeats", config.get("bootstrap_repetitions", 2000))
+    limits = config.get("practical", config.get("practical_thresholds"))
+    evaluation_rows = [row for row in per_building if row["split"] == "test" and row["val_fpr_budget"] == .05]
+    comparisons, comparison_cache, checked_forecasts = [], {}, set()
+    def compare(method, control, relation):
+        if not control or (method, "test", .05) not in overall or (control, "test", .05) not in overall:
+            return {}
+        key = method, control
+        if key not in comparison_cache:
+            _same_cohort(root, grouped[method, "test"], grouped[control, "test"])
+            rows = {}
+            for metric in ("f1", "iou", "recall", "fpr"):
+                result = paired_bootstrap(evaluation_rows, method, control, metric, repetitions, 13)
+                result.update(relation=relation,
+                    metric_checkpoint_id=_checkpoint_fields(metadata[method], metadata)["metric_checkpoint_id"],
+                    control_checkpoint_id=_checkpoint_fields(metadata[control], metadata)["metric_checkpoint_id"])
+                comparisons.append(result)
+                rows[metric] = result
+            comparison_cache[key] = rows
+        return comparison_cache[key].get("f1", {})
+    details = []
+    for method in _progress.progress(sorted(metadata), stage="report-paired-bootstrap"):
+        meta = metadata[method]
+        base = _parent_method(method, meta)
+        base_meta = metadata.get(base, meta)
+        task = base_meta.get("task", meta.get("task", "direct"))
+        current = overall.get((method, "test", .05), {})
+        val = overall.get((method, "val", .05), {})
+        control = _matched_history_control(method, meta, metadata)
+        reference = overall.get((control, "test", .05), {})
+        status = meta.get("status", "completed" if current else "incomplete")
+        reason = errors.get(method, meta.get("reason"))
+        if method in errors:
+            status = "insufficient_data"
+        elif not current and status == "completed":
+            status, reason = "incomplete", "Primary/frozen TEST export not completed"
+        history = compare(method, control, "matched_history_control") if current and reference else {}
+        if control is None:
+            history_status = "N/A"
+        elif not reference and status == "completed":
+            history_status = "INCOMPLETE_CONTROL"
+        else:
+            history_status = practical_status(current, reference, limits, execution_status=status)
+        stack = overall.get(("stack", "test", .05), {})
+        stack_eligible = task != "progression" and method not in ("stack", "stack-original")
+        stack_pair = compare(method, "stack", "working_stack_common_support") if stack_eligible and current and stack else {}
+        stack_status = (practical_status(current, stack, limits, execution_status=status)
+                        if stack_eligible else "N/A")
+        predictive = task in ("actual-next", "h0")
+        profile_key = "U_stable" if task == "h0" else "U_all"
+        learned_last = _history_control(base, metadata)
+        if predictive and not learned_last:
+            learned_last = base if base_meta.get("control") == "last-only" else None
+        copy_last = task + "-copy-last" if predictive else None
+        prediction_value = predictions.get((base, "test"), {}).get(profile_key) if predictive else None
+        last_value = predictions.get((learned_last, "test"), {}).get(profile_key) if predictive else None
+        copy_value = predictions.get((copy_last, "test"), {}).get(profile_key) if predictive else None
+        if predictive and all(v is not None for v in (prediction_value, last_value, copy_value)):
+            for other in (learned_last, copy_last):
+                key = base, other
+                if key not in checked_forecasts:
+                    _same_prediction_area(root, grouped[base, "test"], grouped[other, "test"],
+                                          config.get("quantizer_step", .1))
+                    checked_forecasts.add(key)
+            prediction_improved = prediction_value < last_value and prediction_value < copy_value
+        else:
+            prediction_improved = None
+        attention_control = base + "+feature-mlp" if meta.get("fusion_kind") == "cross-attention" or method.endswith("+cross-attention") else None
+        attention = compare(method, attention_control, "attention_vs_same_input_feature_mlp") if attention_control else {}
+        checkpoints = _checkpoint_fields(meta, metadata)
+        last_checkpoint = _checkpoint_fields(metadata.get(learned_last, {}), metadata)["prediction_checkpoint_id"] if predictive else None
+        overall_status = stack_status if stack_eligible else history_status
+        if control and history_status in ("INCOMPLETE_CONTROL", "INCOMPLETE", "INSUFFICIENT_DATA", "ERROR"):
+            overall_status = history_status
+        elif control and history_status == "NO_GAIN" and overall_status == "PRACTICALLY_USEFUL":
+            overall_status = "STACK_GAIN_WITHOUT_HISTORY_GAIN"
+        elif predictive and overall_status == "PRACTICALLY_USEFUL" and prediction_improved is not True:
+            overall_status = "PREDICTION_NOT_IMPROVED" if prediction_improved is False else "INSUFFICIENT_DATA"
+        if method in ("stack", "stack-original"):
+            overall_status = "BASELINE" if current else "INCOMPLETE"
+        row = dict(task="A-downstream-change" if task == "semantic-state" else task,
+            target_type="annotation-derived latest change" if task == "semantic-state" else
+                base_meta.get("target_type", "annotation-derived latest change"),
+            base_method=base, model=method, score_variant=meta.get("fusion_kind") or ("residual" if method.endswith("-residual") else "standalone"),
+            family=base_meta.get("family"), size=base_meta.get("size"), control=control, **checkpoints,
+            control_checkpoint_id=_checkpoint_fields(metadata.get(control, {}), metadata)["metric_checkpoint_id"] if control else None,
+            f1=current.get("f1"), iou=current.get("iou"), precision=current.get("precision"), recall=current.get("recall"),
+            fpr=current.get("fpr"), ap_binned=current.get("ap_binned"), buildings=current.get("buildings"),
+            known_pixels=current.get("known_pixels"), val_f1=val.get("f1"), val_fpr=val.get("fpr"),
+            delta_f1=history.get("delta"), ci_low=history.get("ci_low"), ci_high=history.get("ci_high"),
+            bootstrap_supports_direction=history.get("bootstrap_supports_direction"), history_conclusion=history_status,
+            delta_f1_stack=stack_pair.get("delta"), stack_ci_low=stack_pair.get("ci_low"), stack_ci_high=stack_pair.get("ci_high"),
+            stack_bootstrap_supports_direction=stack_pair.get("bootstrap_supports_direction"), stack_practical_status=stack_status,
+            prediction_nll=prediction_value, learned_last_only_nll=last_value, copy_last_nll=copy_value,
+            prediction_improved=prediction_improved, forecasting_reference=learned_last,
+            forecasting_reference_checkpoint=last_checkpoint, quantizer_step=config.get("quantizer_step", .1) if predictive else None,
+            prediction_vs_control=(f"{_number(prediction_value)}; {learned_last}={_number(last_value)}; "
+                f"{copy_last}={_number(copy_value)} model bits/component; primary checkpoints" if predictive else "N/A"),
+            feature_mlp_control=attention_control, delta_f1_feature_mlp=attention.get("delta"),
+            feature_mlp_ci_low=attention.get("ci_low"), feature_mlp_ci_high=attention.get("ci_high"),
+            seconds=meta.get("train_seconds", meta.get("training_seconds", meta.get("seconds"))),
+            parameters=meta.get("parameters"), optimizer_steps=meta.get("optimizer_steps"),
+            peak_vram_bytes=meta.get("peak_vram_bytes"), status=overall_status, reason=reason,
+            execution_status=status, selection_split="val", exploratory=True)
+        details.append(row)
+    selected = choose_main_variants(metadata, overall)
+    by_method = {row["model"]: row for row in details}
+    main = [by_method[selected[base]] for base in sorted(selected)]
+    frozen_path = Path(root) / (PREFIX + "main_selection.json")
+    if frozen_path.exists():
+        frozen = read_json(frozen_path)
+        frozen = frozen.get("selected", frozen)
+        for base, method in selected.items():
+            expected = frozen.get(base)
+            expected = expected.get("method") if isinstance(expected, dict) else expected
+            if expected is not None and expected != method:
+                raise ValueError(f"Saved pre-TEST main selection differs from VAL reconstruction: {base}")
+    for method in ("stack", "actual-next-copy-last", "h0-copy-last"):
+        if method in by_method:
+            main.append(by_method[method])
+    return main, details, comparisons, selected
+
+
+def write_event_index(out, manifest):
+    """Every event is addressable; initial gallery selection never limits storage."""
+    out = Path(out)
+    events = {}
+    for original in manifest:
+        row = _metadata(original)
+        event = events.setdefault(row["event_id"], dict(event_id=row["event_id"], split=row["split"],
+            building_id=row["building_id"], methods=[]))
+        event["methods"].append(dict(method=row["method"], path=row["path"],
+            checkpoint=row.get("checkpoint_sha256", row.get("primary_checkpoint_id")),
+            storage_schema=row.get("storage_schema", 1)))
+    index = dict(events=[events[key] for key in sorted(events)],
+                 render_command="history-scenarios report-only --out RUN --event-id EVENT [--method METHOD]",
+                 scope="all saved TRAIN/VAL/TEST events; no training or primary-network inference")
+    write_json(out / (PREFIX + "all_events.json"), index)
+    lines = ["<!doctype html><meta charset='utf-8'><title>All saved history events</title>",
+             "<h1>All saved TRAIN / VAL / TEST events</h1>",
+             "<p>Render any event from saved arrays: <code>history-scenarios report-only --out RUN --event-id EVENT</code>. "
+             "Add repeated <code>--method METHOD</code> to select maps. No primary model or original dataset is loaded.</p>"]
+    for key in sorted(events):
+        event = events[key]
+        lines.append(f"<details><summary>{html.escape(event['split'])}: {html.escape(key)} "
+                     f"({len(event['methods'])} methods)</summary><ul>")
+        for method in event["methods"]:
+            lines.append(f"<li>{html.escape(method['method'])}: "
+                         f"<a href='{html.escape(method['path'], quote=True)}'>saved scientific artifact</a></li>")
+        lines.append("</ul></details>")
+    (out / (PREFIX + "all_events.html")).write_text("\n".join(lines), encoding="utf-8")
+    return dict(events=len(events), index=PREFIX + "all_events.json", page=PREFIX + "all_events.html")
+
+
+def render_event(out, event_id, methods=None):
+    """Render arbitrary TRAIN/VAL/TEST event using immutable saved scientific arrays."""
+    out = Path(out)
+    source = out / (PREFIX + "report_inputs.json")
+    if not source.exists():
+        report_only(out)
+    inputs = read_json(source)
+    manifest = inputs["manifest"]
+    rows = [row for row in manifest if row["event_id"] == event_id]
+    if not rows:
+        raise ValueError(f"Unknown saved event: {event_id}")
+    available = {row["method"] for row in rows}
+    if methods is not None and set(methods) - available:
+        raise ValueError(f"Requested methods are unavailable for event {event_id}: {sorted(set(methods) - available)}")
+    selected = list(methods) if methods else sorted(available)
+    # Scales belong to the whole TRAIN/VAL population, never the queried TEST event.
+    scale_path = out / (PREFIX + "visual_scales.json")
+    if scale_path.exists():
+        scales = read_json(scale_path)["scales"]
+    else:
+        with tempfile.TemporaryDirectory(prefix=PREFIX + "visual-scales-", dir=out) as scratch:
+            calculated = build_gallery(out, manifest, {}, limit=0, directory=scratch)
+        scales = calculated["scales"]
+        write_json(scale_path, dict(scales=scales, source="all saved TRAIN/VAL arrays only"))
+    storage.verify_manifest(out, [row for row in rows if row["method"] in selected])
+    thresholds = read_json(out / (PREFIX + "thresholds.json")).get("0.05", {})
+    directory = out / (PREFIX + "event-visuals") / hashlib.sha256(event_id.encode()).hexdigest()[:20]
+    result = build_gallery(out, rows, thresholds, methods=selected, event_ids=[event_id],
+                           scales_override=scales, directory=directory)
+    result.update(event_id=event_id, methods=selected, scientific_artifacts_unchanged=True,
+                  inference_performed=False)
+    print(json.dumps(result, ensure_ascii=False))
+    return result
+
+
+def choose_main_variants(metadata, overall):
+    """Pure VAL-only selector shared by pre-TEST freeze and report reconstruction."""
+    bases = [method for method, row in metadata.items() if _parent_method(method, row) == method and
+             _history_control(method, metadata) is not None and not row.get("fusion_kind") and
+             row.get("control") in ("history", "learned")]
+    selected = {}
+    for base in sorted(bases):
+        candidates = [method for method, row in metadata.items() if _parent_method(method, row) == base
+                      and (method, "val", .05) in overall]
+        selected[base] = min(candidates, key=lambda method: _val_f1_key(method, overall)) if candidates else base
+    return selected
+
+
+def write_event_metrics(out, manifest, data, thresholds, metadata):
+    """Stream all correlated event-crop diagnostics; inferential metrics stay buildings."""
+    path = Path(out) / (PREFIX + "per_event.csv")
+    fields = ["method", "event_id", "building_id", "split", "slice_type", "slice", "target_type",
+              "threshold", "val_fpr_budget", "tp", "fp", "fn", "tn", "known_pixels", "positive_pixels", "negative_pixels",
+              *metrics.METRICS, "metric_checkpoint_id", "producer_id", "reference_contract_sha256", "status", "aggregation"]
+    count = 0
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for original in _progress.progress(manifest, stage="report-event-class-diagnostics"):
+            record = _metadata(original)
+            method = record["method"]
+            selected = thresholds.get(method)
+            with storage.open_arrays(out, record) as arrays:
+                labels = metrics.slice_targets(data, arrays)
+                support = arrays["support"].astype(bool)
+                score = np.asarray(arrays["score"], np.float32)
+                contract = record.get("stack_contract")
+                raw_key = "stack_raw" if "stack_raw" in arrays else "stack_raw7" if "stack_raw7" in arrays else None
+                if contract and raw_key and _uses_raw_stack(record):
+                    logits = _stack_logits(arrays[raw_key], contract)
+                    fusion = record.get("fusion_parameters")
+                    if fusion is not None:
+                        weights = fusion.get("weight", fusion.get("weights"))
+                        logits = float(fusion["bias"]) + float(weights[0]) * logits + float(weights[1]) * arrays["fusion_signal_logit"]
+                    score = np.exp(-np.logaddexp(0., -logits))
+                for channel, (kind, label, _) in enumerate(metrics.slices(data)):
+                    target = labels[channel]
+                    valid = support & (target != 255)
+                    bins = np.ceil(score[valid] * (metrics.BINS - 1)).astype(np.int64)
+                    histogram = np.stack([np.bincount(bins[target[valid] == k], minlength=metrics.BINS) for k in (0, 1)])
+                    values = metrics.metrics(histogram, selected["threshold"] if selected else .5)
+                    if selected is None:
+                        for key in ("tp", "fp", "fn", "tn", "f1", "iou", "precision", "recall", "fpr"):
+                            values[key] = None
+                    producer = _checkpoint_fields(metadata.get(method, record), metadata)
+                    row = dict(method=method, event_id=record["event_id"], building_id=record["building_id"],
+                        split=record["split"], slice_type=kind, slice=label,
+                        target_type="annotation-derived latest change (A downstream)" if record.get("scenario") == "A" else
+                            record.get("target_type", "annotation-derived latest change"),
+                        threshold=selected.get("threshold") if selected else None, val_fpr_budget=.05,
+                        **values, metric_checkpoint_id=producer["metric_checkpoint_id"], producer_id=producer["producer_id"],
+                        reference_contract_sha256=producer["reference_contract_sha256"],
+                        status="available" if selected else "INSUFFICIENT_VAL",
+                        aggregation="correlated event-crop diagnostic; not building-level inference")
+                    writer.writerow({key: "NA" if value is None else value for key, value in row.items()})
+                    count += 1
+    return dict(path=path.name, rows=count, event_method_pairs=len(manifest), val_fpr_budget=.05,
+                aggregation="per event crop/class; overlapping pixels may recur across event diagnostics")

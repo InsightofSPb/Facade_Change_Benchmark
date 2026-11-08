@@ -145,11 +145,13 @@ class EvaluationData:
     Original canonical targets remain available separately for exact old-stack
     parity. This adapter changes only the declared common evaluation support.
     """
-    def __init__(self, dataset):
+    def __init__(self, dataset, samples=None, split=None):
         self.dataset = dataset
         self.categories, self.groups = dataset.categories, dataset.groups
         self.samples = []
-        for row in dataset.samples:
+        selected = dataset.samples if samples is None else samples
+        selected = [row for row in selected if split is None or row["split"] == split]
+        for row in selected:
             target = self.target(row["event_id"])["target"]
             self.samples.append({**row, "known_pixels": int(np.count_nonzero(target != 255)),
                                  "positive_pixels": int(np.count_nonzero(target == 1)),
@@ -204,6 +206,7 @@ class ScenarioData:
             self.baseline_inputs = memory.Inputs(self.source, self.saved, self.frozen, "cpu")
             self.synthetic = False
             self.cache_index = self._cache_index()
+            self.source_cache_index = dict(self.cache_index)
         except BaseException:
             self.saved.__exit__(None, None, None)
             raise
@@ -252,10 +255,47 @@ class ScenarioData:
                     observation_ids=[r["observation_id"] for r in observations], time_precision="year",
                     coordinate_frame="native earliest-anchor grid", bbox_xywh=list(track["bbox_xywh"]))
 
-    def missing_features(self):
-        return [identifier for identifier in sorted(self.canonical.observations)
+    def _observation_ids(self, splits=None):
+        if splits is None:
+            return sorted(self.canonical.observations)
+        splits = {splits} if isinstance(splits, str) else set(splits)
+        if splits - {"train", "val", "test"}:
+            raise ValueError("Feature preparation splits must be train, val or test")
+        return sorted({observation["observation_id"] for track in self.tracks.values()
+                       if track["split"] in splits for observation in track["observations"]})
+
+    def missing_features(self, splits=None):
+        return [identifier for identifier in self._observation_ids(splits)
                 if not (self.saved.out / "units" / (PREFIX + "features-" + identifier + ".json")).is_file()
-                and (self.overlay is None or self.overlay.read_unit(PREFIX + "causal-features-" + identifier) is None)]
+                and (self.overlay is None or not (self.overlay.out / "units" /
+                     (PREFIX + "causal-features-" + identifier + ".json")).is_file())]
+
+    def _refresh_cache_index(self):
+        """Verify overlay availability without changing immutable source identity."""
+        if not hasattr(self, "source_cache_index"):
+            self.source_cache_index = dict(getattr(self, "cache_index", {
+                "feature:" + identifier: None for identifier in self.canonical.observations}))
+        effective = dict(self.source_cache_index)
+        if self.overlay is not None:
+            for identifier in self._observation_ids():
+                key = "feature:" + identifier
+                if effective.get(key) is not None:
+                    continue
+                path = self.overlay.out / "units" / (PREFIX + "causal-features-" + identifier + ".json")
+                if not path.exists():
+                    continue
+                record = read_json(path)
+                artifact = fusion.data_module._inside(self.overlay.out, record["artifact_path"])
+                if (record.get("encoder_sha256") != self.saved.encoder_sha256 or
+                        record.get("target_labels_used") is not False or
+                        record.get("observation_id") != identifier or
+                        sha256(artifact) != record["artifact_sha256"]):
+                    raise ValueError(f"Incompatible or corrupt prepared feature overlay: {artifact}")
+                effective[key] = dict(unit_sha256=sha256(path), artifact_sha256=record["artifact_sha256"],
+                    artifact_path=record["artifact_path"], artifact_root=str(self.overlay.out),
+                    origin="run_overlay", encoder_sha256=record["encoder_sha256"])
+        self.cache_index = effective
+        return effective
 
     def _cache_index(self):
         """Stable input identity independent of lazy read/cache order, including absences."""
@@ -294,12 +334,14 @@ class ScenarioData:
                     artifact_sha256=record["artifact_sha256"], artifact_path=record["artifact_path"])
         return records
 
-    def prepare_missing(self, store, device="cpu"):
+    def prepare_missing(self, store, device="cpu", splits=None):
         """Only absent DINO observations; immutable old cache and detectors untouched."""
         self.overlay = store
-        missing = self.missing_features()
+        self._refresh_cache_index()
+        missing = self.missing_features(splits)
+        selected_count = len(self._observation_ids(splits))
         if not missing:
-            return dict(newly_computed=0, reused=len(self.canonical.observations))
+            return dict(newly_computed=0, reused=selected_count, splits=splits)
         settings = {**self.source.config["options"]["dinov2"],
                     "config_path": str(self.source.root / "run.json"),
                     "config_sha256": sha256(self.source.root / "run.json"),
@@ -312,26 +354,30 @@ class ScenarioData:
             raise ValueError("Missing-cache preparation encoder contract differs; use original compatible environment")
         store.event("missing_causal_features_preparation", observations=missing,
                     reason="compatible per-observation units absent; no causal incompatibility",
-                    encoder=contract, prior_encoder=self.encoder, source_cache_read_only=True)
+                    encoder=contract, prior_encoder=self.encoder, source_cache_read_only=True, splits=splits)
         encoder = None
         try:
-            for identifier in missing:
-                rgb, support = self.canonical.frame(identifier)
-                valid = memory.history_features.supported_patches(support)
-                if valid.any():
-                    if encoder is None:
-                        encoder = memory.history_features.DinoEncoder(settings, device, contract)
-                    arrays = encoder.encode([rgb], [support], save_patch_tokens=True)[0]
-                else:
-                    arrays = dict(patch_tokens=np.zeros((256, 384), np.float16), patch_support=valid)
-                store.save_unit(dict(unit_id=PREFIX + "causal-features-" + identifier,
-                    kind="frozen_observation_features", observation_id=identifier,
-                    encoder_sha256=self.saved.encoder_sha256, execution_encoder=contract,
-                    target_labels_used=False), arrays)
+            progress_module = importlib.import_module("facade_change.research.2026-11-08_history_scenarios_progress")
+            with progress_module.Progress(stage="cache-preparation", total=len(missing), ledger=store) as progress:
+                for identifier in missing:
+                    rgb, support = self.canonical.frame(identifier)
+                    valid = memory.history_features.supported_patches(support)
+                    if valid.any():
+                        if encoder is None:
+                            encoder = memory.history_features.DinoEncoder(settings, device, contract)
+                        arrays = encoder.encode([rgb], [support], save_patch_tokens=True)[0]
+                    else:
+                        arrays = dict(patch_tokens=np.zeros((256, 384), np.float16), patch_support=valid)
+                    store.save_unit(dict(unit_id=PREFIX + "causal-features-" + identifier,
+                        kind="frozen_observation_features", observation_id=identifier,
+                        encoder_sha256=self.saved.encoder_sha256, execution_encoder=contract,
+                        target_labels_used=False), arrays)
+                    progress.update(observation=identifier)
         finally:
             if encoder is not None:
                 encoder.close()
-        return dict(newly_computed=len(missing), reused=len(self.canonical.observations) - len(missing))
+        self._refresh_cache_index()
+        return dict(newly_computed=len(missing), reused=selected_count - len(missing), splits=splits)
 
     @lru_cache(maxsize=24)
     def feature(self, identifier):
@@ -381,9 +427,17 @@ class ScenarioData:
 
     @property
     def evaluation_data(self):
-        if not hasattr(self, "_evaluation_data"):
-            self._evaluation_data = EvaluationData(self)
-        return self._evaluation_data
+        return self.evaluation_for()
+
+    def evaluation_for(self, split=None, samples=None):
+        """Scope label/support inspection to the requested evaluation cohort."""
+        if samples is not None:
+            return EvaluationData(self, samples=samples, split=split)
+        if not hasattr(self, "_evaluation_scopes"):
+            self._evaluation_scopes = {}
+        if split not in self._evaluation_scopes:
+            self._evaluation_scopes[split] = EvaluationData(self, split=split)
+        return self._evaluation_scopes[split]
 
     @lru_cache(maxsize=24)
     def annotation(self, identifier):
@@ -488,10 +542,13 @@ class ScenarioData:
         return dict(kind="history_three_scenarios_data", synthetic=False, counts=counts,
                     channels=self.channels, grid=list(self.grid), ontology=self.ontology, causality=self.geometry,
                     source_sha256=dict(self.source.hashes), memory_sha256=dict(self.source_memory_hashes),
-                    source_cache_index_sha256=digest(self.cache_index),
+                    source_cache_index_sha256=digest(getattr(self, "source_cache_index", self.cache_index)),
+                    effective_cache_index_sha256=digest(self.cache_index),
                     split=self.canonical.split, dataset_revision=self.canonical.index["history_manifest_sha256"],
                     missing_feature_observations=[k.split(":", 1)[1] for k, v in self.cache_index.items()
                                                   if k.startswith("feature:") and v is None],
+                    prepared_feature_observations=[k.split(":", 1)[1] for k, v in self.cache_index.items()
+                                                   if v is not None and v.get("origin") == "run_overlay"],
                     target_type="annotation-derived class-membership differences, not independently reviewed events",
                     checkpoint_exposure=self.source.summary.get("checkpoint_exposure") or {
                         "status": "unknown", "note": "source run did not record verified VAL/TEST training independence"},
@@ -572,6 +629,7 @@ class SyntheticData:
     annotation_history = ScenarioData.annotation_history
     evaluation_support = ScenarioData.evaluation_support
     evaluation_data = ScenarioData.evaluation_data
+    evaluation_for = ScenarioData.evaluation_for
 
     def __init__(self, channels=8, grid=4, buildings_per_split=2, seed=13):
         self.channels, self.grid, self.synthetic = channels, (grid, grid), True
@@ -691,8 +749,8 @@ class SyntheticData:
     def verify(self):
         validate_partitions(self.tracks.values())
 
-    def prepare_missing(self, store, device="cpu"):
-        return dict(newly_computed=0, synthetic=True)
+    def prepare_missing(self, store, device="cpu", splits=None):
+        return dict(newly_computed=0, synthetic=True, splits=splits)
 
     def close(self):
         pass

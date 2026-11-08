@@ -7,7 +7,9 @@ an image encoder or a base detector. Prediction calls read inputs before targets
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
+from functools import lru_cache
+from types import SimpleNamespace
 import hashlib
 import importlib
 import json
@@ -16,6 +18,7 @@ import os
 from pathlib import Path
 import random
 import time
+import tempfile
 
 import numpy as np
 import torch
@@ -60,7 +63,10 @@ def options(config):
     result = dict(epochs=60, patience=12, lr=3e-4, weight_decay=.01,
                   effective_batch=8, microbatch=1, amp=True, grad_clip=5., seed=13,
                   quantizer_step=.1, min_scale=.05, device="cpu", smoke=False,
-                  fusion_epochs=30, fusion_lr=.01, auxiliary_weight=.1)
+                  fusion_epochs=30, fusion_lr=.01, auxiliary_weight=.1,
+                  fusion_weight_decay=0., matrix_protocol="legacy-v1")
+    if config.get("matrix_protocol") == "reduced-v2":
+        result.update(fusion_epochs=5,fusion_lr=.001)
     result.update(config.get("training", {}))
     result.update({k: v for k, v in config.items() if k in result})
     if result["seed"] != 13:
@@ -71,12 +77,19 @@ def options(config):
         raise ValueError("Positive epochs, patience and effective_batch required")
     if result["lr"] <= 0 or result["quantizer_step"] <= 0 or result["min_scale"] <= 0:
         raise ValueError("Learning rate, quantizer step and scale floor must be positive")
+    if result["matrix_protocol"] == "reduced-v2":
+        if not isinstance(result["epochs"],int) or result["epochs"]>60:
+            raise ValueError("Reduced primary budget is an integer maximum of 60 epochs")
+        if not isinstance(result["fusion_epochs"],int) or not 1 <= result["fusion_epochs"] <= 10:
+            raise ValueError("Fusion budget must explicitly be an integer between 1 and 10 epochs")
     return result
 
 
 def resolve_matrix(config):
     """Resolve all scientific comparisons before any TEST access."""
     opts = options(config)
+    if opts["matrix_protocol"] == "reduced-v2":
+        return _reduced_matrix(opts)
     sizes = ["smoke"] if opts["smoke"] else ["medium", "large"]
     result = []
     for task in ("direct", "actual-next", "h0"):
@@ -105,6 +118,59 @@ def resolve_matrix(config):
     for mode in ("latest", "first", "history"):
         result.append(dict(id="C-" + mode, task="progression", scenario="C", mode=mode,
             family="progression", size="shared", control=mode, target_type="annotation-derived progression proxy"))
+    return result
+
+
+def _reduced_matrix(opts):
+    size = "smoke" if opts["smoke"] else "large"
+    result=[]
+    for task in ("direct","actual-next","h0"):
+        for family in ("convgru","transformer"):
+            for control in ("history","pair-only" if task=="direct" else "last-only"):
+                result.append(dict(id=f"{task}-{family}-{size}-{control}",task=task,family=family,size=size,
+                    control=control,delta="signed",time_mode="real",scenario="main",
+                    matrix_protocol="reduced-v2",target_type="annotation-derived latest change"))
+    for scenario,modes,task,family,target in (
+        ("A",("learned","repeat"),"semantic-state","semantic-memory","semantic state"),
+        ("B",("history","regularized"),"direct","pair-aux","annotation-derived latest change"),
+        ("C",("history","latest"),"progression","progression","annotation-derived progression proxy")):
+        for mode in modes:
+            result.append(dict(id=scenario+"-"+mode,scenario=scenario,mode=mode,task=task,family=family,
+                size="shared",hidden=64,control=mode,matrix_protocol="reduced-v2",target_type=target))
+    return result
+
+
+def matched_control(spec):
+    if spec.get("scenario")=="A": return "A-repeat"
+    if spec.get("scenario")=="B": return "B-regularized"
+    if spec.get("scenario")=="C": return "C-latest"
+    control="pair-only" if spec["task"]=="direct" else "last-only"
+    return f"{spec['task']}-{spec['family']}-{spec['size']}-{control}"
+
+
+def resolve_fusion_matrix(config):
+    if options(config)["matrix_protocol"] != "reduced-v2":
+        return []
+    result=[]
+    for parent in resolve_matrix(config):
+        if parent["scenario"]=="C": continue
+        kinds=["logreg","score-mlp","score-cnn"]
+        if parent["task"]=="h0": kinds.extend(["feature-mlp","cross-attention"])
+        for kind in kinds:
+            result.append(dict(**{k:v for k,v in parent.items() if k!="id"},id=parent["id"]+"+"+kind,
+                parent_method=parent["id"],base_method=parent["id"],fusion_kind=kind,
+                fit_kind="feature-fusion" if kind in ("feature-mlp","cross-attention") else "score-fusion",
+                matched_control_method=matched_control(parent)+"+"+kind))
+    return result
+
+
+def matrix_contract(config):
+    result=dict(protocol=PROTOCOL,options=options(config),variants=resolve_matrix(config),seed=13,
+        test_previously_inspected=True,progression_rule=_module("abc").PROGRESSION_RULE)
+    if options(config)["matrix_protocol"]=="reduced-v2":
+        result.update(fusion_variants=resolve_fusion_matrix(config),planned_fit_counts=dict(primary=18,score_fusion=48,feature_fusion=8,total=74),
+            checkpoint_selection="top3 VAL building-macro F1 at recall-selected FPR<=.05 operating point; earlier epoch ties",
+            early_stopping="patience12 on strictly improving primary VAL F1 only; secondary improvements do not reset")
     return result
 
 
@@ -333,7 +399,7 @@ def prediction(model, dataset, row, spec, normalizer, config, intervention=None)
                 coverage90=_resize(((target - output["mean"]).abs() <= math.log(19.) * output["scale"]).float().mean(1,keepdim=True), shape)[0,0].cpu().numpy())
         elif spec.get("scenario") == "A":
             semantic_sequence = output["semantic_sequence"]
-            semantic = torch.sigmoid(output["semantic_logits"])
+            semantic = semantic_sequence[:,-1] if opts["matrix_protocol"]=="reduced-v2" else torch.sigmoid(output["semantic_logits"])
             # Soft probability of state disagreement; target remains latest change.
             score = (semantic - semantic_sequence[:, -2]).abs().amax(1, keepdim=True)
             _, sem_support = _semantic_inputs(dataset, row, opts["device"])
@@ -407,9 +473,15 @@ def _profile_prediction(model, dataset, spec, normalizer, config):
 
 
 def _validation(model, dataset, spec, normalizer, config, evaluator):
-    callback = lambda row: prediction(model, dataset, row, spec, normalizer, config)
+    @lru_cache(maxsize=24)
+    def cached(identifier):
+        return prediction(model,dataset,by_id[identifier],spec,normalizer,config)
+    by_id={row["event_id"]:row for row in dataset.split_samples("val")}
+    callback=lambda row:cached(row["event_id"])
     result = evaluator(dataset, callback, split="val", spec=spec, budget=.05)
     result["prediction_score"] = _profile_prediction(model, dataset, spec, normalizer, config)
+    if options(config)["matrix_protocol"]=="reduced-v2" and spec.get("scenario")=="A":
+        result["semantic_miou"]=_semantic_val_miou(dataset,callback)
     return result
 
 
@@ -423,6 +495,8 @@ def _criterion(result):
 def train_variant(spec, dataset, out_dir, config, evaluator=None, ledger=None, resume=False,
                   normalizer=None):
     opts = options(config)
+    if opts["matrix_protocol"] == "reduced-v2":
+        return _train_reduced_variant(spec,dataset,out_dir,config,evaluator,ledger,resume,normalizer)
     root = Path(out_dir) / "models" / spec["id"]
     root.mkdir(parents=True, exist_ok=True)
     final = root / (PREFIX + "selection.json")
@@ -602,19 +676,41 @@ def train_all(dataset, out, config, ledger=None, resume=False):
     specs = resolve_matrix(config)
     normalizer = _normalizer(dataset, out, ledger)
     matrix_path = out / (PREFIX + "resolved_matrix.json")
-    matrix = dict(protocol=PROTOCOL, options=options(config), variants=specs,
-                  seed=13, test_previously_inspected=True, progression_rule=_module("abc").PROGRESSION_RULE)
+    matrix = matrix_contract(config)
     if matrix_path.exists() and read_json(matrix_path) != matrix:
         raise ValueError("Resolved scientific matrix changed; use a new run")
-    _json(matrix_path, matrix)
+    completed_path=out/(PREFIX+"maps_manifest.json")
+    reduced=options(config)["matrix_protocol"]=="reduced-v2"
+    if reduced and completed_path.exists() and read_json(completed_path).get("completed"):
+        if not resume:
+            raise FileExistsError("Completed scientific export exists; use resume or a new output")
+        records=_verify_completed_reduced(out,config,normalizer,read_json(completed_path))
+        _event(ledger,"primary_stages_skipped",reason="completed compatible scientific export",records=len(records))
+        print(f"history-progress stage=primary-models status=skipped-completed records={len(records)}",flush=True)
+        return records
+    if not matrix_path.exists():
+        _json(matrix_path, matrix)
     records = []
+    # Partial export may already contain completed short fits. Preserve their
+    # scientific records while primary stages are checked, rather than truncating
+    # the shared record index back to its eighteen primary entries.
+    head_path=out/(PREFIX+"fusion_records.json")
+    preserved_heads=read_json(head_path) if reduced and resume and head_path.exists() else []
+    def save_records(primary_records):
+        _json(out/(PREFIX+"training_records.json"),[*primary_records,*preserved_heads])
     progression_coverage = []
     for row in dataset.samples:
+        if options(config)["matrix_protocol"]=="reduced-v2" and row["split"]=="test":
+            continue
         result = _progression(dataset, row, "cpu")
         progression_coverage.append(dict(event_id=row["event_id"], building_id=row["building_id"],
             split=row["split"], coverage=result["coverage"]))
     review = {split: _module("abc").progression_review_manifest(
         [r for r in progression_coverage if r["split"] == split]) for split in ("train", "val", "test")}
+    if reduced:
+        review_path=out/(PREFIX+"progression_review_manifest.json")
+        previous_review=read_json(review_path) if resume and review_path.exists() else {}
+        review["test"]=previous_review.get("test",dict(status="NOT_INSPECTED",reason="TEST coverage waits for frozen selections"))
     _json(out / (PREFIX + "progression_review_manifest.json"), review)
     try:
         for spec in specs:
@@ -622,7 +718,7 @@ def train_all(dataset, out, config, ledger=None, resume=False):
                 records.append(dict(id=spec["id"],spec=spec,status="INSUFFICIENT_DATA",
                     reason="Progression requires at least two buildings and a positive building in TRAIN and VAL",
                     review_manifest=PREFIX + "progression_review_manifest.json"))
-                _json(out / (PREFIX + "training_records.json"), records)
+                save_records(records)
                 continue
             try:
                 record = train_variant(spec, dataset, out, config, ledger=ledger,
@@ -634,10 +730,10 @@ def train_all(dataset, out, config, ledger=None, resume=False):
                 record = dict(id=spec["id"], spec=spec, status="ERROR", reason=str(exc))
                 _event(ledger, "model_failed", **record)
             records.append(record)
-            _json(out / (PREFIX + "training_records.json"), records)
+            save_records(records)
     except BaseException:
         remaining = specs[len(records):]
-        _json(out / (PREFIX + "training_records.json"), records + [dict(id=s["id"], spec=s,
+        save_records(records + [dict(id=s["id"], spec=s,
               status="INCOMPLETE", reason="Execution interrupted before selection") for s in remaining])
         raise
     _event(ledger, "all_model_selections_frozen_before_test", models=records,
@@ -861,6 +957,8 @@ def _cached_result(ledger, method, event_id):
 
 
 def export_all(dataset, records, out, config, ledger=None, resume=False):
+    if options(config)["matrix_protocol"] == "reduced-v2":
+        return _export_reduced(dataset,records,out,config,ledger=ledger,resume=resume)
     """Export TRAIN/VAL, freeze all heads/thresholds, then access TEST.
 
     Completed RunStore maps skip model forward on partial resume. Report-only
@@ -1039,3 +1137,561 @@ def export_all(dataset, records, out, config, ledger=None, resume=False):
         forecast_support="all compared methods share first/previous/current token geometry; original stack full-support diagnostic separate",
         old_history_support="old support intersect last-past support identically for all learned controls"))
     return manifest
+
+
+def _semantic_val_miou(dataset,predict):
+    """Canonical overlap, then per-building semantic-class IoU (not change IoU)."""
+    base=dataset.evaluation_for(split="val") if hasattr(dataset,"evaluation_for") else getattr(dataset,"evaluation_data",getattr(dataset,"canonical",dataset))
+    rows=dataset.split_samples("val")
+    per_building=defaultdict(list)
+    by_id={r["event_id"]:r for r in rows}
+    for channel,category in enumerate(base.categories):
+        def target(event):
+            row=by_id[event]
+            annotation=dataset.annotation_history(row)
+            labels=annotation["labels"][-1,channel].astype(np.uint8)
+            support=dataset.evaluation_support(row)
+            valid=annotation["known"][-1,0]&support
+            labels=np.where(valid,labels,255).astype(np.uint8)
+            return dict(target=labels,class_targets=labels[None],support=support,
+                before=np.ones(labels.shape,np.uint16),after=np.ones(labels.shape,np.uint16))
+        adapter=SimpleNamespace(samples=rows,categories=[category],groups=[],target=target)
+        histogram,_=_report().metrics.collect(adapter,rows,
+            lambda row:(predict(row)["extras"]["semantic_probability"][channel],predict(row)["support"]))
+        for building,hist in histogram.items():
+            value=_report().metrics.metrics(hist[0],.5)["iou"]
+            if value is not None: per_building[building].append(value)
+    return float(np.mean([np.mean(v) for v in per_building.values()])) if per_building else None
+
+
+def _primary_f1(result):
+    value=result.get("f1")
+    fpr=result.get("fpr")
+    if value is None or fpr is None or not np.isfinite(value) or fpr>.05+1e-12:
+        return -math.inf
+    return float(value)
+
+
+def _train_reduced_variant(spec,dataset,out_dir,config,evaluator=None,ledger=None,resume=False,normalizer=None):
+    opts=options(config)
+    normalizer=normalizer or _normalizer(dataset,out_dir,ledger)
+    root=Path(out_dir)/"models"/spec["id"]
+    root.mkdir(parents=True,exist_ok=True)
+    final=root/(PREFIX+"selection.json")
+    contract=_digest(dict(protocol="history-three-scenarios-reduced-v2",spec=spec,config=config,
+        source_sha256=sha256(__file__),normalizer_sha256=_digest(normalizer.state_dict())))
+    manager=_module("checkpoints").CheckpointManager(root,contract,ledger=ledger,restore_contract=dict(spec=spec,options=opts))
+    if final.exists():
+        record=read_json(final)
+        if not resume or record["contract"]!=contract: raise ValueError("Completed model/config mismatch")
+        for pointer in record.get("retained",[]):
+            if sha256(pointer["path"])!=pointer["sha256"]: raise ValueError("Selected weights hash mismatch")
+        _event(ledger,"model_stage_skipped",model=spec["id"],reason="completed compatible primary fit")
+        print(f"history-progress model={spec['id']} status=skipped-completed",flush=True)
+        return record
+    random.seed(13); np.random.seed(13); torch.manual_seed(13)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(13)
+    model=build_model(spec,dataset,opts)
+    device=opts["device"]; cuda=device.startswith("cuda")
+    if cuda: torch.cuda.reset_peak_memory_stats(device)
+    optimizer=torch.optim.AdamW(model.parameters(),lr=opts["lr"],weight_decay=opts["weight_decay"])
+    scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=opts["epochs"])
+    scaler=torch.amp.GradScaler("cuda",enabled=cuda and opts["amp"]) if hasattr(getattr(torch,"amp",None),"GradScaler") else torch.cuda.amp.GradScaler(enabled=cuda and opts["amp"])
+    rows=dataset.split_samples("train",predictive=spec["task"] in ("actual-next","h0"))
+    counts=Counter(r["building_id"] for r in rows)
+    evaluator=evaluator or _report().evaluate_predictor
+    first,steps,stale,best_f1=1,0,0,-math.inf
+    history=[]; peak=0; elapsed_before=0.
+    state=manager.resume()
+    if state is not None:
+        if not resume: raise FileExistsError("Incomplete reduced fit exists; use resume")
+        model.load_state_dict(state["model"]); optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"]); scaler.load_state_dict(state["scaler"])
+        _restore_rng(state["rng"])
+        first=state["epoch"]+1;steps=state["steps"];stale=state["stale"];best_f1=state["best_f1"]
+        history=state["history"];peak=state.get("peak_vram_bytes",0);elapsed_before=state.get("active_seconds",0.)
+        _event(ledger,"model_resumed",model=spec["id"],completed_epoch=first-1)
+    started=time.perf_counter();reason="early_stopping" if stale>=opts["patience"] else "budget"
+    end=first if stale>=opts["patience"] else opts["epochs"]+1
+    try:
+        for epoch in range(first,end):
+            model.train();optimizer.zero_grad(set_to_none=True)
+            order=np.random.permutation(len(rows));loss_sum=0.;used=0
+            with _module("progress").Progress(stage="TRAIN",model=spec["id"],epoch=epoch,total=len(rows),ledger=ledger) as progress:
+                for offset in range(0,len(order),opts["effective_batch"]):
+                    group=order[offset:offset+opts["effective_batch"]];group_used=0
+                    for index in group:
+                        row=rows[int(index)]
+                        context=torch.autocast(device_type="cuda",dtype=torch.float16) if cuda and opts["amp"] else nullcontext()
+                        with context:
+                            loss=_loss(model,dataset,row,spec,normalizer,opts)
+                            if loss is None:
+                                progress.update(skipped_unknown=True);continue
+                            if not torch.isfinite(loss): raise RuntimeError("Nonfinite loss; scientific budget unchanged")
+                            weight=len(rows)/(len(counts)*counts[row["building_id"]])
+                            objective=loss*weight/len(group)
+                        scaler.scale(objective).backward();loss_sum+=float(loss.detach())*weight;used+=1;group_used+=1
+                        progress.update(loss=loss_sum/used,last_val_epoch=history[-1]["epoch"] if history else None,
+                            last_val_f1=history[-1]["val"]["f1"] if history else None,best_val_f1=best_f1 if math.isfinite(best_f1) else None)
+                    if group_used:
+                        scaler.unscale_(optimizer);torch.nn.utils.clip_grad_norm_(model.parameters(),opts["grad_clip"])
+                        scaler.step(optimizer);scaler.update();steps+=1
+                    optimizer.zero_grad(set_to_none=True)
+            if not used: raise _report().InsufficientData("No supervised TRAIN pixels for this task")
+            scheduler.step()
+            with _module("progress").Progress(stage="VAL",model=spec["id"],epoch=epoch,total=1,ledger=ledger) as progress:
+                val=_validation(model,dataset,spec,normalizer,opts,evaluator)
+                progress.update(val_f1=val.get("f1"),val_recall=val.get("recall"),val_fpr=val.get("fpr"))
+            f1=_primary_f1(val)
+            if not math.isfinite(f1): raise _report().InsufficientData("No defined VAL F1 at the requested FPR budget")
+            if f1>best_f1+1e-12: best_f1=f1;stale=0
+            else: stale+=1
+            epoch_record=dict(epoch=epoch,train_loss=loss_sum/used,val={k:val.get(k) for k in
+                ("f1","iou","recall","fpr","threshold","prediction_score","semantic_miou")},optimizer_steps=steps,
+                seconds=elapsed_before+time.perf_counter()-started)
+            history.append(epoch_record)
+            peak=max(peak,torch.cuda.max_memory_allocated(device) if cuda else 0)
+            state=dict(model=model.state_dict(),optimizer=optimizer.state_dict(),scheduler=scheduler.state_dict(),
+                scaler=scaler.state_dict(),rng=_rng_state(),epoch=epoch,steps=steps,stale=stale,best_f1=best_f1,
+                history=history,peak_vram_bytes=peak,active_seconds=epoch_record["seconds"],spec=spec,contract=contract)
+            manager.save_epoch(model.state_dict(),state,epoch_record["val"],epoch)
+            _json(root/(PREFIX+"curves.json"),history)
+            _event(ledger,"history_scenarios_epoch",model=spec["id"],**epoch_record)
+            if stale>=opts["patience"]: reason="early_stopping";break
+    except _report().InsufficientData as exc:
+        record=dict(id=spec["id"],spec=spec,status="INSUFFICIENT_DATA",reason=str(exc),contract=contract,
+                    optimizer_steps=steps,completed_epochs=len(history))
+        _json(final,record);return record
+    selection=manager.finalize();primary=selection.get("checkpoint")
+    record=dict(id=spec["id"],spec=spec,status="completed" if primary else "INSUFFICIENT_DATA",contract=contract,
+        **{k:v for k,v in selection.items() if k not in ("latest","contract")},parameters=sum(p.numel() for p in model.parameters()),
+        train_seconds=elapsed_before+time.perf_counter()-started,optimizer_steps=steps,peak_vram_bytes=peak,
+        selected_epoch=primary.get("epoch") if primary else None,completed_epochs=len(history),stop_reason=reason,seed=13,
+        primary_checkpoint_id=primary.get("sha256") if primary else None,
+        checkpoint_selection="primary VAL building-macro F1 at recall-selected FPR<=.05; earlier epoch ties",
+        early_stopping="strict primary F1 improvement only; secondary metrics never reset patience",fit_kind="primary")
+    _json(final,record);_event(ledger,"model_selection_frozen",**record)
+    return record
+
+
+def _frozen_predict(store,lookup,row):
+    arrays=store.read(lookup[row["event_id"]],fields=["score","support","stack_raw"])
+    return dict(score=arrays["score"],support=arrays["support"],stack_raw=arrays["stack_raw"],
+        stack_contract=lookup[row["event_id"]].get("source_stack_contract",lookup[row["event_id"]].get("stack_contract")))
+
+
+def _score_blocks(dataset,store,lookup,split,halo=2):
+    data=dataset.evaluation_for(split=split) if hasattr(dataset,"evaluation_for") else getattr(dataset,"evaluation_data",getattr(dataset,"canonical",dataset))
+    return _module("fusion").iter_score_blocks(data,dataset.split_samples(split),
+        lambda row:_frozen_predict(store,lookup,row),halo=halo)
+
+
+def _block_tensors(block,device):
+    return {key:_tensor(block[key],device,torch.bool if key=="support" else torch.float32)[None]
+            for key in ("stack","method","support","target")}
+
+
+@contextmanager
+def _score_outputs(head,dataset,store,lookup,split,device,scratch):
+    """Merge frozen inputs then head with halo. Temporary VAL blocks are retired.
+
+    Cropped outputs agree exactly on overlaps; the canonical evaluator's final
+    averaging therefore preserves the nonlinear-head result. Memory is bounded
+    by one halo block and one event; no whole facade canvas is allocated.
+    """
+    scratch=Path(scratch);scratch.mkdir(parents=True,exist_ok=True)
+    head.eval()
+    with tempfile.TemporaryDirectory(prefix="2026-11-08-fusion-blocks-",dir=scratch) as directory:
+        paths={}
+        with torch.inference_mode():
+            for key,block in _score_blocks(dataset,store,lookup,split):
+                tensors=_block_tensors(block,device)
+                probability=_module("fusion").apply_score_tile(head,tensors["stack"],tensors["method"],
+                    tensors["support"],block["core_slices"])[0,0].cpu().numpy().astype(np.float32)
+                path=Path(directory)/(_digest(key)+".npy")
+                np.save(path,probability,allow_pickle=False);paths[key]=path
+        def predicted(row):
+            x,y,width,height=row["bbox_xywh"]
+            scene=tuple(row[k] for k in ("building_id","view_id","previous_year","current_year"))
+            score=np.zeros((height,width),np.float32)
+            for by in range(y//256,(y+height-1)//256+1):
+                for bx in range(x//256,(x+width-1)//256+1):
+                    block=np.load(paths[(scene,(bx,by))],mmap_mode="r",allow_pickle=False)
+                    left,top=max(x,bx*256),max(y,by*256)
+                    right,bottom=min(x+width,(bx+1)*256),min(y+height,(by+1)*256)
+                    score[top-y:bottom-y,left-x:right-x]=block[top-by*256:bottom-by*256,left-bx*256:right-bx*256]
+            return dict(score=score,support=dataset.evaluation_support(row),extras={})
+        yield predicted
+
+
+def _feature_head_inputs(store,parent,device):
+    arrays=store.read(parent,fields=["forecast","target_features","forecast_support","stack_score","support","target"])
+    current=_tensor(arrays["target_features"],device)[None]
+    forecast=_tensor(arrays["forecast"],device)[None]
+    shape=current.shape[-2:]
+    support=F.adaptive_avg_pool2d(_tensor(np.asarray(arrays["forecast_support"]) & np.asarray(arrays["support"]),device)[None,None],shape)>=1-1e-6
+    stack=F.adaptive_avg_pool2d(_tensor(arrays["stack_score"],device)[None,None],shape)
+    target=_tensor(arrays["target"],device)[None,None]
+    known=(_tensor(arrays["support"],device,torch.bool)[None,None])&(target!=255)
+    return current,forecast,support,stack,target,known
+
+
+def _feature_head_predict(head,store,parent,device):
+    current,forecast,support,stack,target,known=_feature_head_inputs(store,parent,device)
+    with torch.inference_mode():
+        probability,_=_module("fusion").feature_prediction(head,current,forecast,support,stack,output_size=target.shape[-2:])
+    # The fixed common target support is shared with every comparator.
+    arrays=store.read(parent,fields=["support"])
+    return dict(score=probability[0,0].cpu().numpy(),support=arrays["support"],extras={})
+
+
+def _train_reduced_fusion(spec,dataset,store,parent_maps,out,config,ledger=None,resume=False):
+    opts=options(config);kind=spec["fusion_kind"];device=opts["device"]
+    feature=kind in ("feature-mlp","cross-attention")
+    lookup={r["event_id"]:r for r in parent_maps}
+    train_rows=dataset.split_samples("train")
+    channels=int(store.read(lookup[train_rows[0]["event_id"]],fields=["forecast"])["forecast"].shape[0]) if feature else None
+    root=Path(out)/"fusion"/spec["id"];root.mkdir(parents=True,exist_ok=True)
+    final=root/(PREFIX+"selection.json")
+    contract=_digest(dict(spec=spec,options=opts,source=sha256(__file__),parent_maps=[(r["event_id"],r["artifact_sha256"]) for r in parent_maps]))
+    manager=_module("checkpoints").CheckpointManager(root,contract,ledger=ledger,restore_contract=dict(spec=spec,channels=channels))
+    if final.exists():
+        record=read_json(final)
+        if not resume or record["contract"]!=contract: raise ValueError("Fusion completed contract mismatch")
+        manager.finalize()
+        _event(ledger,"fusion_stage_skipped",model=spec["id"])
+        return record
+    torch.manual_seed(13);np.random.seed(13);random.seed(13)
+    head=_module("fusion").build_head(kind,channels=channels).to(device)
+    optimizer=torch.optim.Adam(head.parameters(),lr=opts["fusion_lr"],weight_decay=opts["fusion_weight_decay"])
+    scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda epoch:1.)
+    cuda=device.startswith("cuda")
+    scaler=torch.amp.GradScaler("cuda",enabled=cuda and opts["amp"]) if hasattr(getattr(torch,"amp",None),"GradScaler") else torch.cuda.amp.GradScaler(enabled=cuda and opts["amp"])
+    totals=Counter()
+    block_count=0
+    if feature:
+        for row in train_rows:
+            arrays=store.read(lookup[row["event_id"]],fields=["target","support"])
+            totals[row["building_id"]]+=int(np.count_nonzero((arrays["target"]!=255)&arrays["support"]))
+        block_count=len(train_rows)
+    else:
+        for key,block in _score_blocks(dataset,store,lookup,"train"):
+            core=block["core_slices"]
+            totals[key[0][0]]+=int(np.count_nonzero((block["target"][(0,*core)]!=255)&block["support"][(0,*core)]))
+            block_count+=1
+    totals={k:v for k,v in totals.items() if v>0}
+    if not totals:
+        record=dict(id=spec["id"],spec=spec,status="INSUFFICIENT_DATA",reason="No known TRAIN pixels",contract=contract)
+        _json(final,record);return record
+    first,steps=1,0;curves=[];elapsed=0.;peak=0
+    state=manager.resume()
+    if state is not None:
+        if not resume: raise FileExistsError("Fusion incomplete; use resume")
+        head.load_state_dict(state["model"]);optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"]);scaler.load_state_dict(state["scaler"]);_restore_rng(state["rng"])
+        first=state["epoch"]+1;steps=state["steps"];curves=state["history"];elapsed=state["active_seconds"];peak=state.get("peak_vram_bytes",0)
+    if cuda: torch.cuda.reset_peak_memory_stats(device)
+    started=time.perf_counter()
+    for epoch in range(first,opts["fusion_epochs"]+1):
+        head.train();optimizer.zero_grad(set_to_none=True);loss_total=0.;used=0;pending=0
+        iterable=((row,None) for row in train_rows) if feature else _score_blocks(dataset,store,lookup,"train")
+        with _module("progress").Progress(stage="fusion-TRAIN",model=spec["id"],epoch=epoch,total=block_count,ledger=ledger) as progress:
+            for number,(key,block) in enumerate(iterable,1):
+                context=torch.autocast(device_type="cuda",dtype=torch.float16) if cuda and opts["amp"] else nullcontext()
+                with context:
+                    if feature:
+                        row=key;building=row["building_id"]
+                        current,forecast,support,stack,target,known=_feature_head_inputs(store,lookup[row["event_id"]],device)
+                        probability,_=_module("fusion").feature_prediction(head,current,forecast,support,stack,output_size=target.shape[-2:])
+                        with torch.autocast(device_type="cuda",enabled=False) if cuda else nullcontext():
+                            losses=F.binary_cross_entropy(probability.float().clamp(1e-6,1-1e-6),target.float().masked_fill(~known,0),reduction="none")
+                    else:
+                        building=key[0][0];tensors=_block_tensors(block,device);core=block["core_slices"]
+                        logits=_module("fusion").score_logits(head,tensors["stack"],tensors["method"],tensors["support"])[...,core[0],core[1]]
+                        target=tensors["target"][...,core[0],core[1]]
+                        known=tensors["support"][...,core[0],core[1]]&(target!=255)
+                        losses=F.binary_cross_entropy_with_logits(logits,target.masked_fill(~known,0),reduction="none")
+                    objective=None
+                    if building in totals and known.any():
+                        loss=losses.masked_select(known).sum()/totals[building]/len(totals)
+                        # Constant scaling: a partial/unknown final group must not
+                        # increase the relative contribution of its buildings.
+                        objective=loss*block_count/opts["effective_batch"]
+                if objective is not None:
+                    if not torch.isfinite(objective): raise RuntimeError("Nonfinite fusion loss")
+                    scaler.scale(objective).backward();loss_total+=float(loss.detach());used+=1;pending+=1
+                if (number%opts["effective_batch"]==0 or number==block_count) and pending:
+                    scaler.unscale_(optimizer);torch.nn.utils.clip_grad_norm_(head.parameters(),opts["grad_clip"])
+                    scaler.step(optimizer);scaler.update();optimizer.zero_grad(set_to_none=True);steps+=1;pending=0
+                progress.update(loss=loss_total,last_val_epoch=curves[-1]["epoch"] if curves else None,
+                    last_val_f1=curves[-1]["val"]["f1"] if curves else None)
+        if not used: raise _report().InsufficientData("Fusion TRAIN has no usable supervision")
+        scheduler.step();head.eval()
+        with _module("progress").Progress(stage="fusion-VAL",model=spec["id"],epoch=epoch,total=1,ledger=ledger) as progress:
+            if feature:
+                val=_report().evaluate_predictor(dataset,lambda row:_feature_head_predict(head,store,lookup[row["event_id"]],device),split="val",spec=spec,budget=.05)
+            else:
+                with _score_outputs(head,dataset,store,lookup,"val",device,Path(out)/"work") as predict:
+                    val=_report().evaluate_predictor(dataset,predict,split="val",spec=spec,budget=.05)
+            progress.update(val_f1=val.get("f1"),val_fpr=val.get("fpr"))
+        if not math.isfinite(_primary_f1(val)): raise _report().InsufficientData("Fusion VAL F1 is undefined")
+        metrics={k:val.get(k) for k in ("f1","iou","recall","fpr","threshold")}
+        curves.append(dict(epoch=epoch,train_loss=loss_total,val=metrics,optimizer_steps=steps,seconds=elapsed+time.perf_counter()-started))
+        peak=max(peak,torch.cuda.max_memory_allocated(device) if cuda else 0)
+        state=dict(model=head.state_dict(),optimizer=optimizer.state_dict(),scheduler=scheduler.state_dict(),scaler=scaler.state_dict(),
+            rng=_rng_state(),epoch=epoch,steps=steps,history=curves,active_seconds=curves[-1]["seconds"],peak_vram_bytes=peak)
+        manager.save_epoch(head.state_dict(),state,metrics,epoch)
+        _json(root/(PREFIX+"curves.json"),curves)
+    selection=manager.finalize();primary=selection.get("checkpoint")
+    record=dict(id=spec["id"],spec=spec,status="completed" if primary else "INSUFFICIENT_DATA",contract=contract,
+        **{k:v for k,v in selection.items() if k not in ("contract","latest")},parent_method=spec["parent_method"],
+        base_method=spec["parent_method"],fusion_kind=kind,fit_kind=spec["fit_kind"],channels=channels,
+        parameters=sum(p.numel() for p in head.parameters()),optimizer_steps=steps,train_seconds=elapsed+time.perf_counter()-started,
+        peak_vram_bytes=peak,completed_epochs=len(curves),selected_epoch=primary.get("epoch") if primary else None,
+        fusion_checkpoint_id=primary.get("sha256") if primary else None,checkpoint_selection="VAL building-macro F1; earlier epoch ties",
+        matched_control_method=spec["matched_control_method"],fit_split="train",seed=13,
+        objective="BCE; equal total known-pixel mean weight per building; fixed five/default maximum ten epochs",
+        optimizer="Adam",lr=opts["fusion_lr"],weight_decay=opts["fusion_weight_decay"])
+    _json(final,record);_event(ledger,"fusion_selection_frozen",**record)
+    return record
+
+
+def _load_head(record,device):
+    pointer=record["checkpoint"]
+    if sha256(pointer["path"])!=pointer["sha256"]: raise ValueError("Fusion winner hash mismatch")
+    head=_module("fusion").build_head(record["fusion_kind"],channels=record.get("channels")).to(device)
+    head.load_state_dict(_load_torch(pointer["path"])["model"])
+    return head.eval()
+
+
+def _export_reduced(dataset,records,out,config,ledger=None,resume=False):
+    """18 fixed base fits, 56 short frozen-input heads, one primary TEST export."""
+    out=Path(out);opts=options(config);device=opts["device"]
+    store=_module("storage").SharedMapStore(out,ledger=ledger,dataset=dataset)
+    normalizer=_normalizer(dataset,out,ledger)
+    path=out/(PREFIX+"maps_manifest.json")
+    head_path=out/(PREFIX+"fusion_records.json")
+    if path.exists() and read_json(path).get("completed"):
+        document=read_json(path)
+        if document["config_hash"]!=_digest(config) or document["normalizer_sha256"]!=_digest(normalizer.state_dict()):
+            raise ValueError("Completed scientific export configuration changed")
+        saved_records=_verify_completed_reduced(out,config,normalizer,document)
+        store.verify(document["maps"])
+        records[:]=saved_records
+        return document["maps"]
+    primary=[r for r in records if r.get("fit_kind","primary")=="primary" and r["status"]=="completed"]
+    primary.sort(key=lambda r:(r["spec"].get("control") in ("history","learned"),r["id"]))
+    by_id={r["id"]:r for r in primary}
+    contract=dataset.stack_contract
+    copy_scales={task:_copy_distribution(dataset,normalizer,task,opts) for task in ("actual-next","h0")}
+    for task,scale in copy_scales.items():
+        if scale is not None:
+            _json(out/(PREFIX+task+"-copy-last.json"),dict(scale=scale.tolist(),fit_split="train",distribution="logistic",
+                quantizer_step=opts["quantizer_step"],normalizer_sha256=_digest(normalizer.state_dict())))
+
+    def metadata(spec,record=None,variant="standalone"):
+        parent=spec.get("parent_method",spec["id"])
+        base=by_id.get(parent)
+        return dict(base_method=parent,parent_method=spec.get("parent_method"),score_variant=variant,
+            fusion_kind=spec.get("fusion_kind"),matched_control_method=spec.get("matched_control_method",matched_control(spec)) if spec.get("scenario")!="baseline" else None,
+            primary_checkpoint_id=base.get("primary_checkpoint_id") if base else None,
+            checkpoint_sha256=base["checkpoint"]["sha256"] if base else None,
+            fusion_checkpoint_id=record.get("fusion_checkpoint_id") if record and spec.get("fusion_kind") else None,
+            checkpoint_selection="primary-val-f1",canonical_score=bool(spec.get("fusion_kind")))
+
+    def references(split):
+        for row in _module("progress").progress(dataset.split_samples(split),stage="export-references-"+split,ledger=ledger):
+            for name in ("stack","stack-original"):
+                if store.get(name,row["event_id"]): continue
+                score,support=dataset.scores(row)
+                if name=="stack": support=dataset.evaluation_support(row)
+                spec=dict(id=name,task="direct",scenario="baseline",family="stack",size="frozen",control="stack",target_type="annotation-derived latest change")
+                store.save(row,name,spec,dict(score=score,support=support,extras=dict(stack_raw=dataset.stack_components(row)[0],stack_score=score)),
+                    dict(**metadata(spec),stack_contract=contract,original_full_support=name=="stack-original"))
+            for task,scale in copy_scales.items():
+                name=task+"-copy-last"
+                if scale is None or store.get(name,row["event_id"]): continue
+                spec=dict(id=name,task=task,scenario="main",family="copy-last",size="fixed",control="copy-last",target_type="annotation-derived latest change")
+                result=_copy_predict(dataset,row,normalizer,task,scale,opts)
+                result["support"]=dataset.evaluation_support(row)
+                store.save(row,name,spec,result,metadata(spec,variant="U"))
+        # Independent semantic processing is a fixed reference, never a neural fit.
+        spec=dict(id="A-independent",task="semantic-state",scenario="A",mode="independent",family="semantic-memory",size="shared",hidden=64,control="independent",target_type="semantic state")
+        model=None
+        for row in dataset.split_samples(split):
+            if store.get(spec["id"],row["event_id"]): continue
+            if model is None: model=build_model(spec,dataset,opts)
+            result=prediction(model,dataset,row,spec,normalizer,opts)
+            store.save(row,spec["id"],spec,result,dict(**metadata(spec),fixed_reference=True))
+        del model
+
+    def base_outputs(split):
+        for record in primary:
+            spec,name=record["spec"],record["id"]
+            model=None
+            for row in _module("progress").progress(dataset.split_samples(split),stage="export-base-"+split,model=name,ledger=ledger):
+                saved=store.get(name,row["event_id"])
+                if saved is None:
+                    if model is None: model=load_selected(dataset,record,opts)
+                    result=prediction(model,dataset,row,spec,normalizer,opts)
+                    result["extras"]["stack_raw"]=dataset.stack_components(row)[0]
+                    result["extras"]["stack_score"]=dataset.scores(row)[0]
+                    if spec["task"] in ("actual-next","h0") and spec["control"]=="history":
+                        last=store.get(matched_control(spec),row["event_id"])
+                        if last is not None:
+                            result["extras"]["G"]=np.asarray(store.read(last,fields=["U"])["U"])-result["extras"]["U"]
+                    saved=store.save(row,name,spec,result,dict(**metadata(spec,record,"U" if spec["task"] in ("actual-next","h0") else "standalone"),source_stack_contract=contract))
+                if spec["task"] in ("actual-next","h0"):
+                    residual=name+"-residual"
+                    if store.get(residual,row["event_id"]) is None:
+                        arrays=store.read(saved,fields=["residual_score","support"])
+                        residual_spec={**spec,"id":residual}
+                        meta=metadata(spec,record,"residual")
+                        meta["matched_control_method"]=matched_control(spec)+"-residual"
+                        store.save(row,residual,residual_spec,dict(score=arrays["residual_score"],support=arrays["support"]),meta,
+                            refs=store.references(saved))
+            del model
+
+    for split in ("train","val"):
+        references(split);base_outputs(split)
+    _event(ledger,"primary_train_val_scientific_cache_frozen",models=len(primary),primary_checkpoint_export_only=True)
+    heads=[]
+    for spec in resolve_fusion_matrix(config):
+        if spec["parent_method"] not in by_id:
+            heads.append(dict(id=spec["id"],spec=spec,status="INCOMPLETE",reason="Primary model unavailable",fit_kind=spec["fit_kind"],parent_method=spec["parent_method"]))
+            continue
+        parent_maps=sorted([r for r in store.records if r["method"]==spec["parent_method"] and r["split"] in ("train","val")],key=lambda r:(r["split"],r["event_id"]))
+        try:
+            record=_train_reduced_fusion(spec,dataset,store,parent_maps,out,config,ledger=ledger,resume=resume)
+        except _report().InsufficientData as exc:
+            record=dict(id=spec["id"],spec=spec,status="INSUFFICIENT_DATA",reason=str(exc),fit_kind=spec["fit_kind"],parent_method=spec["parent_method"])
+        except (RuntimeError,MemoryError) as exc:
+            record=dict(id=spec["id"],spec=spec,status="ERROR",reason=str(exc),fit_kind=spec["fit_kind"],parent_method=spec["parent_method"])
+        heads.append(record);_json(head_path,heads)
+    completed_heads=[r for r in heads if r["status"]=="completed"]
+
+    def head_outputs(split):
+        rows=dataset.split_samples(split)
+        for record in completed_heads:
+            name,spec=record["id"],record["spec"]
+            pending=[row for row in rows if store.get(name,row["event_id"]) is None]
+            if not pending:
+                print(f"history-progress stage=export-fusion-{split} model={name} status=skipped-completed",flush=True)
+                continue
+            lookup={r["event_id"]:r for r in store.records if r["method"]==spec["parent_method"] and r["split"]==split}
+            head=_load_head(record,device)
+            context=_score_outputs(head,dataset,store,lookup,split,device,out/"work") if spec["fit_kind"]=="score-fusion" else nullcontext(None)
+            with context as predicted:
+                for row in _module("progress").progress(pending,stage="export-fusion-"+split,model=name,ledger=ledger):
+                    parent=lookup[row["event_id"]]
+                    result=predicted(row) if predicted else _feature_head_predict(head,store,parent,device)
+                    meta=metadata(spec,record,spec["fusion_kind"])
+                    meta["overlap_order"]="canonical inputs merge -> head with halo2 -> unique core -> crop" if spec["fit_kind"]=="score-fusion" else "native feature head -> sigmoid -> bilinear pixel resize -> canonical overlap mean"
+                    store.save(row,name,spec,result,meta,refs=store.references(parent))
+            del head
+
+    head_outputs("train");head_outputs("val")
+    # Primary scores, residuals, fixed references and all heads get VAL-only decisions.
+    decisions={};val_methods=defaultdict(list)
+    for record in store.records:
+        if record["split"]=="val": val_methods[record["method"]].append(record)
+    for budget in config.get("fpr_budgets",(.05,.10,.15)):
+        decisions[str(budget)]={}
+        for method,maps in _module("progress").progress(sorted(val_methods.items()),stage="freeze-VAL-thresholds",model=str(budget),ledger=ledger):
+            meta=maps[0];lookup={r["event_id"]:r for r in maps}
+            def predict(row):
+                arrays=store.read(lookup[row["event_id"]])
+                extras={}
+                for key in ("progression_target",):
+                    if key in arrays:extras[key]=arrays[key]
+                if meta.get("scenario")=="baseline":extras["stack_raw"]=arrays["stack_raw"]
+                return dict(score=arrays["score"],support=arrays["support"],extras=extras,
+                    stack_contract=contract if meta.get("scenario")=="baseline" else None,
+                    canonical_score=meta.get("canonical_score",False))
+            try:
+                val=_report().evaluate_predictor(dataset,predict,split="val",spec={**meta["spec"],
+                    "original_full_support":meta.get("original_full_support",False)},budget=budget)
+                decisions[str(budget)][method]={k:val.get(k) for k in ("threshold","f1","iou","recall","fpr")}
+            except _report().InsufficientData as exc:
+                decisions[str(budget)][method]=dict(status="INSUFFICIENT_DATA",reason=str(exc))
+    _json(out/(PREFIX+"frozen_val_decisions.json"),decisions)
+    selection_metadata={r["id"]:{**r.get("spec",{}),**r} for r in [*records,*heads]}
+    for saved in store.records:
+        selection_metadata.setdefault(saved["method"],{**saved.get("spec",{}),**saved})
+    overall={(method,"val",.05):value for method,value in decisions["0.05"].items()}
+    main=_report().choose_main_variants(selection_metadata,overall)
+    _json(out/(PREFIX+"main_selection.json"),dict(selected=main,selection_split="val",criterion="building-macro F1 at recall-selected FPR<=.05"))
+    _event(ledger,"all_val_decisions_frozen_before_test",methods=len(val_methods),budgets=list(decisions),
+        thresholds_sha256=sha256(out/(PREFIX+"frozen_val_decisions.json")),main_selection_sha256=sha256(out/(PREFIX+"main_selection.json")))
+    references("test");base_outputs("test");head_outputs("test")
+    review_path=out/(PREFIX+"progression_review_manifest.json")
+    review=read_json(review_path) if review_path.exists() else {}
+    test_coverage=[]
+    for row in dataset.split_samples("test"):
+        target=_progression(dataset,row,"cpu")
+        test_coverage.append(dict(event_id=row["event_id"],building_id=row["building_id"],split="test",coverage=target["coverage"]))
+    review["test"]=_module("abc").progression_review_manifest(test_coverage)
+    _json(review_path,review)
+    existing={r["id"] for r in records}
+    records.extend(r for r in heads if r["id"] not in existing)
+    _json(out/(PREFIX+"training_records.json"),records)
+    counts=dict(planned=dict(primary=18,score_fusion=48,feature_fusion=8,total=74),
+        completed={kind:sum(r["status"]=="completed" and r.get("fit_kind","primary")==kind for r in records)
+                   for kind in ("primary","score-fusion","feature-fusion")})
+    _json(out/(PREFIX+"fit_counts.json"),counts)
+    canonical=getattr(dataset,"canonical",dataset)
+    manifest=store.records
+    _json(path,dict(completed=True,storage_schema=2,config_hash=_digest(config),normalizer_sha256=_digest(normalizer.state_dict()),
+        maps=manifest,categories=canonical.categories,groups=getattr(canonical,"groups",[]),fit_counts=counts,
+        storage=store.storage_summary(),interpretation="exploratory TEST; primary checkpoint only; no coded-stream compression claim"))
+    return manifest
+
+
+
+def _verify_completed_reduced(out,config,normalizer,document):
+    """Verify a completed run's complete fit index and retained weights read-only."""
+    out=Path(out)
+    if document.get("config_hash")!=_digest(config) or document.get("normalizer_sha256")!=_digest(normalizer.state_dict()):
+        raise ValueError("Completed scientific export configuration/normalization changed")
+    records=read_json(out/(PREFIX+"training_records.json"))
+    expected={spec["id"]:spec for spec in [*resolve_matrix(config),*resolve_fusion_matrix(config)]}
+    if len(records)!=len(expected) or {r["id"] for r in records}!=set(expected):
+        raise ValueError("Completed training_records does not contain the full planned primary/fusion matrix")
+    heads=read_json(out/(PREFIX+"fusion_records.json"))
+    by_id={r["id"]:r for r in records}
+    if any(by_id.get(row["id"])!=row for row in heads):
+        raise ValueError("Completed fusion records disagree with the full training index")
+    if {row["id"] for row in heads}!={spec["id"] for spec in resolve_fusion_matrix(config)}:
+        raise ValueError("Completed fusion record coverage is incomplete")
+    options_hash=options(config)
+    verified={}
+    for record in records:
+        spec=expected[record["id"]]
+        if record.get("spec")!=spec:
+            raise ValueError("Completed fit specification changed")
+        if record.get("status")!="completed":
+            continue
+        fusion=record.get("fit_kind","primary")!="primary"
+        if fusion:
+            parent_maps=sorted([row for row in document["maps"] if row["method"]==spec["parent_method"] and row["split"] in ("train","val")],key=lambda row:(row["split"],row["event_id"]))
+            contract=_digest(dict(spec=spec,options=options_hash,source=sha256(__file__),
+                parent_maps=[(row["event_id"],row["artifact_sha256"]) for row in parent_maps]))
+        else:
+            contract=_digest(dict(protocol="history-three-scenarios-reduced-v2",spec=spec,config=config,
+                source_sha256=sha256(__file__),normalizer_sha256=_digest(normalizer.state_dict())))
+        if record.get("contract")!=contract:
+            raise ValueError("Completed fit source/config/cache contract changed")
+        selection_path=out/("fusion" if fusion else "models")/record["id"]/(PREFIX+"selection.json")
+        if read_json(selection_path)!=record:
+            raise ValueError("Completed fit selection differs from the retained scientific index")
+        pointers=[*record.get("retained",[]),*[record.get(key) for key in ("checkpoint","prediction_checkpoint","semantic_checkpoint")]]
+        if not record.get("checkpoint"):
+            raise ValueError("Completed fit lacks its primary checkpoint")
+        for pointer in pointers:
+            if pointer is None:continue
+            path=Path(pointer["path"])
+            key=str(path)
+            if key not in verified:verified[key]=sha256(path)
+            if verified[key]!=pointer["sha256"]:
+                raise ValueError("Completed retained primary/fusion checkpoint hash mismatch")
+    return records

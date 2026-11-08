@@ -229,6 +229,61 @@ class DataTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_split_scoped_evaluation_does_not_inspect_test_targets(self):
+        original = self.dataset.targets
+        seen = []
+        def targets(row):
+            seen.append(row["split"])
+            self.assertEqual(row["split"], "val")
+            return original(row)
+        with mock.patch.object(self.dataset, "targets", side_effect=targets):
+            scoped = self.dataset.evaluation_for(split="val")
+            self.assertEqual({row["split"] for row in scoped.samples}, {"val"})
+            self.assertEqual(len(seen), len(scoped.samples))
+            self.assertIs(scoped, self.dataset.evaluation_for(split="val"))
+
+    def test_preflight_repairs_only_train_val_and_keeps_source_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "old"
+            (old / "units").mkdir(parents=True)
+            source = root / "source"
+            source.mkdir()
+            write_json(source / "run.json", dict(kind="source_fixture"))
+            adapter = data.ScenarioData.__new__(data.ScenarioData)
+            adapter.overlay = None
+            adapter.saved = SimpleNamespace(out=old, encoder_sha256="encoder-hash")
+            adapter.tracks = {split: dict(split=split, observations=[dict(observation_id=split)])
+                              for split in ("train", "val", "test")}
+            seen = []
+            def frame(identifier):
+                seen.append(identifier)
+                return np.ones((224, 224, 3), np.uint8), np.ones((224, 224), bool)
+            adapter.canonical = SimpleNamespace(observations={split: {} for split in adapter.tracks},
+                                               fp=Fingerprints(), frame=frame)
+            adapter.encoder = dict(checkpoint_sha256="same", device="cpu", weights_frozen=True)
+            adapter.source = SimpleNamespace(root=source, config=dict(options=dict(dinov2={})))
+            adapter.cache_index = {"feature:" + key: None for key in adapter.tracks}
+            original_index = dict(adapter.cache_index)
+            fake = SimpleNamespace(encode=lambda rgb, support, save_patch_tokens: [dict(
+                patch_tokens=np.ones((256, 384), np.float16), patch_support=np.ones(256, bool))], close=lambda: None)
+            store = data.fusion.data_module.Store(root / "new", {})
+            try:
+                with mock.patch.object(data.memory.history_features, "encoder_contract", return_value=adapter.encoder), mock.patch.object(
+                        data.memory.history_features, "DinoEncoder", return_value=fake):
+                    adapter.prepare_missing(store, splits=("train", "val"))
+                    self.assertEqual(seen, ["train", "val"])
+                    self.assertEqual(adapter.missing_features(splits=("train", "val")), [])
+                    self.assertEqual(adapter.missing_features(), ["test"])
+                    self.assertIsNotNone(adapter.cache_index["feature:train"])
+                    self.assertIsNone(adapter.cache_index["feature:test"])
+                    self.assertEqual(adapter.source_cache_index, original_index)
+                    adapter.prepare_missing(store, splits=("test",))
+                    self.assertEqual(adapter.missing_features(), [])
+                    self.assertEqual(adapter.source_cache_index, original_index)
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
