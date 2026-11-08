@@ -1,6 +1,7 @@
 """Saved-head evaluation parity and failure cases on procedural CPU data."""
 from argparse import Namespace
 import contextlib
+import csv
 import importlib
 import io
 from pathlib import Path
@@ -20,6 +21,35 @@ try:
     import torch
 except ImportError:
     torch = None
+
+
+class OperatingPointTests(unittest.TestCase):
+    def test_val_budgets_change_thresholds_but_keep_native_mask_and_frozen_fpr05(self):
+        hist = np.zeros((1, 2, memory.metrics.BINS), np.int64)
+        for score, count in ((.1, 85), (.4, 5), (.7, 5), (.9, 5)):
+            hist[0, 0, int(np.ceil(score * 2048))] = count
+        for score, count in ((.2, 20), (.5, 30), (.8, 30), (.95, 20)):
+            hist[0, 1, int(np.ceil(score * 2048))] = count
+        native = np.zeros_like(hist)
+        native[0, 0, [0, -1]] = [92, 8]
+        native[0, 1, [0, -1]] = [40, 60]
+        val = dict(stack=dict(building=hist.copy()), pair=dict(building=hist.copy()),
+                   anychange=dict(building=native))
+        frozen = Namespace(fpr_threshold=dict(threshold=.75, selection_split="val"))
+        selected = evaluation.fpr_thresholds(val, frozen, [.05, .10, .15])
+        for budget, expected_recall in ((.05, .5), (.10, .8), (.15, 1.)):
+            for method in ("pair", "stack"):
+                point = selected[budget][method]
+                self.assertAlmostEqual(point["calibration_recall"], expected_recall)
+                self.assertLessEqual(point["calibration_fpr"], budget)
+                self.assertTrue(point["val_budget_met"])
+                self.assertIn(f"<= {budget:g};", point["criterion"])
+            self.assertEqual(selected[budget]["anychange"]["threshold"], .5)
+            self.assertAlmostEqual(selected[budget]["anychange"]["calibration_fpr"], .08)
+            self.assertEqual(selected[budget]["anychange"]["val_budget_met"], budget >= .08)
+        self.assertEqual(selected[.05]["stack"]["threshold"], .75)
+        self.assertEqual(frozen.fpr_threshold, dict(threshold=.75, selection_split="val"))
+        self.assertGreater(selected[.10]["stack"]["threshold"], selected[.15]["stack"]["threshold"])
 
 
 @unittest.skipIf(torch is None, "PyTorch is optional for offline analysis environments")
@@ -82,6 +112,7 @@ class SavedEvaluationTests(unittest.TestCase):
         write_json(path, value)
 
     def test_interrupted_subset_matches_complete_run_without_training_or_rgb(self):
+        self.args.fpr_budgets = [.05, .10, .15]
         before = {str(p): sha256(p) for p in self.saved.rglob("*") if p.is_file()}
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -90,17 +121,36 @@ class SavedEvaluationTests(unittest.TestCase):
                                  (memory.history_features, "DinoEncoder"), (torch.optim, "AdamW"),
                                  (fusion, "RemoteScorer"), (fusion.data_module.Dataset, "frame")):
                 stack.enter_context(mock.patch.object(target, name, side_effect=AssertionError(f"Unexpected {name}")))
-            result = evaluation.run(self.args)
+            with mock.patch.object(memory, "evaluate", wraps=memory.evaluate) as forward:
+                result = evaluation.run(self.args)
+            self.assertEqual(forward.call_count, 5)  # Three splits plus two history shifts, not per budget.
             self.assertEqual(result["results"], self.reference["results"])
             self.assertEqual(result["comparisons"], self.reference["comparisons"])
             self.assertEqual(result["evaluated_seeds"], [13])
             self.assertEqual(result["originally_requested_seeds"], [13, 29, 47])
             self.assertFalse(result["training_performed"])
             self.assertEqual(result["features"]["newly_computed"], 0)
+            self.assertEqual(result["fpr_budgets"], [.05, .10, .15])
+            self.assertEqual(result["checkpoint_selection_fpr_budget"], .05)
             for suffix in ("metrics.csv", "per_building.csv", "comparisons.csv", "history_shift.csv",
                            "return_to_past.csv", "thresholds-13.json"):
                 self.assertEqual((Path(self.args.out) / (memory.PREFIX + suffix)).read_bytes(),
                                  (self.saved / (memory.PREFIX + suffix)).read_bytes())
+            for ordinary, budget_file in (("metrics.csv", "fpr_metrics.csv"),
+                                          ("per_building.csv", "fpr_per_building.csv"),
+                                          ("return_to_past.csv", "fpr_return_to_past.csv")):
+                with (Path(self.args.out) / (memory.PREFIX + ordinary)).open(encoding="utf-8-sig") as stream:
+                    expected = list(csv.DictReader(stream))
+                with (Path(self.args.out) / (memory.PREFIX + budget_file)).open(encoding="utf-8-sig") as stream:
+                    actual = [r for r in csv.DictReader(stream) if float(r["val_fpr_budget"]) == .05]
+                self.assertEqual([{k: r[k] for k in expected[0]} for r in actual], expected)
+            points = read_json(Path(self.args.out) / (memory.PREFIX + "fpr_thresholds-13.json"))
+            for row in result["fpr_results"]:
+                selected = points[str(row["val_fpr_budget"])][row["method"]]
+                self.assertEqual(row["threshold"], selected["threshold"])
+                self.assertEqual(row["overall_val_fpr"], selected["calibration_fpr"])
+                if row["method"] != "anychange":
+                    self.assertTrue(row["val_budget_met"])
             self.args.resume = True
             with mock.patch.object(memory, "evaluate", side_effect=AssertionError("Repeated evaluation")):
                 self.assertEqual(evaluation.run(self.args), result)
@@ -112,6 +162,23 @@ class SavedEvaluationTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(read_json(self.saved / "run.json")["status"], "interrupted")
         self.assertEqual(read_json(Path(self.args.out) / "run.json")["status"], "completed")
+
+    def test_invalid_budgets_fail_before_opening_inputs(self):
+        for budgets in ([5, 10, 15], [0], [1], [.1, .1], [float("nan")], [float("inf")]):
+            self.args.fpr_budgets = budgets
+            with mock.patch.object(evaluation, "SavedMemory", side_effect=AssertionError("Read inputs")):
+                with self.assertRaisesRegex(ValueError, "FPR budgets must be distinct fractions"):
+                    evaluation.run(self.args)
+
+    def test_fpr_sweep_can_skip_completed_shift_diagnostics(self):
+        self.args.fpr_budgets = [.05, .10, .15]
+        self.args.skip_history_shifts = True
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(memory, "evaluate", wraps=memory.evaluate) as forward:
+            evaluation.run(self.args)
+        self.assertEqual(forward.call_count, 3)
+        self.assertFalse((Path(self.args.out) / (memory.PREFIX + "history_shift.csv")).exists())
+        self.assertTrue((Path(self.args.out) / (memory.PREFIX + "fpr_report.txt")).exists())
 
     def test_missing_last_head_never_evaluates_or_trains(self):
         unit = self.saved / "units" / (memory.PREFIX + "model-convgru-last-13.json")
@@ -164,7 +231,8 @@ class SavedEvaluationTests(unittest.TestCase):
         with mock.patch.object(evaluation, "read_json", side_effect=[dict(source=str(self.root / "full")), source]), \
                 mock.patch.object(evaluation.subprocess, "run", return_value=Namespace(returncode=0)) as launch:
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit_code:
-                evaluation.main(["--run", str(self.saved), "--out", self.args.out, "--seeds", "13", "--resume"])
+                evaluation.main(["--run", str(self.saved), "--out", self.args.out, "--seeds", "13", "--resume",
+                                 "--fpr-budgets", "0.05", "0.10", "0.15", "--skip-history-shifts"])
         self.assertEqual(exit_code.exception.code, 0)
         command = launch.call_args.args[0]
         self.assertEqual(command[0], "/original/env/bin/python")
@@ -172,6 +240,9 @@ class SavedEvaluationTests(unittest.TestCase):
         self.assertIn("--worker", command)
         self.assertNotIn("--epochs", command)
         self.assertNotIn("--fusion", command)
+        self.assertEqual(command[command.index("--fpr-budgets") + 1:command.index("--fpr-budgets") + 4],
+                         ["0.05", "0.1", "0.15"])
+        self.assertIn("--skip-history-shifts", command)
 
 
 if __name__ == "__main__":

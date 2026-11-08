@@ -99,13 +99,62 @@ def validate_code(saved):
     return code
 
 
+def fpr_thresholds(histograms, frozen, budgets):
+    """Select each operating threshold on full VAL, keeping native masks fixed."""
+    specs = [dict(id=name, native=name == "anychange") for name in histograms]
+    buildings = sorted(next(iter(histograms.values())))
+    overall = {b: np.stack([histograms[item["id"]][b][0] for item in specs]) for b in buildings}
+    native = {item["id"]: dict(threshold=.5) for item in specs}
+    result = {}
+    for budget in budgets:
+        selected = fusion.select_fpr_thresholds(specs, overall, native, budget=budget)
+        if budget == .05:
+            selected["stack"] = dict(frozen.fpr_threshold)
+        for name, value in selected.items():
+            rows = [metrics.metrics(hist[0], value["threshold"], name == "anychange")
+                    for hist in histograms[name].values()]
+            macro = memory.fixed_macro(rows)
+            value.update(val_fpr_budget=budget, calibration_recall=macro["recall"],
+                         calibration_fpr=macro["fpr"], val_budget_met=macro["fpr"] <= budget + 1e-12)
+            if name != "anychange":
+                value["criterion"] = (f"maximum macro recall at VAL macro FPR <= {budget:g}; "
+                                      "F1/FPR/threshold tie breaks")
+        result[budget] = selected
+    return result
+
+
+def fpr_reporting(data, histograms, selected, split, seed, budget):
+    aggregate, rows = memory.reporting(data, histograms, selected, split, seed)
+    for row in (*aggregate, *rows):
+        threshold = selected[row["method"]]
+        row.update(val_fpr_budget=budget, overall_val_recall=threshold["calibration_recall"],
+                   overall_val_fpr=threshold["calibration_fpr"], val_budget_met=threshold["val_budget_met"])
+    return aggregate, rows
+
+
+def return_rows(histograms, thresholds, split, seed):
+    rows = []
+    for name, buildings in histograms.items():
+        for building, histogram in buildings.items():
+            value = metrics.metrics(histogram[-1], thresholds[name]["threshold"], name == "anychange")
+            rows.append(dict(method=name, seed=seed, split=split, building_id=building,
+                threshold=thresholds[name]["threshold"], candidate_pixels=value["positive_pixels"],
+                detected_pixels=value["tp"], recall=value["recall"],
+                scope="annotation-matched return to a known older state; not reviewed events"))
+    return rows
+
+
 def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoints):
     out = Path(args.out).expanduser().resolve()
     for original in (saved.out, source.root, source.data.root, source.data.history_root, frozen.root):
         if out == original or out in original.parents or original in out.parents:
             raise ValueError("Output must be separate from all inputs")
+    budgets = getattr(args, "fpr_budgets", None) or []
+    shifts = [] if getattr(args, "skip_history_shifts", False) else saved.config["history_shift_tokens"]
     config = dict(memory_run=str(saved.out), input_sha256=dict(saved.hashes), seeds=args.seeds,
-                  device=device, history_shift_tokens=saved.config["history_shift_tokens"])
+                  device=device, history_shift_tokens=shifts)
+    if budgets:
+        config["fpr_budgets"] = budgets
     contract = dict(protocol="canonical-variability-memory-evaluation-v1", config=config,
                     code={**code, Path(__file__).name: sha256(__file__)},
                     training_performed=False, feature_extraction_performed=False,
@@ -125,7 +174,7 @@ def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoint
         store.contract(contract)
         store.event("selected_memory_checkpoints_frozen_before_test", checkpoints=checkpoints)
         aggregate, rows, robustness, returns = [], [], [], []
-        shifts = config["history_shift_tokens"]
+        fpr_aggregate, fpr_rows, fpr_returns = [], [], []
         shape = argparse.Namespace(hidden=saved.config["hidden"], device=device)
         with memory.progress(total=len(args.seeds) * (3 + len(shifts)),
                              desc="Saved memory evaluation", unit="split", position=0, leave=True) as progress:
@@ -135,6 +184,10 @@ def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoint
                 val = memory.evaluate(inputs, models, "val", label=f"VAL seed={seed}", position=1)
                 thresholds = memory.calibrate(val, frozen)
                 write_json(out / (PREFIX + f"thresholds-{seed}.json"), thresholds)
+                operating = fpr_thresholds(val, frozen, budgets)
+                if budgets:
+                    write_json(out / (PREFIX + f"fpr_thresholds-{seed}.json"),
+                               {str(budget): selected for budget, selected in operating.items()})
                 for split in ("val", "train", "test"):
                     hist = val if split == "val" else memory.evaluate(
                         inputs, models, split, label=f"{split.upper()} seed={seed}", position=1)
@@ -142,13 +195,13 @@ def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoint
                     a, r = memory.reporting(source.data, hist, thresholds, split, seed)
                     aggregate.extend(a)
                     rows.extend(r)
-                    for name, buildings in hist.items():
-                        for building, histogram in buildings.items():
-                            value = metrics.metrics(histogram[-1], thresholds[name]["threshold"], name == "anychange")
-                            returns.append(dict(method=name, seed=seed, split=split, building_id=building,
-                                threshold=thresholds[name]["threshold"], candidate_pixels=value["positive_pixels"],
-                                detected_pixels=value["tp"], recall=value["recall"],
-                                scope="annotation-matched return to a known older state; not reviewed events"))
+                    returns.extend(return_rows(hist, thresholds, split, seed))
+                    for budget, selected in operating.items():
+                        a, r = fpr_reporting(source.data, hist, selected, split, seed, budget)
+                        fpr_aggregate.extend(a)
+                        fpr_rows.extend(r)
+                        fpr_returns.extend(dict(val_fpr_budget=budget, **r)
+                                           for r in return_rows(hist, selected, split, seed))
                     progress.update(1)
                 for shift in shifts:
                     hist = memory.evaluate(inputs, models, "test", history_shift=shift,
@@ -161,6 +214,16 @@ def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoint
         for name, values in (("metrics", aggregate), ("per_building", rows), ("comparisons", comparisons),
                              ("history_shift", robustness), ("return_to_past", returns)):
             memory.write_csv(out / (PREFIX + name + ".csv"), values)
+        if budgets:
+            fpr_comparisons = []
+            for budget in budgets:
+                subset = [r for r in fpr_rows if r["val_fpr_budget"] == budget]
+                fpr_comparisons.extend(dict(val_fpr_budget=budget, **r)
+                                       for r in memory.paired_comparisons(subset, args.seeds))
+            for name, values in (("metrics", fpr_aggregate), ("per_building", fpr_rows),
+                                 ("operating_points", [r for r in fpr_aggregate if r["slice_type"] == "overall"]),
+                                 ("comparisons", fpr_comparisons), ("return_to_past", fpr_returns)):
+                memory.write_csv(out / (PREFIX + "fpr_" + name + ".csv"), values)
         source.verify()
         frozen.verify()
         saved.verify()
@@ -172,6 +235,9 @@ def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoint
             baseline_parity="exact stack/previous TP/FP/FN/TN on every building/split",
             fit_split="train", selection_split="val", test_previously_inspected=True,
             independent_event_labels=False, results=aggregate, comparisons=comparisons)
+        if budgets:
+            summary.update(fpr_budgets=budgets, fpr_results=fpr_aggregate, fpr_comparisons=fpr_comparisons,
+                           checkpoint_selection_fpr_budget=.05)
         write_json(out / (PREFIX + "summary.json"), summary)
         lines = ["SAVED VARIABILITY MEMORY — exploratory evaluation, no training or DINO extraction",
                  f"Evaluated seeds: {args.seeds}; original training plan: {saved.config['seeds']}",
@@ -186,6 +252,22 @@ def evaluate_saved(saved, source, frozen, inputs, args, device, code, checkpoint
                 values = " ".join(f"{key}={row[key]:.5f}" if row[key] is not None else f"{key}=NA"
                                   for key in ("f1", "iou", "precision", "recall", "fpr", "ap_binned"))
                 lines.append(f"{row['split']:5s} seed={row['seed']} {row['method']:15s} {values}")
+        if budgets:
+            fpr_lines = ["FPR OPERATING POINTS — thresholds selected on full VAL, fixed for TRAIN/TEST",
+                         "Budget applies to building-macro overall VAL FPR, not to each building/class or TEST.",
+                         "The same checkpoints selected at VAL FPR <= 5% are used for every budget.",
+                         "AnyChange retains its native binary decision; infeasible VAL budgets are flagged.",
+                         "Original weights/features reused; TEST previously inspected; one seed is not seed stability."]
+            for row in fpr_aggregate:
+                if row["slice_type"] != "overall":
+                    continue
+                values = " ".join(f"{key}={row[key]:.5f}" if row[key] is not None else f"{key}=NA"
+                                  for key in ("f1", "iou", "precision", "recall", "fpr", "ap_binned"))
+                fpr_lines.append(f"VAL-budget={100 * row['val_fpr_budget']:g}% {row['split']:5s} "
+                                 f"seed={row['seed']} {row['method']:15s} {values} "
+                                 f"VAL-budget-met={row['val_budget_met']}")
+            (out / (PREFIX + "fpr_report.txt")).write_text("\n".join(fpr_lines) + "\n", encoding="utf-8")
+            lines.extend(["", *fpr_lines])
         report = "\n".join(lines) + "\n"
         (out / (PREFIX + "report.txt")).write_text(report, encoding="utf-8")
         memory.tqdm.write(report)
@@ -205,6 +287,9 @@ def run(args):
 
     if not args.seeds or len(set(args.seeds)) != len(args.seeds):
         raise ValueError("Specify distinct completed seeds with --seeds")
+    budgets = getattr(args, "fpr_budgets", None) or []
+    if len(set(budgets)) != len(budgets) or any(not np.isfinite(b) or not 0 < b < 1 for b in budgets):
+        raise ValueError("FPR budgets must be distinct fractions between 0 and 1, e.g. 0.05 0.10 0.15")
     with SavedMemory(args.run) as saved:
         if set(args.seeds) - set(saved.config["seeds"]):
             raise ValueError("Requested seeds are absent from the original training plan")
@@ -252,6 +337,10 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="Separate evaluation output directory")
     parser.add_argument("--seeds", type=int, nargs="+", required=True, help="Completed seeds to evaluate, e.g. 13")
     parser.add_argument("--device", help="Defaults to the training device")
+    parser.add_argument("--fpr-budgets", type=float, nargs="+",
+                        help="Additional full-VAL macro FPR budgets, e.g. 0.05 0.10 0.15; no retraining")
+    parser.add_argument("--skip-history-shifts", action="store_true",
+                        help="Skip already completed history-shift diagnostics; evaluate original inputs only")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
