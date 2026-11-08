@@ -210,6 +210,21 @@ class PairSupportRegressionTests(unittest.TestCase):
         self.assertEqual(new["coordinate_system"], "region_crop_pixels")
         self.assertEqual({row["role"] for row in new["artifacts"]}, {"rgb", "geometric_support"})
 
+    def test_original_rgb_and_crop_support_expose_distinct_coordinate_frames(self):
+        case, rows = self.pair(np.ones((4, 4), bool), np.ones((4, 4), bool))
+        service, _ = self.fixture.service(case=case)
+        result = service.execute("open_crop", {"observation_id": rows[1]["observation_id"], "view": "source"})
+        self.assertEqual(result["status"], "ok")
+        record = result["evidence"][0]
+        self.assertEqual(record["image_shape"], [8, 8])
+        self.assertEqual(record["geometry"]["crop_shape"], [4, 4])
+        self.assertEqual(record["artifact_coordinates"], {
+            "rgb": {"coordinate_system": "observation_native", "observation_id": rows[1]["observation_id"]},
+            "geometric_support": {"coordinate_system": "region_crop_pixels", "region_id": case["region_id"]}})
+        self.assertEqual(result["images"][0]["path"], rows[1]["original_path"])
+        saved = self.fixture.store.get_evidence(record["evidence_id"])
+        self.assertEqual(saved["parameters"]["artifact_coordinates"], record["artifact_coordinates"])
+
 
 if __name__ == "__main__":
     unittest.main()

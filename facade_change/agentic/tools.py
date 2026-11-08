@@ -215,7 +215,10 @@ class ToolService:
         if "native_shape" not in geometry:
             with Image.open(observation["original_path"]) as original:
                 geometry["native_shape"] = [original.height, original.width]
-        record = {"evidence_id": "observation-" + digest([identifier, view, "geometric-support-v2"])[:32], "kind": "observation",
+        crop_frame = {"coordinate_system": "region_crop_pixels", "region_id": observation["region_id"]}
+        rgb_frame = crop_frame if view == "crop" else {
+            "coordinate_system": "observation_native", "observation_id": identifier}
+        record = {"evidence_id": "observation-" + digest([identifier, view, "geometric-support-v3"])[:32], "kind": "observation",
                   "observation_ids": [identifier], "region_id": observation["region_id"],
                   "observation_id": identifier,
                   "date": observation.get("date"), "date_status": observation.get("date_status"),
@@ -225,6 +228,7 @@ class ToolService:
                   "coordinate_system": "region_crop_pixels" if view == "crop" else "observation_native",
                   "image_shape": image_shape,
                   "geometry": geometry,
+                  "artifact_coordinates": {"rgb": rgb_frame, "geometric_support": crop_frame},
                   "summary": "Unmodified RGB. The separate geometric support artifact is not an occlusion mask.",
                   "artifacts": [self._artifact(path, "rgb", "image/png"),
                                 self._artifact(observation["support_path"], "geometric_support")]}
