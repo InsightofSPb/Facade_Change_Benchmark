@@ -355,3 +355,21 @@ cutoff, future-prefix invariance, стабильность ID, импорт на
 Тестовые подмены моделей существуют только в тестах. Настоящие Qwen, SAM3, DINO,
 Jina, GPU-детекторы и fusion на реальных данных должны пройти локальную приёмку;
 результаты CPU не доказывают их качество и совместимость CUDA.
+
+### Выполнено в Cloud
+
+Проверен чистый commit `1fd6f603b44548dc2f22a97074dd08a3d1b89573`
+в CPU-среде Python 3.12, без PyTorch и весов моделей:
+
+| Проверка | Результат |
+| --- | --- |
+| `python -s -B -m unittest discover -s tests -v` | 1238 тестов за 358.738 секунды; `OK (skipped=120)` |
+| `python -m facade_change.agentic smoke --kind cpu --out <новый каталог>` | Две пары за 4.616 секунды, без ошибок; одна область, три наблюдения; SIFT/SSIM/LZMA и HTML |
+| `python -m facade_change.agentic compare --runs <analysis> --cases <analysis/input_manifest.json> --out <новый каталог>` | Сравнение и HTML созданы; 8 строк для двух случаев × четырёх методов, отсутствие VLM сохранено явно |
+| `python -m facade_change workflow benchmark agentic --help`, `compileall`, `git diff --check` | Успешно |
+
+Пропуски относятся к недоступным необязательным зависимостям; это не успешные проверки
+настоящих моделей. Smoke записал указанный commit и `dirty: false`. Успешное сравнение
+без labels подтверждает обработку артефактов, не accuracy/IoU. Qwen, SAM3, Jina,
+реальные DINO-признаки, методы с GPU-весами, реальная история ≥3 дат, реальный fusion
+и пределы VRAM остаются предметом приведённой выше локальной приёмки.
