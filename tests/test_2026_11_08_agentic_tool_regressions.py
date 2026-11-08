@@ -70,6 +70,21 @@ class PublicToolRegressions(unittest.TestCase):
         self.assertEqual(persisted["region_id"], region["region_id"])
         self.assertEqual(persisted["parameters"]["artifact_coordinates"], frames)
         self.assertEqual(persisted["parameters"]["geometry"], record["geometry"])
+        # The HTML must label this actual returned overlay as another region,
+        # even though it is shown inside the current case's agent section.
+        from facade_change.agentic.report import render_report
+        from facade_change.io import write_json
+        run = self.root / "report-input"
+        case_root = run / "cases" / self.case["case_id"]
+        mode_root = case_root / "modes" / "agent"
+        mode_root.mkdir(parents=True)
+        write_json(run / "input_manifest.json", {"cases": [self.case]})
+        write_json(case_root / "case.json", self.case)
+        write_json(mode_root / "evidence.json", {"evidence": [record]})
+        page = render_report(run, self.root / "analogue-report").read_text()
+        self.assertIn("analogue region: " + region["region_id"], page)
+        self.assertIn("observations: " + observation["observation_id"], page)
+        self.assertIn("coordinates: region_crop_pixels", page)
         with self.assertRaisesRegex(ValueError, "another physical region"):
             self.store.add_evidence({"region_id": self.case["region_id"], "kind": "prediction",
                 "observation_ids": [observation["observation_id"]], "available_at": "2020", "artifacts": []})

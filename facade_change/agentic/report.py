@@ -156,7 +156,15 @@ def render_report(run_dir, out=None):
                                     if artifact.get("role") == "overlay"), None)
                 if preview:
                     try:
-                        mode_panels.append({"label": str(item.get("evidence_id", "tool output")),
+                        owner = item.get("region_id") or "unknown"
+                        scope = ("analogue region" if owner != "unknown" and case.get("region_id")
+                                 and owner != case["region_id"] else "region")
+                        observations = ", ".join(str(value) for value in item.get("observation_ids", [])) or "unknown"
+                        frame = item.get("artifact_coordinates", {}).get("overlay", {})
+                        coordinate = frame.get("coordinate_system", item.get("coordinate_system", "unknown"))
+                        label = (f"{item.get('evidence_id', 'tool output')} · {scope}: {owner} · "
+                                 f"observations: {observations} · coordinates: {coordinate}")
+                        mode_panels.append({"label": label,
                                             "src": _copy(mode_root, preview, output, sources)})
                     except (OSError, ValueError) as error:
                         warnings.append(f"{identifier}/{mode}: evidence preview: {error}")
