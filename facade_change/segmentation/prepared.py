@@ -218,9 +218,10 @@ def prepare_augmentations(dataset, out, seed=42, cutmix_prob=.25, cutout_prob=.1
     write_json(out / "ownership.json", ownership)
     records, originals, reused = [], {}, 0
     try:
-        sources = {image_id: _source(data, image_id) for image_id in data.images}
+        sources = {image_id: _source(data, image_id) for image_id in
+                   tqdm(data.images, desc="Validate augmentation sources", unit="image", dynamic_ncols=True)}
         total = sum(len(rows) for rows in data.crops_by_image.values())
-        with tqdm(total=total, desc="Prepare original TRAIN/VAL crops", unit="crop") as progress:
+        with tqdm(total=total, desc="Prepare original TRAIN/VAL crops", unit="crop", dynamic_ncols=True) as progress:
             for image_id in data.images:
                 for crop in data.crops_by_image[image_id]:
                     record = _record(data, image_id, crop, sources[image_id], 0, policy)
@@ -241,36 +242,39 @@ def prepare_augmentations(dataset, out, seed=42, cutmix_prob=.25, cutout_prob=.1
         scratch.path, scratch.config, scratch._verified = out, config, {}
         train = sorted((row for row in records if row["split"] == "train"), key=lambda row: row["crop_key"])
         policy_matches = previous is not None and previous.config["policy"] == policy
-        for original in tqdm(train, desc="Prepare two fixed TRAIN augmentations", unit="crop"):
-            receiver = scratch.load(original)
-            candidates = [row for row in train if row["source"]["image_sha256"] != original["source"]["image_sha256"]]
-            for variant in (1, 2):
-                crop = {**original["crop"], "crop_id": original["crop_id"]}
-                record = _record(data, original["image_id"], crop, original["source"], variant, policy)
-                old = previous.by_sample.get((record["crop_key"], variant)) if policy_matches else None
-                old_donor = originals.get(old["donor"]["crop_key"]) if old and old.get("donor") else None
-                donor_valid = (not old or not old.get("donor") or
-                               (old_donor is not None and old_donor["split"] == "train"
-                                and old_donor["source"] == old["donor"]["source"]
-                                and old_donor["source"]["image_sha256"] != original["source"]["image_sha256"]))
-                if old is not None and donor_valid:
-                    _copy_sample(out, record, previous, old)
-                    if record["donor"]:
-                        record["donor"] = {key: old_donor[key] for key in ("crop_key", "source", "image_id", "crop_id")}
-                    reused += 1
-                else:
-                    rng = np.random.default_rng(record["transform_seed"])
-                    arrays = augment_crop(*receiver, rng)
-                    if rng.random() < cutmix_prob and candidates:
-                        donor = candidates[int(rng.integers(len(candidates)))]
-                        arrays = cutmix_crop(arrays, augment_crop(*scratch.load(donor), rng), rng)
-                        record["donor"] = {key: donor[key] for key in ("crop_key", "source", "image_id", "crop_id")}
-                        record["cutmix_applied"] = True
-                    if rng.random() < cutout_prob:
-                        arrays = cutout_crop(*arrays, rng)
-                        record["cutout_applied"] = True
-                    _write_sample(out, record, arrays)
-                records.append(record)
+        with tqdm(total=2 * len(train), desc="Prepare fixed TRAIN augmentations",
+                  unit="sample", dynamic_ncols=True) as progress:
+            for original in train:
+                receiver = scratch.load(original)
+                candidates = [row for row in train if row["source"]["image_sha256"] != original["source"]["image_sha256"]]
+                for variant in (1, 2):
+                    crop = {**original["crop"], "crop_id": original["crop_id"]}
+                    record = _record(data, original["image_id"], crop, original["source"], variant, policy)
+                    old = previous.by_sample.get((record["crop_key"], variant)) if policy_matches else None
+                    old_donor = originals.get(old["donor"]["crop_key"]) if old and old.get("donor") else None
+                    donor_valid = (not old or not old.get("donor") or
+                                   (old_donor is not None and old_donor["split"] == "train"
+                                    and old_donor["source"] == old["donor"]["source"]
+                                    and old_donor["source"]["image_sha256"] != original["source"]["image_sha256"]))
+                    if old is not None and donor_valid:
+                        _copy_sample(out, record, previous, old)
+                        if record["donor"]:
+                            record["donor"] = {key: old_donor[key] for key in ("crop_key", "source", "image_id", "crop_id")}
+                        reused += 1
+                    else:
+                        rng = np.random.default_rng(record["transform_seed"])
+                        arrays = augment_crop(*receiver, rng)
+                        if rng.random() < cutmix_prob and candidates:
+                            donor = candidates[int(rng.integers(len(candidates)))]
+                            arrays = cutmix_crop(arrays, augment_crop(*scratch.load(donor), rng), rng)
+                            record["donor"] = {key: donor[key] for key in ("crop_key", "source", "image_id", "crop_id")}
+                            record["cutmix_applied"] = True
+                        if rng.random() < cutout_prob:
+                            arrays = cutout_crop(*arrays, rng)
+                            record["cutout_applied"] = True
+                        _write_sample(out, record, arrays)
+                    records.append(record)
+                    progress.update()
         with (out / "index.jsonl").open("w", encoding="utf-8") as stream:
             for row in records:
                 stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -283,7 +287,7 @@ def prepare_augmentations(dataset, out, seed=42, cutmix_prob=.25, cutout_prob=.1
                    "cutout_samples": sum(row["cutout_applied"] for row in records),
                    "test_rgb_loaded": False, "test_annotations_rasterized": False}
         write_json(out / "summary.json", summary)
-        finish_record(out, run, "completed")
+        finish_record(out, run, "completed", progress_desc="Hash fixed augmentations")
         return summary
     except BaseException as error:
         finish_record(out, run, "failed", error=str(error))

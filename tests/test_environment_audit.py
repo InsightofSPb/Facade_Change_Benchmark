@@ -3,6 +3,7 @@ from contextlib import redirect_stdout
 import io
 import json
 import runpy
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,56 @@ def old_torch():
 
 
 class EnvironmentAuditTests(unittest.TestCase):
+    def test_cpu_suite_optional_skips_remain_visible_without_failing_audit(self):
+        def fake_probe(code, timeout=45):
+            if code == AUDIT["TEST_CODE"]:
+                self.assertEqual(timeout, 900)
+                return {"status": "ok", "stdout": "", "stderr": "optional codec skipped\n",
+                        "details": {"successful": True, "tests_run": 20, "skipped": 3}}
+            return {"status": "ok", "stdout": "", "stderr": "", "details": {}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "audit"
+            with patch.dict(AUDIT["main"].__globals__, {
+                "probe": fake_probe,
+                "capture": lambda *args: {"returncode": 0, "stdout": "", "stderr": ""},
+            }), patch("shutil.which", return_value=None), redirect_stdout(io.StringIO()):
+                self.assertEqual(AUDIT["main"](["--run-tests", "--out", str(out)]), 0)
+            report = json.loads((out / "audit.json").read_text())
+            self.assertTrue(report["readiness"]["cpu_project_tests_passed"])
+            self.assertEqual(report["tests"]["details"]["skipped"], 3)
+            self.assertIn("optional codec skipped", (out / "tests.log").read_text())
+
+    def test_cpu_suite_failures_empty_and_all_skipped_are_rejected(self):
+        for details in ({"successful": False, "tests_run": 20, "skipped": 3},
+                        {"successful": True, "tests_run": 0, "skipped": 0},
+                        {"successful": True, "tests_run": 3, "skipped": 3}):
+            with self.subTest(details=details), tempfile.TemporaryDirectory() as directory:
+                def fake_probe(code, timeout=45):
+                    if code == AUDIT["TEST_CODE"]:
+                        self.assertEqual(timeout, 120)
+                    return {"status": "ok", "stdout": "", "stderr": "",
+                            "details": details if code == AUDIT["TEST_CODE"] else {}}
+                out = Path(directory) / "audit"
+                with patch.dict(AUDIT["main"].__globals__, {
+                    "probe": fake_probe,
+                    "capture": lambda *args: {"returncode": 0, "stdout": "", "stderr": ""},
+                }), patch("shutil.which", return_value=None), redirect_stdout(io.StringIO()):
+                    self.assertEqual(AUDIT["main"]([
+                        "--run-tests", "--test-timeout", "120", "--out", str(out)]), 2)
+                report = json.loads((out / "audit.json").read_text())
+                self.assertFalse(report["readiness"]["cpu_project_tests_passed"])
+
+    def test_timeout_preserves_partial_test_output(self):
+        error = subprocess.TimeoutExpired(["python", "tests"], 1,
+                                          output=b"partial stdout\n", stderr=b"last test\n")
+        with patch("subprocess.run", side_effect=error):
+            result = AUDIT["capture"](["python", "tests"], timeout=1)
+        self.assertIsNone(result["returncode"])
+        self.assertEqual(result["stdout"], "partial stdout\n")
+        self.assertIn("last test\n", result["stderr"])
+        self.assertIn("timed out", result["stderr"])
+
     def test_old_torch_retains_bridge_and_cuda_without_weights_only(self):
         scope = {}
         with patch.dict("sys.modules", {"torch": old_torch()}):

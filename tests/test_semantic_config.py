@@ -1,6 +1,7 @@
 """Configuration uses recorded assets and explicit ontology, without model imports."""
 import argparse
 import contextlib
+import copy
 import io
 import json
 import sys
@@ -72,6 +73,7 @@ class SemanticConfigTests(unittest.TestCase):
                 self.assertEqual(result["segmenters"][name]["variants"], ["fixed"])
                 self.assertEqual(result["configure_diagnostics"][name]["status"], "missing_declared_assets")
             self.assertEqual(result["segmenters"]["sam3"]["variants"], ["domain", "expanded_flat", "expanded_layered"])
+            self.assertNotIn("trust_checkpoint", result["segmenters"]["lposs_stock"])
             self.assertTrue(Path(result["segmenters"]["sam3"]["checkpoint"]).is_absolute())
             self.assertEqual(result["source"]["prepared_manifest_sha256"], sha256(prepared / "manifest.json"))
             self.assertEqual(result["cache_root"], str(root / "semantic-cache-v1"))
@@ -201,6 +203,74 @@ class SemanticConfigTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 preserved = repair_config(root / "legacy-custom.json", root / "legacy-kept.json")
             self.assertEqual(preserved["source"]["stock_root_repair"]["models"][0]["status"], "custom_root_preserved")
+
+    def test_configure_checkpoint_trust_is_explicit_and_only_for_stock_lposs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = configure(self.arguments(root, prepared, "--trust-lposs-checkpoint"))
+            self.assertTrue(result["segmenters"]["lposs_stock"]["trust_checkpoint"])
+            self.assertNotIn("trust_checkpoint", result["segmenters"]["maskclip_stock"])
+            self.assertNotIn("trust_checkpoint", result["segmenters"]["sam3"])
+            self.assertNotIn("trust_checkpoint", result["segmenters"]["dino_semantic"])
+
+    def test_trust_only_repair_preserves_all_paths_settings_and_original_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                config = configure(self.arguments(root, prepared))
+            # A usable sibling appears after configure. Trust-only repair must
+            # still not perform the older automatic source-root migration.
+            self.stock_checkout(root / "Compress_to_prevent")
+            config["segmenters"]["lposs_stock"]["dino_checkpoint"] = "/exact/existing/dino.pth"
+            config["segmenters"]["lposs_stock"]["dino_source_root"] = "/exact/existing/dino"
+            config["segmenters"]["lposs_stock"]["trust_checkpoint"] = False
+            config["segmenters"]["sam3"]["checkpoint"] = "/exact/existing/sam3.pt"
+            config["roi"]["max_regions"] = 3
+            config["vocabularies"]["domain"][0]["prompts"] = ["exact user prompt"]
+            source = root / "config003.json"
+            atomic_json(source, config)
+            original = source.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = repair_config(source, root / "config004.json", trust_lposs_checkpoint=True)
+            self.assertEqual(source.read_bytes(), original)
+            expected = copy.deepcopy(config)
+            expected["segmenters"]["lposs_stock"]["trust_checkpoint"] = True
+            audit = result["source"].pop("checkpoint_trust_repair")
+            self.assertEqual(result, expected)
+            self.assertEqual(audit["source_config_sha256"], sha256(source))
+            self.assertEqual(audit["models"], [{"segmenter": "lposs_stock", "previous": False,
+                                                "trust_checkpoint": True}])
+            saved = json.loads((root / "config004.json").read_text())
+            self.assertTrue(saved["segmenters"]["lposs_stock"]["trust_checkpoint"])
+            self.assertIn("checkpoint_trust_repair", saved["source"])
+
+    def test_trust_repair_can_explicitly_combine_with_root_override(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            prepared, _ = self.prepared(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                configure(self.arguments(root, prepared))
+            chosen = self.stock_checkout(root / "chosen-stock")
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = repair_config(root / "config.json", root / "repaired.json", stock_root=chosen,
+                                       trust_lposs_checkpoint=True)
+            for name in ("lposs_stock", "maskclip_stock"):
+                self.assertEqual(result["segmenters"][name]["source_root"], str(chosen))
+            self.assertTrue(result["segmenters"]["lposs_stock"]["trust_checkpoint"])
+            self.assertNotIn("trust_checkpoint", result["segmenters"]["maskclip_stock"])
+
+    def test_trust_repair_without_stock_lposs_does_not_create_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "config.json"
+            destination = root / "repaired.json"
+            atomic_json(source, {"segmenters": {"sam3": {"kind": "sam3"}}})
+            with self.assertRaisesRegex(ValueError, "нет stock_lposs"):
+                repair_config(source, destination, trust_lposs_checkpoint=True)
+            self.assertFalse(destination.exists())
 
     def test_source_records_recover_missing_options_and_conflicts_fail(self):
         manifest = {"source_run": "/nonexistent/source", "source_config": {"method_options": {

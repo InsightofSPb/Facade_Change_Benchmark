@@ -127,10 +127,10 @@ tar -czf runs/2026-10-20-semantic-error-audit-results-001.tar.gz \
 
 ```bash
 PYTHONPATH=tests python -m unittest \
-  test_2026-10-20_semantic_error_audit \
-  test_2026-10-19_directed_delta_updates \
-  test_2026-10-19_continuous_semantic_updates \
-  test_2026-10-19_semantic_updates \
+  test_semantic_error_audit \
+  test_directed_delta_updates \
+  test_continuous_semantic_updates \
+  test_semantic_updates \
   test_real_gt_calibration test_semantic_geometry -q
 ```
 

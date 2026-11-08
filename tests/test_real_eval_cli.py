@@ -11,7 +11,7 @@ class RealEvalCLITests(unittest.TestCase):
         scripts = Path(__file__).resolve().parents[1] / 'scripts' / 'real_eval'
         with tempfile.TemporaryDirectory() as directory:
             for name in ('geoscd_real_retry', 'real_temporal_gallery', 'real_gt_metrics',
-                         'real_gt_calibration', 'temporal_fusion', 'temporal_tables'):
+                         'real_gt_calibration', 'real_final_fpr', 'temporal_fusion', 'temporal_tables'):
                 with self.subTest(script=name):
                     result = subprocess.run(
                         [sys.executable, str(scripts / (name + '.py')), '--help'],

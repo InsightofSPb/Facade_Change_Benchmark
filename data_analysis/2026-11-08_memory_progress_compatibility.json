@@ -1,0 +1,5 @@
+{
+  "before_sha256": "7dadf1809fe041725303600bd9a19a5420d0768dfd0d6ce189490f2dbae840cc",
+  "after_sha256": "13609c38f06175a08e247a433226597f1254b0641ad87231b0c8346fba2c0eeb",
+  "scope": "tqdm instrumentation only; all other experiment-contract fields must match exactly"
+}

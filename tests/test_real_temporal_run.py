@@ -99,7 +99,8 @@ class TemporalRunTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.prepared, self.source = fixture(self.root)
         self.out = self.root/"out"
-        self.quiet = contextlib.redirect_stdout(io.StringIO())
+        self.output = io.StringIO()
+        self.quiet = contextlib.redirect_stdout(self.output)
         self.quiet.__enter__()
         self.gpu = patch.object(runner, "_snapshot_gpu")
         self.gpu.start()
@@ -238,6 +239,42 @@ class TemporalRunTests(unittest.TestCase):
         self.assertEqual(len(timing["methods"]), 5)
         self.assertIsNotNone(timing["estimated_hours_high"])
         self.assertTrue(all("initialization_seconds" in row for row in timing["methods"]))
+
+    def test_pilot_preflight_failures_report_only_scheduled_modes_and_final_reasons(self):
+        for method in ("dinov2", "geoscd"):
+            (self.source/"method_provenance"/f"full_{method}.json").unlink()
+        factory = Factory()
+        result = self.execute(factory, methods=runner.DEFAULT_METHODS, pilot=True,
+                              pilot_pairs=2, pilot_history_frames=3)
+        self.assertEqual(result["status"], "completed_with_failures")
+        self.assertEqual((result["total"], result["completed"], result["failed"], result["unprocessed"]),
+                         (48, 8, 0, 40))
+        self.assertEqual(set(factory.activations), {"rgb_diff", "ssim"})
+        expected = {f"{mode}/{method}" for method in runner.DEFAULT_METHODS
+                    if method not in ("rgb_diff", "ssim")
+                    for mode in ("previous", "earliest")}
+        expected.update(f"history/{method}" for method in runner.HISTORY_METHODS)
+        self.assertEqual(set(result["method_failures"]), expected)
+        self.assertEqual(read_json(self.out/"summary.json")["method_failures"], result["method_failures"])
+        # Errors must remain visible after the timing table, without mistaking
+        # preflight skips for successful or attempted inference units.
+        final_output = self.output.getvalue().split("Итог: ")[-1]
+        self.assertIn("готово 8/48; ошибок расчёта 0; не обработано 40", final_output)
+        self.assertIn("previous/lpips, earliest/lpips: ValueError:", final_output)
+        self.assertIn("checkpoint_path/checkpoint_sha256", final_output)
+        self.assertIn(str(self.out/"summary.json"), final_output)
+        self.assertNotIn("history/lpips", final_output)
+        self.assertNotIn("history/anychange", final_output)
+        self.assertNotIn("history/geoscd", final_output)
+
+    def test_history_threshold_failure_keeps_pair_modes_available(self):
+        manifest = read_json(self.prepared/"manifest.json")
+        manifest["source_summary"]["calibration"] = []
+        atomic_json(self.prepared/"manifest.json", manifest)
+        result = self.execute(Factory(), methods=("dinov2",), pilot=True, pilot_pairs=2)
+        self.assertEqual((result["completed"], result["unprocessed"]), (4, 3))
+        self.assertEqual(set(result["method_failures"]), {"history/dinov2"})
+        self.assertIn("history/dinov2: ValueError:", self.output.getvalue().split("Итог: ")[-1])
 
 
 if __name__ == "__main__":

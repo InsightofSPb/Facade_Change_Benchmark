@@ -92,29 +92,38 @@ def bernoulli_entropy(probability):
     return entropy.mean(axis=0).astype(np.float32)
 
 
-def _checked_run(training_run):
+def _checked_run(training_run, *, source_root=None, backbone_checkpoint=None, head_checkpoint=None,
+                 allow_source_change=False):
+    if type(allow_source_change) is not bool:
+        raise ValueError("allow_source_change must be boolean")
     root = Path(training_run).expanduser().resolve()
+    head = Path(head_checkpoint).expanduser().resolve() if head_checkpoint is not None else root / "best.pth"
     record = read_json(root / "run.json")
     if (record.get("kind") != "dino_semantic_training"
             or record.get("status") not in {"completed_exploratory", "completed_smoke"}):
         raise ValueError("Evaluation requires a completed semantic training run; active runs are not loaded")
     for name in ("config.json", "best.pth", "summary.json"):
-        if record.get("artifact_sha256", {}).get(name) != sha256(root / name):
+        path = head if name == "best.pth" else root / name
+        if record.get("artifact_sha256", {}).get(name) != sha256(path):
             raise ValueError(f"Training artifact hash mismatch: {name}")
     config = read_json(root / "config.json")
     if config != record.get("config"):
         raise ValueError("Training run/config mismatch")
-    saved = torch.load(root / "best.pth", map_location="cpu", weights_only=True)
+    provenance = record.get("model", {})
+    sources, weights = provenance.get("sources", {}), provenance.get("checkpoint", {})
+    source = source_root if source_root is not None else config["source_root"]
+    backbone = backbone_checkpoint if backbone_checkpoint is not None else config["checkpoint"]
+    if (not sources.get("python_tree_sha256") or not weights.get("sha256")
+            or sha256(Path(backbone).expanduser().resolve()) != weights["sha256"]):
+        raise ValueError("Frozen DINO source/checkpoint fingerprint differs from training")
+    actual_source = _source_provenance(source)["python_tree_sha256"]
+    if not allow_source_change and actual_source != sources["python_tree_sha256"]:
+        raise ValueError("Frozen DINO source/checkpoint fingerprint differs from training")
+    saved = torch.load(head, map_location="cpu", weights_only=True)
     if (saved.get("kind") != "frozen_dinov2_semantic_head" or saved.get("schema_version") != 1
             or saved.get("config") != config or saved.get("backbone_provenance") != record.get("model")
             or saved.get("epoch") != read_json(root / "summary.json").get("best_epoch")):
         raise ValueError("Best checkpoint contract differs from completed training record")
-    provenance = saved["backbone_provenance"]
-    sources, weights = provenance.get("sources", {}), provenance.get("checkpoint", {})
-    if (not sources.get("python_tree_sha256") or not weights.get("sha256")
-            or sha256(config["checkpoint"]) != weights["sha256"]
-            or _source_provenance(config["source_root"])["python_tree_sha256"] != sources["python_tree_sha256"]):
-        raise ValueError("Frozen DINO source/checkpoint fingerprint differs from training")
     return root, record, config, saved
 
 

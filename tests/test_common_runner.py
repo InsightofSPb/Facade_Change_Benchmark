@@ -21,7 +21,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             configs = root / "configs"
             configs.mkdir()
             write_json(configs / "methods.json", {"methods": {"dinov2": {
-                "worker_python": "/usr/bin/python3", "source_root": "../sources/dino"}}})
+                "worker_python": "/usr/bin/python3", "source_root": "../sources/dino"},
+                "semantic_dino": {"head_checkpoint": "../models/semantic_dino/best.pth"}}})
             write_json(configs / "run.json", {"dataset_run": "../runs/data", "out": "../runs/new",
                 "methods_config": "methods.json", "selection_path": "../runs/old/selection.json",
                 "reuse_run": "../runs/old", "device": "cuda:0", "methods": ["dinov2"]})
@@ -31,6 +32,8 @@ class BenchmarkConfigTests(unittest.TestCase):
             self.assertEqual(result["dataset_run"], str(root / "runs/data"))
             self.assertEqual(result["out"], str(root / "runs/new"))
             self.assertEqual(result["method_options"]["dinov2"]["source_root"], str(root / "sources/dino"))
+            self.assertEqual(result["method_options"]["semantic_dino"]["head_checkpoint"],
+                             str(root / "models/semantic_dino/best.pth"))
             self.assertEqual(result["device"], "cuda:0")
             override = benchmark_arguments({**flags, "out": "runs/override", "methods": ["lpips"]})
             self.assertEqual(override["out"], "runs/override")

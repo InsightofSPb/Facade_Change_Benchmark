@@ -25,11 +25,11 @@ def confusion_counts(prediction: np.ndarray, target: np.ndarray, valid: np.ndarr
     prediction, target, valid = map(np.asarray, (prediction, target, valid))
     if prediction.ndim != 3 or target.shape != prediction.shape:
         raise ValueError("prediction and target must have identical C,H,W shapes")
-    if valid.shape != prediction.shape[1:]:
-        raise ValueError("valid must have shape H,W")
+    if valid.shape not in (prediction.shape[1:], prediction.shape):
+        raise ValueError("valid must have shape H,W or C,H,W")
     if any(array.dtype != np.bool_ for array in (prediction, target, valid)):
         raise ValueError("prediction, target and valid must be boolean arrays")
-    support = valid[None, :, :]
+    support = valid[None, :, :] if valid.ndim == 2 else valid
     axes = (1, 2)
     return np.stack((
         np.sum(prediction & target & support, axis=axes, dtype=np.int64),

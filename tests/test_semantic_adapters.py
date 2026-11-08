@@ -171,6 +171,70 @@ class SemanticAdaptersTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapters.sam3_image_state({})
 
+    def test_sam3_omits_only_inactive_interactive_neck_and_keeps_strict_loading(self):
+        from unittest.mock import Mock
+        active = {'backbone.vision_backbone.convs.0.conv_1x1.weight': np.ones((2, 2)),
+                  'segmentation_head.weight': np.ones((2, 2))}
+        extra = 'backbone.vision_backbone.sam2_convs.0.conv_1x1.weight'
+        merged = {'detector.' + key: value for key, value in active.items()}
+        merged['detector.' + extra] = np.zeros((2, 2))
+        merged['tracker.weight'] = np.zeros((1,))
+        model = Mock()
+        model.inst_interactive_predictor = None
+        model.state_dict.return_value = active
+        metadata = adapters.load_sam3_image_state(model, merged)
+        model.load_state_dict.assert_called_once_with(active, strict=True)
+        self.assertEqual(metadata['omitted_inactive_keys'], [extra])
+        self.assertEqual(metadata['loaded_keys'], len(active))
+        self.assertIn('detector.' + extra, merged)  # Checkpoint mapping is not mutated.
+
+        # A broad sam2_convs-prefix filter would silently accept both cases.
+        for key, value in ((extra, np.zeros((3, 3))),
+                           ('backbone.vision_backbone.sam2_convs.unknown.weight', np.zeros((2, 2)))):
+            model.reset_mock()
+            model.load_state_dict.side_effect = RuntimeError('unexpected key')
+            invalid = {**active, key: value}
+            with self.assertRaisesRegex(RuntimeError, 'unexpected key'):
+                adapters.load_sam3_image_state(model, invalid)
+            model.load_state_dict.assert_called_once_with(invalid, strict=True)
+
+    def test_sam3_active_interactive_branch_and_unknown_keys_are_not_filtered(self):
+        from unittest.mock import Mock
+        active = 'backbone.vision_backbone.sam2_convs.0.conv_1x1.weight'
+        unknown = 'backbone.vision_backbone.sam2_convs.unknown.weight'
+        model = Mock()
+        model.inst_interactive_predictor = None
+        model.state_dict.return_value = {active: 1}
+        state = {active: 1, unknown: 2, 'unexpected_image_head.weight': 3}
+        metadata = adapters.load_sam3_image_state(model, state)
+        model.load_state_dict.assert_called_once_with(state, strict=True)
+        self.assertEqual(metadata['omitted_inactive_keys'], [])
+
+    def test_sam3_required_state_errors_propagate(self):
+        from unittest.mock import Mock
+        for state in ({'other.weight': 1}, {'required.weight': np.zeros((3,))}):
+            model = Mock()
+            model.state_dict.return_value = {'required.weight': np.zeros((2,))}
+            model.load_state_dict.side_effect = RuntimeError('missing key or shape mismatch')
+            with self.assertRaisesRegex(RuntimeError, 'missing key or shape mismatch'):
+                adapters.load_sam3_image_state(model, state)
+            model.load_state_dict.assert_called_once_with(state, strict=True)
+
+    def test_legacy_torch_loader_requires_explicit_trust_and_never_hides_other_errors(self):
+        from unittest.mock import Mock
+        legacy = Mock()
+        legacy.load.side_effect = TypeError("unexpected keyword argument 'weights_only'")
+        with self.assertRaisesRegex(RuntimeError, 'trust_checkpoint:true'):
+            adapters._load_tensors(legacy, 'local.pth')
+        self.assertEqual(legacy.load.call_count, 1)
+        legacy.reset_mock()
+        legacy.load.side_effect = [TypeError("unexpected keyword argument 'weights_only'"), {'weight': 1}]
+        self.assertEqual(adapters._load_tensors(legacy, 'local.pth', trust_checkpoint=True), {'weight': 1})
+        self.assertEqual(legacy.load.call_args_list[-1].kwargs, {'map_location': 'cpu'})
+        legacy.load.side_effect = TypeError('unrelated error')
+        with self.assertRaisesRegex(TypeError, 'unrelated error'):
+            adapters._load_tensors(legacy, 'local.pth', trust_checkpoint=True)
+
     def test_auto_rejects_missing_or_ambiguous_assets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

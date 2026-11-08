@@ -3,16 +3,18 @@ import importlib
 import importlib.util
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-from facade_change.io import sha256, write_json
+from facade_change.io import read_json, sha256, write_json
 from facade_change.method_worker import serve
 from facade_change.methods.remote import RemotePool, RemoteScorer, validate_auxiliary_arrays
 
@@ -64,6 +66,146 @@ class SemanticMetadataTests(unittest.TestCase):
             write_json(path, {"kind": "semantic_crop_index", "manifest": "manifest.json"})
             with self.assertRaisesRegex(ValueError, "nonempty images list"):
                 semantic._training_origin({}, path)
+
+
+class SemanticCheckpointRelocationTests(unittest.TestCase):
+    def setUp(self):
+        from facade_change.methods.dinov2 import _source_provenance
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        (self.source / "hubconf.py").write_text("# frozen source\n")
+        self.weights = self.root / "backbone.pth"
+        self.weights.write_bytes(b"frozen backbone")
+        self.config = {"source_root": str(self.source), "checkpoint": str(self.weights),
+                       "categories": [{"id": 1, "name": "CRACK"}],
+                       "category_to_channel": [{"category_id": 1, "channel": 0}]}
+        model = {"sources": _source_provenance(self.source), "checkpoint": {"sha256": sha256(self.weights)},
+                 "num_classes": 1}
+        saved = {"kind": "frozen_dinov2_semantic_head", "schema_version": 1, "epoch": 3,
+                 "config": self.config, "backbone_provenance": model, "head_state_dict": {}}
+        for name, value in (("config.json", self.config), ("summary.json", {"best_epoch": 3}), ("best.pth", saved)):
+            write_json(self.root / name, value)
+        write_json(self.root / "run.json", {
+            "kind": "dino_semantic_training", "status": "completed_smoke", "config": self.config, "model": model,
+            "artifact_sha256": {name: sha256(self.root / name) for name in ("config.json", "summary.json", "best.pth")}})
+        self.load = Mock(side_effect=lambda path, **kwargs: read_json(path))
+        stubs = {"torch": SimpleNamespace(load=self.load),
+                 "facade_change.segmentation.model": SimpleNamespace(load_model=None),
+                 "facade_change.segmentation.train": SimpleNamespace(evaluate=None, gpu_preflight=None, ownership_masks=None)}
+        path = Path(semantic.__file__).parents[1] / "segmentation/evaluate.py"
+        spec = importlib.util.spec_from_file_location("facade_change.segmentation._relocation_test_evaluate", path)
+        self.module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, stubs):
+            spec.loader.exec_module(self.module)
+
+    def relocate(self):
+        target = self.root / "models"
+        target.mkdir()
+        shutil.copytree(self.source, target / "source")
+        shutil.copy2(self.weights, target / "backbone.pth")
+        shutil.copy2(self.root / "best.pth", target / "head.pth")
+        return {"source_root": target / "source", "backbone_checkpoint": target / "backbone.pth",
+                "head_checkpoint": target / "head.pth"}
+
+    def test_default_paths_and_restricted_head_loading_are_preserved(self):
+        _, _, config, saved = self.module._checked_run(self.root)
+        self.assertEqual(config, self.config)
+        self.assertEqual(saved["epoch"], 3)
+        self.load.assert_called_once_with(self.root / "best.pth", map_location="cpu", weights_only=True)
+
+    def test_identical_copies_work_without_original_weight_paths(self):
+        options = self.relocate()
+        before = {name: sha256(self.root / name) for name in ("run.json", "config.json", "summary.json")}
+        self.weights.unlink()
+        (self.root / "best.pth").unlink()
+        shutil.rmtree(self.source)
+        _, _, config, saved = self.module._checked_run(self.root, **options)
+        self.assertEqual(config, self.config)
+        self.assertEqual(saved["config"], self.config)
+        self.assertEqual(before, {name: sha256(self.root / name) for name in before})
+        self.load.assert_called_once_with(options["head_checkpoint"], map_location="cpu", weights_only=True)
+
+    def test_changed_backbone_and_source_are_rejected_before_deserialization(self):
+        options = self.relocate()
+        for path in (options["backbone_checkpoint"], options["source_root"] / "hubconf.py"):
+            with self.subTest(path=path.name):
+                original = path.read_bytes()
+                path.write_bytes(b"different")
+                with self.assertRaisesRegex(ValueError, "fingerprint"):
+                    self.module._checked_run(self.root, **options)
+                self.load.assert_not_called()
+                path.write_bytes(original)
+
+    def test_changed_head_is_rejected_before_deserialization(self):
+        options = self.relocate()
+        options["head_checkpoint"].write_bytes(b"different")
+        with self.assertRaisesRegex(ValueError, "artifact hash mismatch: best.pth"):
+            self.module._checked_run(self.root, **options)
+        self.load.assert_not_called()
+
+    def test_changed_source_is_allowed_only_with_boolean_opt_in(self):
+        options = self.relocate()
+        (options["source_root"] / "hubconf.py").write_text("# current source\n")
+        for flag in (False, "true"):
+            with self.subTest(flag=flag), self.assertRaises(ValueError):
+                self.module._checked_run(self.root, **options, allow_source_change=flag)
+            self.load.assert_not_called()
+        _, _, config, saved = self.module._checked_run(self.root, **options, allow_source_change=True)
+        self.assertEqual(config, self.config)
+        self.assertEqual(saved["config"], self.config)
+        self.load.assert_called_once_with(options["head_checkpoint"], map_location="cpu", weights_only=True)
+
+    def test_source_opt_in_keeps_backbone_and_head_hash_checks(self):
+        options = self.relocate()
+        (options["source_root"] / "hubconf.py").write_text("# current source\n")
+        for name in ("backbone_checkpoint", "head_checkpoint"):
+            with self.subTest(name=name):
+                path = options[name]
+                original = path.read_bytes()
+                path.write_bytes(b"different weights")
+                with self.assertRaises(ValueError):
+                    self.module._checked_run(self.root, **options, allow_source_change=True)
+                self.load.assert_not_called()
+                path.write_bytes(original)
+
+    def test_adapter_loads_verified_copies_and_records_actual_head_path(self):
+        from facade_change.methods.dinov2 import _source_provenance
+
+        options = self.relocate()
+        model = SimpleNamespace(head=SimpleNamespace(load_state_dict=Mock()))
+        model.eval = lambda: model
+        model.requires_grad_ = lambda value: model
+        provenance = {"sources": _source_provenance(options["source_root"]),
+                      "checkpoint": {"sha256": sha256(options["backbone_checkpoint"])}, "num_classes": 1}
+        load_model = Mock(return_value=(model, provenance))
+        stubs = {"facade_change.segmentation.evaluate": self.module,
+                 "facade_change.segmentation.model": SimpleNamespace(load_model=load_model),
+                 "facade_change.segmentation.train": SimpleNamespace(gpu_preflight=lambda device: {})}
+        with patch.dict(sys.modules, stubs):
+            scorer = semantic.SemanticDINOScorer(training_run=self.root, **options)
+        load_model.assert_called_once_with(options["source_root"], options["backbone_checkpoint"], 1, "cpu", False)
+        model.head.load_state_dict.assert_called_once_with({}, strict=True)
+        self.assertEqual(scorer.metadata["training_run"], str(self.root))
+        self.assertEqual(scorer.metadata["head_checkpoint"]["path"], str(options["head_checkpoint"]))
+        self.assertEqual(read_json(self.root / "config.json"), self.config)
+        self.assertTrue(scorer.metadata["source_compatibility"]["matches_training"])
+        self.assertFalse(scorer.metadata["source_compatibility"]["allow_source_change"])
+        (options["source_root"] / "hubconf.py").write_text("# current source\n")
+        provenance["sources"] = _source_provenance(options["source_root"])
+        with patch.dict(sys.modules, stubs):
+            scorer = semantic.SemanticDINOScorer(training_run=self.root, **options, allow_source_change=True)
+        audit = scorer.metadata["source_compatibility"]
+        self.assertFalse(audit["matches_training"])
+        self.assertTrue(audit["allow_source_change"])
+        self.assertNotEqual(audit["training_python_tree_sha256"], audit["current_python_tree_sha256"])
+        self.assertEqual(audit["current_python_tree_sha256"], provenance["sources"]["python_tree_sha256"])
+        provenance["checkpoint"]["sha256"] = "wrong"
+        with patch.dict(sys.modules, stubs), self.assertRaisesRegex(ValueError, "Loaded semantic backbone"):
+            semantic.SemanticDINOScorer(training_run=self.root, **options, allow_source_change=True)
 
 
 class AuxiliaryProtocolTests(unittest.TestCase):

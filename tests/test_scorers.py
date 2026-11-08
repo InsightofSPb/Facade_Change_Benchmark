@@ -2,7 +2,6 @@
 import importlib.util
 import inspect
 import unittest
-from pathlib import Path
 
 import numpy as np
 
@@ -172,15 +171,6 @@ class SSIMTests(unittest.TestCase):
         self.assertTrue((score >= 0).all() and (score <= 1).all())
         np.testing.assert_array_equal(source, 255 - reference)
 
-
-def load_tests(loader, suite, pattern):
-    # unittest discovery skips ISO-dated filenames because they contain hyphens.
-    for name in ("test_2026-10-04_compression", "test_2026-10-04_msdzip"):
-        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + ".py"))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        suite.addTests(loader.loadTestsFromModule(module))
-    return suite
 
 
 if __name__ == "__main__":

@@ -31,6 +31,38 @@ def _integer(value, name, minimum=0):
     return value
 
 
+def rasterize_annotations(annotations, height, width, category_to_channel):
+    """Native-grid multilabel COCO rasterization, without decoding RGB."""
+    try:
+        from pycocotools import mask as mask_utils
+    except ImportError as error:
+        raise RuntimeError("Semantic rasterization requires pycocotools; install the segmentation extra") from error
+    packed = np.zeros((height, width), dtype=np.uint16)
+    crowd = np.zeros((height, width), dtype=bool)
+    for annotation in annotations:
+        if annotation["category_id"] not in category_to_channel:
+            raise ValueError(f"Unknown annotation category: {annotation['category_id']}")
+        segmentation = annotation.get("segmentation")
+        if isinstance(segmentation, list) and segmentation:
+            rle = mask_utils.merge(mask_utils.frPyObjects(segmentation, height, width))
+        elif isinstance(segmentation, dict):
+            if list(segmentation.get("size", [])) != [height, width]:
+                raise ValueError(f"RLE size mismatch: annotation {annotation['id']}")
+            rle = (mask_utils.frPyObjects(segmentation, height, width)
+                   if isinstance(segmentation.get("counts"), list) else segmentation)
+        else:
+            raise ValueError(f"Missing/invalid COCO segmentation: annotation {annotation['id']}")
+        mask = mask_utils.decode(rle).astype(bool)
+        if mask.shape != (height, width):
+            raise ValueError(f"Decoded annotation has invalid shape: {annotation['id']}")
+        if annotation.get("iscrowd", 0):
+            crowd |= mask
+        else:
+            packed[mask] |= np.uint16(1 << category_to_channel[annotation["category_id"]])
+    packed[crowd] = 0
+    return packed
+
+
 class PreparedData:
     """Metadata-only construction; lazy RGB and COCO rasterization.
 
@@ -217,32 +249,8 @@ class PreparedData:
     def _rasterize(self, image_id, h, w):
         if self.images[image_id]["split"] == "test":
             self.metadata["test_annotations_rasterized"] = True
-        try:
-            from pycocotools import mask as mask_utils
-        except ImportError as error:
-            raise RuntimeError("Semantic rasterization requires pycocotools; install the segmentation extra") from error
-        packed = np.zeros((h, w), dtype=np.uint16)
-        crowd = np.zeros((h, w), dtype=bool)
-        for annotation in self.annotations_by_image.get(image_id, []):
-            segmentation = annotation.get("segmentation")
-            if isinstance(segmentation, list) and segmentation:
-                rle = mask_utils.merge(mask_utils.frPyObjects(segmentation, h, w))
-            elif isinstance(segmentation, dict):
-                if list(segmentation.get("size", [])) != [h, w]:
-                    raise ValueError(f"RLE size mismatch: annotation {annotation['id']}")
-                rle = (mask_utils.frPyObjects(segmentation, h, w)
-                       if isinstance(segmentation.get("counts"), list) else segmentation)
-            else:
-                raise ValueError(f"Missing/invalid COCO segmentation: annotation {annotation['id']}")
-            mask = mask_utils.decode(rle).astype(bool)
-            if mask.shape != (h, w):
-                raise ValueError(f"Decoded annotation has invalid shape: {annotation['id']}")
-            if annotation.get("iscrowd", 0):
-                crowd |= mask
-            else:
-                packed[mask] |= np.uint16(1 << self.category_to_channel[annotation["category_id"]])
-        packed[crowd] = 0
-        return packed
+        return rasterize_annotations(self.annotations_by_image.get(image_id, []), h, w,
+                                     self.category_to_channel)
 
     def crop(self, image_id, crop_row):
         if crop_row["image_id"] != image_id:

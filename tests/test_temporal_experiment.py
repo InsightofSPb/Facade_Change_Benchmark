@@ -22,7 +22,7 @@ from facade_change.methods.rgb import RGBScorer
 
 runner = importlib.import_module("facade_change.2026-10-14_temporal_experiment")
 spec = importlib.util.spec_from_file_location(
-    "temporal_input_fixtures", Path(__file__).with_name("test_2026-10-14_temporal_inputs.py"))
+    "temporal_input_fixtures", Path(__file__).with_name("test_temporal_inputs.py"))
 fixtures = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixtures)
 

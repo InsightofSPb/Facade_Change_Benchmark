@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Audit -> selected real histories -> timed pilot -> resumable frozen inference."""
+"""Audit -> real histories -> timed pilot -> resumable frozen inference."""
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 import subprocess
@@ -35,19 +36,32 @@ def main(argv=None):
     audit.add_argument('--snapshot', required=True)
     audit.add_argument('--dataset', help='По умолчанию dataset исходного запуска')
     audit.add_argument('--alignment-runs', nargs='+', help='Явный список сохранённых alignment; иначе обнаружение')
+    audit.add_argument('--alignment-session', help='Завершённая сессия dataset_statistics; только её выбранные пары')
+    audit.add_argument('--quality-report', help='Явный завершённый quality-отчёт после отдельного evaluate')
     audit.add_argument('--runs-root', help='Корень runs для обнаружения существующих совмещений')
     audit.add_argument('--splits', nargs='+', choices=('train', 'val', 'test'), default=['test', 'val', 'train'])
     audit.add_argument('--out', required=True)
-    prepare = commands.add_parser('prepare', help='CPU: отбор по размеченным изменениям, все годы и галерея')
-    prepare.add_argument('--audit', required=True)
+    prepare = commands.add_parser('prepare', help='CPU: выбранные или все геометрически пригодные истории')
+    source = prepare.add_mutually_exclusive_group(required=True)
+    source.add_argument('--audit')
+    source.add_argument('--histories', help='Готовый canonical manifest.json, 224 px / шаг 192; RGB не пересоздаётся')
+    prepare.add_argument('--annotation-manifest', help='Reviewed manifest с source.coco_json; иначе из provenance истории')
+    prepare.add_argument('--class-groups', default=str(Path(__file__).resolve().parents[2] / 'configs/semantic_class_groups.json'))
+    prepare.add_argument('--expected-sha256')
+    prepare.add_argument('--expected-candidates', type=int)
+    prepare.add_argument('--boundary-tolerance', type=int, default=1)
+    prepare.add_argument('--resume', action='store_true')
     prepare.add_argument('--out', required=True)
-    prepare.add_argument('--max-facades', type=int, default=12)
-    prepare.add_argument('--crops-per-facade', type=int, choices=(1, 2), default=1)
+    prepare.add_argument('--selection-mode', choices=('gt-enriched', 'all-geometric'), default='gt-enriched',
+                         help='all-geometric: все окна без отбора по GT, без лимитов фасадов/кропов')
+    prepare.add_argument('--max-facades', type=int, help='Только gt-enriched; по умолчанию 12')
+    prepare.add_argument('--crops-per-facade', type=int, choices=(1, 2), help='Только gt-enriched; по умолчанию 1')
     prepare.add_argument('--tile-size', type=int, default=512)
     prepare.add_argument('--stride', type=int, default=256)
     prepare.add_argument('--min-support', type=float, default=.8)
-    prepare.add_argument('--min-known-pixels', type=int, default=1024)
+    prepare.add_argument('--min-known-pixels', type=int, help='Только gt-enriched; по умолчанию 1024')
     prepare.add_argument('--buildings', nargs='+', help='Необязательно: явно ограничить фасады по audit')
+    prepare.add_argument('--gallery-limit', type=int, default=48, help='Максимум историй в HTML; данные не ограничивает')
     for name in ('pilot', 'run'):
         command = commands.add_parser(name, help=('Реальный замер на малой выборке' if name == 'pilot'
                                                   else 'PREVIOUS → EARLIEST → HISTORY, без обучения'))
@@ -58,6 +72,10 @@ def main(argv=None):
         command.add_argument('--modes', nargs='+', choices=('previous', 'earliest', 'history'),
                              default=['previous', 'earliest', 'history'])
         command.add_argument('--device', default=None)
+        command.add_argument('--methods-config', help='Существующий JSON с путями весов и worker_python')
+        command.add_argument('--trust-checkpoint', action='store_true')
+        command.add_argument('--pilot-tracks', type=int, default=3,
+                             help='Canonical pilot: столько полных историй на TRAIN и VAL')
         command.add_argument('--geoscd-run', help='Дополнительный кэш готовых пар GeoSCD')
         command.add_argument('--reuse-run', help='Переиспользовать проверенные парные карты отдельного pilot')
         command.add_argument('--resume', action='store_true')
@@ -73,6 +91,12 @@ def main(argv=None):
     report.add_argument('--run', required=True)
     report.add_argument('--out', help='По умолчанию RUN/reports')
     report.add_argument('--budgets', type=float, nargs='+', default=[.01, .05])
+    calibrate = commands.add_parser('calibrate', help='CPU: реальный VAL LOFO, все попарные AND/OR с итоговым FPR')
+    calibrate.add_argument('--run', required=True, help='Завершённый ночной запуск с units и maps')
+    calibrate.add_argument('--out', required=True, help='Новый каталог CPU-анализа рядом с исходным запуском')
+    calibrate.add_argument('--budgets', type=float, nargs='+', default=[.01, .05])
+    calibrate.add_argument('--methods', nargs='+', help='По умолчанию все методы PREVIOUS и доступные HISTORY')
+    calibrate.add_argument('--resume', action='store_true', help='Продолжить с проверкой входов, кода и готовых семейств')
     status = commands.add_parser('status', help='Короткая сводка прогресса без запуска моделей')
     status.add_argument('--run', required=True)
     args = parser.parse_args(argv)
@@ -81,17 +105,38 @@ def main(argv=None):
     if args.command in ('pilot', 'run') and args.detach:
         _launch_detached(args, argv)
         return
+    canonical = None
+    if args.command == 'prepare' and args.histories:
+        canonical = 'prepare'
+    elif args.command in ('pilot', 'run'):
+        path = Path(args.prepared).expanduser() / 'index.json'
+        if path.exists() and json.loads(path.read_text()).get('kind') == 'canonical_history_prepared':
+            canonical = 'run'
+    elif args.command == 'report':
+        path = Path(args.run).expanduser() / 'run.json'
+        if path.exists() and json.loads(path.read_text()).get('kind') == 'canonical_history_benchmark':
+            canonical = 'report'
+    if canonical:
+        module = importlib.import_module('facade_change.research.2026-11-04_history_benchmark' +
+                                         ('_data' if canonical == 'prepare' else ''))
+        result = module.report(args.run, args.out) if canonical == 'report' else getattr(module, canonical)(args)
+        if canonical != 'report':
+            print(json.dumps({'out': str(Path(args.out).resolve()),
+                              'status': result.get('status', 'completed')}, ensure_ascii=False, indent=2))
+        return
     if args.command == 'audit':
         from scripts.real_eval.night_prepare import audit
         result = audit(args.run, args.snapshot, args.out, alignment_runs=args.alignment_runs,
-                       runs_root=args.runs_root, splits=tuple(args.splits), dataset=args.dataset)
+                       runs_root=args.runs_root, splits=tuple(args.splits), dataset=args.dataset,
+                       alignment_session=args.alignment_session, quality_report=args.quality_report)
         print(f'Аудит: {Path(args.out).resolve() / "audit.json"}', flush=True)
     elif args.command == 'prepare':
         from scripts.real_eval.night_prepare import prepare
         result = prepare(args.audit, args.out, max_facades=args.max_facades,
                          crops_per_facade=args.crops_per_facade, tile_size=args.tile_size,
                          stride=args.stride, min_support=args.min_support,
-                         min_known_pixels=args.min_known_pixels, buildings=args.buildings)
+                         min_known_pixels=args.min_known_pixels, buildings=args.buildings,
+                         selection_mode=args.selection_mode, gallery_limit=args.gallery_limit)
         print(f'Галерея: {Path(args.out).resolve() / "gallery.html"}', flush=True)
     elif args.command in ('run', 'pilot'):
         from scripts.real_eval.night_run import run
@@ -109,6 +154,10 @@ def main(argv=None):
     elif args.command == 'report':
         from scripts.real_eval.night_report import report
         report(args.run, args.out, budgets=tuple(args.budgets))
+    elif args.command == 'calibrate':
+        from scripts.real_eval.night_calibration import run
+        result = run(args.run, args.out, budgets=tuple(args.budgets), methods=args.methods, resume=args.resume)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         from scripts.real_eval.robustness_common import read_json
         root = Path(args.run).expanduser().resolve()

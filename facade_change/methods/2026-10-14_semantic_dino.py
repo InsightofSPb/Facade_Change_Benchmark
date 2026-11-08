@@ -106,7 +106,8 @@ class SemanticDINOScorer:
 
     def __init__(self, training_run=None, device="cpu", batch_size=4,
                  export_probabilities=False, current_manifest=None, expected_categories=None,
-                 crop_size=None, crop_stride=None):
+                 crop_size=None, crop_stride=None, source_root=None,
+                 backbone_checkpoint=None, head_checkpoint=None, allow_source_change=False):
         if not training_run:
             raise ValueError("semantic_dino requires training_run with completed best.pth provenance")
         from ..segmentation.evaluate import _checked_run
@@ -118,7 +119,9 @@ class SemanticDINOScorer:
         if type(export_probabilities) is not bool:
             raise ValueError("export_probabilities must be boolean")
         self.export_probabilities = export_probabilities
-        root, record, config, saved = _checked_run(training_run)
+        root, record, config, saved = _checked_run(
+            training_run, source_root=source_root, backbone_checkpoint=backbone_checkpoint,
+            head_checkpoint=head_checkpoint, allow_source_change=allow_source_change)
         if current_manifest:
             current_categories = read_json(current_manifest).get("categories")
             if expected_categories is None and current_categories is not None:
@@ -143,11 +146,18 @@ class SemanticDINOScorer:
         if not geometry:
             origin["warnings"].append("Training crop geometry unavailable; recorded adapter crop geometry is used")
         gpu = gpu_preflight(self.device)
-        model, provenance = load_model(config["source_root"], config["checkpoint"], len(categories),
+        source = source_root if source_root is not None else config["source_root"]
+        backbone = backbone_checkpoint if backbone_checkpoint is not None else config["checkpoint"]
+        model, provenance = load_model(source, backbone, len(categories),
                                        self.device, config.get("trust_checkpoint", False))
-        for name, key in (("sources", "python_tree_sha256"), ("checkpoint", "sha256")):
-            if provenance[name][key] != saved["backbone_provenance"][name][key]:
-                raise ValueError("Loaded semantic backbone/source fingerprint differs from training")
+        old_source = saved["backbone_provenance"]["sources"]["python_tree_sha256"]
+        current_source = provenance["sources"]["python_tree_sha256"]
+        if (provenance["checkpoint"]["sha256"] != saved["backbone_provenance"]["checkpoint"]["sha256"]
+                or (not allow_source_change and current_source != old_source)):
+            raise ValueError("Loaded semantic backbone/source fingerprint differs from training")
+        source_compatibility = dict(training_python_tree_sha256=old_source,
+            current_python_tree_sha256=current_source, matches_training=current_source == old_source,
+            allow_source_change=allow_source_change)
         model.head.load_state_dict(saved["head_state_dict"], strict=True)
         self.model = model.eval().requires_grad_(False)
         self.raw_scores = self.native_prediction = None
@@ -155,7 +165,8 @@ class SemanticDINOScorer:
         self.metadata = {
             "method": "semantic_dino", "implementation_version": "2026-10-14-v1", "output_kind": "score",
             "training_run": str(root), "training_status": record["status"],
-            "head_checkpoint": file_provenance(root / "best.pth"), "checkpoint_epoch": saved["epoch"],
+            "head_checkpoint": file_provenance(head_checkpoint if head_checkpoint is not None else root / "best.pth"),
+            "checkpoint_epoch": saved["epoch"],
             "checkpoint_selection": "previously saved best VAL head; no retraining or reselection",
             "categories": categories, "category_to_channel": mapping, "num_classes": len(categories),
             "probability": "independent sigmoid for every class; no softmax",
@@ -168,6 +179,7 @@ class SemanticDINOScorer:
             "support_policy": "all output arrays NaN outside geometric support; no label masks enter inference",
             "export_probabilities": export_probabilities, "device": self.device,
             "backbone_provenance": provenance, "checkpoint_origin_audit": origin, "gpu_preflight": gpu,
+            "source_compatibility": source_compatibility,
         }
 
     def _probabilities(self, rgb):
@@ -206,7 +218,8 @@ class SemanticDINOScorer:
         from ..segmentation.evaluate import bernoulli_entropy
 
         reference, source, support = validate_rgb_inputs(reference, source, support)
-        before, after = self._probabilities(reference), self._probabilities(source)
+        before = self._probabilities(reference)
+        after = before if np.array_equal(reference, source) else self._probabilities(source)
         delta = after - before
         scores = mask_scores(np.abs(delta).max(axis=0), support)
         arrays = {"semantic_delta": delta,

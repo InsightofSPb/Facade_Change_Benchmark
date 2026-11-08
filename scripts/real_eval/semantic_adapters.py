@@ -291,6 +291,37 @@ def sam3_image_state(state):
     return state  # A direct image-model state is checked strictly by load_state_dict.
 
 
+def load_sam3_image_state(model, state):
+    """Load every image-model weight, omitting only an absent interactive neck.
+
+    Official merged checkpoints include sam2_convs even when the image builder
+    uses enable_inst_interactivity=False (Sam3DualViTDetNeck.sam2_convs=None).
+    Keep strict=True for all active parameters and all other unexpected keys.
+    """
+    image_state = sam3_image_state(state)
+    expected = model.state_dict()
+    prefix = "backbone.vision_backbone.sam2_convs."
+    omitted = []
+    if (getattr(model, "inst_interactive_predictor", None) is None
+            and not any(key.startswith(prefix) for key in expected)):
+        for key, value in image_state.items():
+            if not key.startswith(prefix):
+                continue
+            # Upstream creates the auxiliary neck by deepcopy(convs). Require
+            # its exact active counterpart and shape, not arbitrary prefix data.
+            counterpart = "backbone.vision_backbone.convs." + key[len(prefix):]
+            shape = getattr(value, "shape", None)
+            if (counterpart in expected and shape is not None
+                    and tuple(shape) == tuple(expected[counterpart].shape)):
+                omitted.append(key)
+        omitted.sort()
+    omitted_set = set(omitted)
+    retained = {key: value for key, value in image_state.items() if key not in omitted_set}
+    model.load_state_dict(retained, strict=True)
+    return {"policy": "strict image state; omit sam2_convs only when absent from the model",
+            "loaded_keys": len(retained), "omitted_inactive_keys": omitted}
+
+
 class _SAM3Segmenter(_BaseSegmenter):
     def __init__(self, config, vocabulary):
         import torch
@@ -304,7 +335,7 @@ class _SAM3Segmenter(_BaseSegmenter):
         if self.device.startswith("cuda"):
             torch.cuda.set_device(torch.device(self.device))
         # Upstream's loader uses strict=False and only prints missing keys.
-        # Build locally, then require complete image-model state ourselves.
+        # Build locally, then require complete active image-model state ourselves.
         self.model = build_sam3_image_model(
             checkpoint_path=None, load_from_HF=False,
             bpe_path=config.get("bpe_path"), device="cpu",
@@ -312,9 +343,8 @@ class _SAM3Segmenter(_BaseSegmenter):
             compile=False,
         )
         saved = _load_tensors(torch, config["checkpoint"], config.get("trust_checkpoint", False))
-        state = sam3_image_state(saved.get("model", saved))
-        self.model.load_state_dict(state, strict=True)
-        del state, saved
+        loading = load_sam3_image_state(self.model, saved.get("model", saved))
+        del saved
         # Some upstream versions move only for device == "cuda", not cuda:0.
         self.model.to(self.device).eval().requires_grad_(False)
         self.processor = Sam3Processor(self.model, device=self.device,
@@ -327,7 +357,7 @@ class _SAM3Segmenter(_BaseSegmenter):
                          "confidence_threshold": float(config.get("confidence_threshold", .25)),
                          "precision": config.get("precision", "bfloat16"),
                          "prompt_texts": [prompt for row in self.vocabulary for prompt in row["prompts"]],
-                         "checkpoint_loading": "strict=True; detector subtree for image model", "downloads": False}
+                         "checkpoint_loading": loading, "downloads": False}
 
     def _predict(self, rgb):
         import torch

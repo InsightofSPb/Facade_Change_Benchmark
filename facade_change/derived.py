@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import html
+from itertools import product
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from .geometry import Canvas, absolute_residual, warp_pair
 from .io import finish_record, load_rgb, new_directory, read_json, run_record, sha256, write_json
@@ -42,7 +44,7 @@ def _starts(length, size, stride):
 
 
 def build_crops(pair_run, out, tile_size=256, stride=128, min_valid_fraction=.8,
-                split="dev", group_id=None):
+                split="dev", group_id=None, selection=None):
     """Warp original RGB directly into each fixed crop; decode each original once.
 
     Saved pair RGB PNGs are deliberately never read. Crop translation is composed
@@ -57,7 +59,10 @@ def build_crops(pair_run, out, tile_size=256, stride=128, min_valid_fraction=.8,
     pair_record = read_json(pair_run / "run.json")
     if not pair_record.get("status", "").startswith("completed"):
         raise ValueError("Crop input must be a completed pair run")
-    if pair_record["status"] == "completed_rejected" or ("quality_gate" in pair_record and not pair_record["quality_gate"]["passed"]):
+    if selection is not None and selection["alignment_run_sha256"] != pair_record_hash:
+        raise ValueError("Selection refers to another pair run")
+    reviewed = selection is not None and selection.get("review") == "accept"
+    if not reviewed and (pair_record["status"] == "completed_rejected" or ("quality_gate" in pair_record and not pair_record["quality_gate"]["passed"])):
         raise ValueError("Rejected alignment cannot produce dataset crops")
     geometry_path = pair_run / "geometry.json"
     geometry_hash = sha256(geometry_path)
@@ -65,8 +70,27 @@ def build_crops(pair_run, out, tile_size=256, stride=128, min_valid_fraction=.8,
         raise ValueError("Pair geometry changed or its provenance hash is absent")
     geometry = read_json(geometry_path)
     observations = pair_record["observations"]
+    if selection is not None:
+        from .alignment_session import IDENTITY
+        current = selection["observations"]
+        if any(observations[role].get(k) != current[role].get(k)
+               for role in ("reference", "source") for k in IDENTITY):
+            raise ValueError("Selection changes pair content or metadata")
+        observations = current
     identity = _identity(observations, split, group_id)
-    matrices = [np.asarray(geometry[key], dtype=float) for key in ("reference_to_canvas", "source_to_reference")]
+    dense = geometry.get("type") == "dense_reference_grid"
+    dense_frame = None
+    if dense:
+        from .saved_geometry import FrameSampler, frame_geometry
+        dense_frame = frame_geometry({"path": pair_run, "record": {**pair_record, "observations": observations},
+                                      "selection": selection}, {})
+        source_sampler = FrameSampler(dense_frame)
+        reference_sampler = FrameSampler({"source_to_reference": np.eye(3).tolist()})
+        canvas_height, canvas_width = geometry["reference_native_shape"]
+        matrices = [np.eye(3), np.eye(3)]  # Only the reference translation is used below for dense crops.
+    else:
+        canvas_width, canvas_height = int(geometry["width"]), int(geometry["height"])
+        matrices = [np.asarray(geometry[key], dtype=float) for key in ("reference_to_canvas", "source_to_reference")]
     if any(matrix.shape != (3, 3) or not np.isfinite(matrix).all() or np.linalg.matrix_rank(matrix) != 3 for matrix in matrices):
         raise ValueError("Pair geometry requires finite nonsingular 3x3 transforms")
     # The saved canvas translation cannot change reference pixel scale.
@@ -79,6 +103,8 @@ def build_crops(pair_run, out, tile_size=256, stride=128, min_valid_fraction=.8,
               "geometry_sha256": geometry_hash, "tile_size": tile_size, "stride": stride,
               "min_valid_fraction": min_valid_fraction, "alignment_status": pair_record["status"],
               "alignment_quality_gate": pair_record.get("quality_gate", "legacy_run_without_gate"), **identity}
+    if selection is not None:
+        config["alignment_selection"] = selection
     record = run_record("native_rgb_crops", config)
     write_json(out / "run.json", record)
     try:
@@ -93,48 +119,64 @@ def build_crops(pair_run, out, tile_size=256, stride=128, min_valid_fraction=.8,
             arrays.extend([rgb, support])
         crops, rejected = [], 0
         gallery = []
-        for y in _starts(int(geometry["height"]), tile_size, stride):
-            for x in _starts(int(geometry["width"]), tile_size, stride):
-                offset = np.array([[1., 0, -x], [0, 1, -y], [0, 0, 1]])
-                canvas = Canvas(tile_size, tile_size, offset @ matrices[0], matrices[1])
+        ys = _starts(canvas_height, tile_size, stride)
+        xs = _starts(canvas_width, tile_size, stride)
+        for y, x in tqdm(product(ys, xs), total=len(ys) * len(xs), desc="Crop windows",
+                         unit="window", dynamic_ncols=True, leave=False):
+            offset = np.array([[1., 0, -x], [0, 1, -y], [0, 0, 1]])
+            canvas = Canvas(tile_size, tile_size, offset @ matrices[0], matrices[1])
+            if dense:
+                window = (x, y, tile_size, tile_size)
+                warped = {"reference": reference_sampler.warp(arrays[0], window),
+                          "source": source_sampler.warp(arrays[2], window),
+                          "reference_support": reference_sampler.support(arrays[1], window),
+                          "source_support": source_sampler.support(arrays[3], window)}
+                warped["overlap"] = warped["reference_support"] & warped["source_support"]
+            else:
                 warped = warp_pair(*arrays, canvas)
-                fraction = float(warped["overlap"].mean())
-                if fraction < min_valid_fraction:
-                    rejected += 1
-                    continue
-                name = f"crop-x{x:05d}-y{y:05d}"
-                crop_dir = new_directory(out / name)
-                for role in ("reference", "source"):
-                    _save(crop_dir / f"{role}_rgb.png", warped[role])
-                    _save(crop_dir / f"{role}_support.png", warped[role + "_support"].astype(np.uint8) * 255)
-                _save(crop_dir / "geometric_overlap.png", warped["overlap"].astype(np.uint8) * 255)
-                _save(crop_dir / "not_comparable.png", (~warped["overlap"]).astype(np.uint8) * 255)
-                residual = absolute_residual(warped["source"], warped["reference"])
-                residual[~warped["overlap"]] = 0
-                _save(crop_dir / "absolute_residual_rgb.png", residual)
-                files = {path.name: sha256(path) for path in sorted(crop_dir.glob("*.png"))}
-                crop = {"crop_id": name, "path": name, "bbox_canvas_xyxy": [x, y, x + tile_size, y + tile_size],
-                        "tile_shape": [tile_size, tile_size], "valid_fraction": fraction,
-                        "reference_to_crop": canvas.reference_to_canvas.tolist(),
-                        "source_to_crop": (canvas.reference_to_canvas @ canvas.source_to_reference).tolist(),
-                        "reference_id": observations["reference"]["image_id"], "source_id": observations["source"]["image_id"],
-                        "source_image_sha256": {key: observations[key]["sha256"] for key in observations},
-                        "alignment_status": pair_record["status"],
-                        "sampling": "one direct interpolation from each original RGB per crop; no resize",
-                        "artifact_sha256": files, **identity}
-                write_json(crop_dir / "crop.json", crop)
-                crops.append(crop)
-                gallery.append(f'<tr><td>{html.escape(name)}<br>{fraction:.1%} overlap</td>'
-                               f'<td><img src="{name}/reference_rgb.png"></td>'
-                               f'<td><img src="{name}/source_rgb.png"></td>'
-                               f'<td><img src="{name}/absolute_residual_rgb.png"></td></tr>')
+            fraction = float(warped["overlap"].mean())
+            if fraction < min_valid_fraction:
+                rejected += 1
+                continue
+            name = f"crop-x{x:05d}-y{y:05d}"
+            crop_dir = new_directory(out / name)
+            for role in ("reference", "source"):
+                _save(crop_dir / f"{role}_rgb.png", warped[role])
+                _save(crop_dir / f"{role}_support.png", warped[role + "_support"].astype(np.uint8) * 255)
+            _save(crop_dir / "geometric_overlap.png", warped["overlap"].astype(np.uint8) * 255)
+            _save(crop_dir / "not_comparable.png", (~warped["overlap"]).astype(np.uint8) * 255)
+            residual = absolute_residual(warped["source"], warped["reference"])
+            residual[~warped["overlap"]] = 0
+            _save(crop_dir / "absolute_residual_rgb.png", residual)
+            files = {path.name: sha256(path) for path in sorted(crop_dir.glob("*.png"))}
+            crop = {"crop_id": name, "path": name, "bbox_canvas_xyxy": [x, y, x + tile_size, y + tile_size],
+                    "tile_shape": [tile_size, tile_size], "valid_fraction": fraction,
+                    "reference_to_crop": canvas.reference_to_canvas.tolist(),
+                    "source_to_crop": None if dense else (canvas.reference_to_canvas @ canvas.source_to_reference).tolist(),
+                    "reference_id": observations["reference"]["image_id"], "source_id": observations["source"]["image_id"],
+                    "source_image_sha256": {key: observations[key]["sha256"] for key in observations},
+                    "alignment_status": pair_record["status"],
+                    "sampling": "one direct interpolation from each original RGB per crop; no resize",
+                    "artifact_sha256": files, **identity}
+            if dense:
+                crop["dense_geometry"] = dense_frame["dense_geometry"]
+            if selection is not None:
+                crop["alignment_selection"] = {key: value for key, value in selection.items() if key != "observations"}
+            write_json(crop_dir / "crop.json", crop)
+            crops.append(crop)
+            gallery.append(f'<tr><td>{html.escape(name)}<br>{fraction:.1%} overlap</td>'
+                           f'<td><img src="{name}/reference_rgb.png"></td>'
+                           f'<td><img src="{name}/source_rgb.png"></td>'
+                           f'<td><img src="{name}/absolute_residual_rgb.png"></td></tr>')
         if sha256(pair_run / "run.json") != pair_record_hash or sha256(geometry_path) != geometry_hash:
             raise ValueError("Pair provenance or geometry changed while generating crops")
+        if dense and sha256(dense_frame["dense_geometry"]["path"]) != dense_frame["dense_geometry"]["sha256"]:
+            raise ValueError("Dense field changed while generating crops")
         result = {"schema_version": 1, "config": config, "crops": crops,
                   "summary": {"crop_count": len(crops), "rejected_low_overlap": rejected, **identity}}
         write_json(out / "crops.json", result)
         _gallery(out, "Native RGB crops", "Reference / later image / RGB difference. Physical occlusion unknown.", gallery)
-        finish_record(out, record, "completed" if crops else "completed_empty")
+        finish_record(out, record, "completed" if crops else "completed_empty", progress_desc="Hash pair crops")
         return result["summary"]
     except Exception as exc:
         finish_record(out, record, "failed", f"{type(exc).__name__}: {exc}")

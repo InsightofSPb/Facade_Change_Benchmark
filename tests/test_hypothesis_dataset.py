@@ -219,6 +219,7 @@ class HypothesisDatasetTests(unittest.TestCase):
 
     def _finish_parent(self):
         write_json(self.parent / self.index_name, {"split": self.split, "crops": self.rows,
+                                                 "categories": [{"id": 1, "name": "CRACK"}, {"id": 2, "name": "REPAIRS"}],
                                                  "excluded_pairs": [{"pair_id": f"failed-{n}", "reason": "no_passed_requested_method"}
                                                                     for n in range(31)]})
         write_json(self.parent / "summary.json", self.parent_summary)
@@ -387,6 +388,228 @@ class HypothesisDatasetTests(unittest.TestCase):
             self.assertEqual(summary["parent_excluded_pair_count"], 1)
         finally:
             fixture.tearDown()
+
+    def _annotation_statistics(self, different_reference_support=False):
+        """A hash-bound console-statistics snapshot with partial, multilabel targets."""
+        from facade_change import annotation_targets
+        from facade_change.crop_selection import DEFAULTS, VERSION
+        # Same reference with a genuinely different late image: retain the real pair,
+        # but do not generate the identical synthetic reference family twice.
+        duplicate = next(r for r in self.rows if r["source_id"]-r["reference_id"] == 100)
+        directory = self.parent / duplicate["path"]
+        with Image.open(directory / "source_rgb.png") as image:
+            rgb = np.asarray(image).copy()
+        Image.fromarray((rgb.astype(int)+17).astype(np.uint8)).save(directory / "source_rgb.png")
+        duplicate["artifact_sha256"]["source_rgb.png"] = sha256(directory / "source_rgb.png")
+        metadata = read_json(directory / "crop.json")
+        if different_reference_support:
+            with Image.open(directory / "reference_support.png") as image:
+                support = np.asarray(image).copy()
+            support[-1, -1] = 0
+            with Image.open(directory / "geometric_overlap.png") as image:
+                overlap = np.asarray(image).copy()
+            overlap[-1, -1] = 0
+            for name, array in (("reference_support", support), ("geometric_overlap", overlap), ("not_comparable", 255-overlap)):
+                Image.fromarray(array).save(directory / (name+".png"))
+                duplicate["artifact_sha256"][name+".png"] = sha256(directory / (name+".png"))
+            duplicate["valid_fraction"] = float((overlap > 0).mean())
+            metadata["valid_fraction"] = duplicate["valid_fraction"]
+        metadata["artifact_sha256"] = duplicate["artifact_sha256"]
+        write_json(directory / "crop.json", metadata)
+        self._finish_parent()
+        config = read_json(self.config)
+        config.update(include_real_pairs=True)
+        config["selection"] = dict(DEFAULTS, strategy=VERSION, max_pairs=50, max_same_pair_iou=1.)
+        write_json(self.config, config)
+        statistics = self.root / "statistics"
+        statistics.mkdir()
+        crop_rows, class_rows = [], []
+        for row in self.rows:
+            if row["split"] == "test":
+                continue
+            meta = {k: row[k] for k in ("dataset_crop_id", "pair_id", "building_id", "view_id", "split",
+                                        "reference_year", "source_year")}
+            meta["alignment_method"] = "sift"
+            row["alignment_method"] = "sift"
+            stable = row["crop_id"] == "crop-b"
+            known_fraction = 512/round(row["valid_fraction"]*1024)
+            crop_rows.append(dict(meta, status="unknown" if stable else "changed",
+                reason="target_annotations_without_comparable_support" if stable else "target_difference_on_annotated_support",
+                known_fraction=known_fraction, known_pixels=512, changed_pixels=0 if stable else 64,
+                uncomparable_target_pixels=32))
+            for cid, category in ((1, "CRACK"), (2, "REPAIRS")):
+                changed = 0 if stable else 64
+                # REPAIRS absent on the entire known ROI is not a stable-present case.
+                absent = cid == 2 and row["view_id"] != "view_b"
+                class_rows.append(dict(meta, category_id=cid, category=category,
+                    status="unknown" if stable or absent else "changed", known_pixels=512,
+                    known_fraction=known_fraction, changed_pixels=0 if absent else changed,
+                    change_fraction=0 if absent else changed/512,
+                    before_fraction=0 if absent else .25,
+                    after_fraction=0 if absent else .25+(0 if stable else 32/512),
+                    area_delta=0 if absent or stable else 32/512, uncomparable_target_pixels=32))
+        self._finish_parent()
+        for name, rows in (("crops.csv", crop_rows), ("class_changes.csv", class_rows)):
+            with (statistics / name).open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        write_json(statistics / "summary.json", dict(all_crop_pairs=len(self.rows), processed_crop_pairs=len(crop_rows),
+            classes=[dict(category_id=1, category="CRACK"), dict(category_id=2, category="REPAIRS")]))
+        write_json(statistics / "experiment_contract.json", dict(inputs={str(self.parent / name): sha256(self.parent / name)
+            for name in ("run.json", "summary.json", self.index_name, "split.json")},
+            annotation_core_sha256=sha256(annotation_targets.__file__)))
+        record = run_record("crop_statistics", dict(crops=str(self.parent)))
+        finish_record(statistics, record, "completed")
+        return statistics, config, crop_rows, class_rows
+
+    def test_annotation_plan_is_rgb_free_frozen_and_matches_all_generated_file_counts(self):
+        statistics, config, _, _ = self._annotation_statistics()
+        before = {p: p.read_bytes() for p in self.parent.rglob("*") if p.is_file()}
+        with patch("facade_change.hypothesis_dataset.load_rgb", side_effect=AssertionError("Plan decoded RGB")), \
+                patch("PIL.Image.open", side_effect=AssertionError("Plan opened an image")):
+            report = prepare_hypothesis_dataset(self.parent, self.config, self.root / "plan",
+                                                statistics_run=statistics, plan_only=True)
+        self.assertFalse(list((self.root / "plan").rglob("*.png")))
+        self.assertEqual(report["selected_building_count"], 2)
+        self.assertGreater(report["selected_pair_count"], report["synthetic_base_count"])
+        self.assertEqual(report["selected_view_count"], report["eligible_view_count"])
+        self.assertEqual({row["split"] for row in read_json(self.root / "plan/selection.json")["selected"]}, {"train", "val"})
+        with patch("facade_change.crop_selection.select_pairs", side_effect=AssertionError("Frozen plan was reranked")):
+            result = prepare_hypothesis_dataset(self.parent, self.config, self.root / "combined",
+                                                selection_plan=self.root / "plan")
+        out, budget = self.root / "combined", report["generation_budget"]
+        pngs = list(out.rglob("*.png"))
+        rgb_count = 0
+        for path in pngs:
+            with Image.open(path) as image:
+                rgb_count += image.mode == "RGB"
+        self.assertEqual(rgb_count, budget["rgb_png"])
+        self.assertEqual(len(pngs)-rgb_count, budget["auxiliary_png"])
+        self.assertEqual(len(list(out.rglob("*.npy"))), budget["intensity_npy"])
+        self.assertEqual(result["case_count"], budget["synthetic_comparisons"])
+        real = read_json(out / "real_pairs/index.json")
+        self.assertEqual(len(real["cases"]), budget["real_comparisons"])
+        self.assertTrue(any(c["original_pair_status"] == "unknown" for c in real["cases"]))
+        by_id = {r["dataset_crop_id"]: r for r in self.rows}
+        for case in real["cases"]:
+            row = by_id[case["parent_dataset_crop_id"]]
+            self.assertFalse(case["natural_change_labels_created"])
+            self.assertNotIn("hypothesis", case)
+            self.assertNotIn("labels_reference", case)
+            if case["scenario_id"] == "identity":
+                np.testing.assert_array_equal(self._mask(out, case["source_rgb"]), self._mask(self.parent, row["source_rgb"]))
+                self.assertFalse(np.array_equal(self._mask(out, case["source_rgb"]), self._mask(out, case["reference_rgb"])))
+            if case["scenario_id"] == "occluded":
+                self.assertFalse(self._mask(out, case["geometric_visible_support"]).any())
+        for path, expected in read_json(out / "run.json")["artifact_sha256"].items():
+            self.assertEqual(sha256(out / path), expected)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.parent.rglob("*") if p.is_file()})
+
+    def test_annotation_selection_is_order_independent_and_does_not_label_absent_classes_stable(self):
+        from facade_change.crop_selection import select_pairs
+        _, config, crop_rows, class_rows = self._annotation_statistics()
+        categories = read_json(self.parent / self.index_name)["categories"]
+        first = select_pairs(self.rows, self.split, categories, crop_rows, class_rows, config["selection"])
+        second = select_pairs(list(reversed(self.rows)), self.split, categories, list(reversed(crop_rows)),
+                              list(reversed(class_rows)), config["selection"])
+        self.assertEqual(first, second)
+        self.assertTrue(any(item["role"] == "stable_present_on_common_support" for detail in first["selected_details"].values() for item in detail["evidence"]))
+        self.assertFalse(any(item["category_id"] == 2 and item["role"] == "stable_present_on_common_support"
+                            for detail in first["selected_details"].values() for item in detail["evidence"]))
+        with self.assertRaisesRegex(ValueError, "retain every"):
+            select_pairs(self.rows, self.split, categories, crop_rows, class_rows, dict(config["selection"], max_pairs=1))
+
+    def test_annotation_statistics_tampering_and_different_crop_snapshot_fail_before_rgb(self):
+        statistics, _, _, _ = self._annotation_statistics()
+        original = (statistics / "class_changes.csv").read_bytes()
+        (statistics / "class_changes.csv").write_bytes(original+b"\n")
+        with self.assertRaisesRegex(ValueError, "artifact changed"):
+            prepare_hypothesis_dataset(self.parent, self.config, self.root / "bad", statistics_run=statistics, plan_only=True)
+        self.assertFalse((self.root / "bad").exists())
+        (statistics / "class_changes.csv").write_bytes(original)
+        self.rows.reverse()
+        self._finish_parent()
+        with self.assertRaisesRegex(ValueError, "another crop snapshot"):
+            prepare_hypothesis_dataset(self.parent, self.config, self.root / "bad-index", statistics_run=statistics, plan_only=True)
+
+    def test_annotation_frozen_plan_rejects_changed_config_and_output_inside_inputs(self):
+        statistics, config, _, _ = self._annotation_statistics()
+        with self.assertRaisesRegex(ValueError, "Output must be separate"):
+            prepare_hypothesis_dataset(self.parent, self.config, self.parent / "bad", statistics_run=statistics, plan_only=True)
+        prepare_hypothesis_dataset(self.parent, self.config, self.root / "plan", statistics_run=statistics, plan_only=True)
+        config["selection"]["max_pairs"] += 1
+        write_json(self.config, config)
+        with self.assertRaisesRegex(ValueError, "differs"):
+            prepare_hypothesis_dataset(self.parent, self.config, self.root / "bad-config", selection_plan=self.root / "plan")
+
+    def test_annotation_round_robin_retains_thin_rare_class_and_enforces_spatial_and_building_caps(self):
+        from copy import deepcopy
+        from facade_change.crop_selection import select_pairs, _iou
+        _, config, crop_rows, class_rows = self._annotation_statistics()
+        prototype = self.rows[0]
+        meta = crop_rows[0]
+        class_meta = class_rows[0]
+        rows, crop_stats, class_stats = [], [], []
+        for pair in range(2):
+            for number, x in enumerate((0, 16, 64, 80, 128)):
+                row = deepcopy(prototype)
+                identifier = f"p{pair}/crop-{number}"
+                row.update(pair_id=f"p{pair}", dataset_crop_id=identifier, bbox_canvas_xyxy=[x, 0, x+32, 32],
+                           source_image_sha256=dict(reference="original-A", source=f"original-B{pair}"),
+                           artifact_sha256={k: identifier+"/"+k for k in row["artifact_sha256"]})
+                rows.append(row)
+                identity = dict(dataset_crop_id=identifier, pair_id=row["pair_id"])
+                crop_stats.append(dict(meta, **identity))
+                class_stats.append(dict(class_meta, **identity))
+                if pair == 1 and number == 4:
+                    n = round(row["valid_fraction"]*1024)
+                    class_stats.append(dict(class_meta, **identity, category_id=2, category="REPAIRS",
+                        known_pixels=n, known_fraction=1., changed_pixels=8, change_fraction=8/n,
+                        before_fraction=128/n, after_fraction=136/n, area_delta=8/n))
+        cfg = dict(config["selection"], max_pairs=5, max_pairs_per_building=3,
+                   max_crops_per_photo_pair=2, max_same_pair_iou=.25)
+        result = select_pairs(rows, self.split, [{"id": 1, "name": "CRACK"}, {"id": 2, "name": "REPAIRS"}],
+                              crop_stats, class_stats, cfg)
+        self.assertEqual(len(result["selected"]), 3)
+        self.assertTrue(any(item["category_id"] == 2 and item["magnitude_band"] == 0
+                            for details in result["selected_details"].values() for item in details["evidence"]))
+        for row in result["selected"]:
+            same = [r for r in result["selected"] if r["pair_id"] == row["pair_id"]]
+            self.assertLessEqual(len(same), 2)
+            for other in same:
+                if row != other:
+                    self.assertLessEqual(_iou(row["bbox_canvas_xyxy"], other["bbox_canvas_xyxy"]), .25)
+        self.assertIn("building_budget", result["report"]["excluded_reasons"])
+
+    def test_annotation_identical_rgb_with_different_support_exports_distinct_synthetic_families(self):
+        statistics, _, _, _ = self._annotation_statistics(different_reference_support=True)
+        out = self.root / "different-support"
+        result = prepare_hypothesis_dataset(self.parent, self.config, out, statistics_run=statistics)
+        index = read_json(out / "index.json")
+        self.assertEqual(len({b["base_id"] for b in index["bases"]}), result["selected_crop_count"])
+        references = {}
+        for case in index["cases"]:
+            if case["state"] == "unchanged" and case["scenario_id"] == "identity":
+                references.setdefault(case["artifact_sha256"]["reference_rgb"], set()).add(case["artifact_sha256"]["reference_support"])
+        self.assertTrue(any(len(supports) == 2 for supports in references.values()))
+
+    def test_supplied_annotation_config_runs_all_eighteen_scenarios_for_both_branches(self):
+        statistics, _, _, _ = self._annotation_statistics()
+        supplied = Path(__file__).resolve().parents[1] / "configs/2026-10-25_crop_controls.json"
+        write_json(self.config, read_json(supplied))
+        plan = prepare_hypothesis_dataset(self.parent, self.config, self.root / "full-matrix-plan",
+                                         statistics_run=statistics, plan_only=True)
+        out = self.root / "full-matrix"
+        with patch("facade_change.segmentation.data.rasterize_annotations", side_effect=AssertionError("No new masks")):
+            report = prepare_hypothesis_dataset(self.parent, self.config, out,
+                                                selection_plan=self.root / "full-matrix-plan")
+        self.assertEqual(report["case_count"], 72*plan["synthetic_base_count"])
+        real = read_json(out / "real_pairs/index.json")
+        self.assertEqual(len(real["cases"]), 18*plan["selected_pair_count"])
+        self.assertEqual(len({c["scenario_id"] for c in real["cases"]}), 18)
+        self.assertEqual(len(list(out.rglob("*.png"))), plan["generation_budget"]["rgb_png"]+plan["generation_budget"]["auxiliary_png"])
+        self.assertEqual(len(list(out.rglob("*.npy"))), plan["generation_budget"]["intensity_npy"])
 
 
 if __name__ == "__main__":

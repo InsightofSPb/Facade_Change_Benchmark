@@ -4,34 +4,91 @@
 состояние → выравнивание RGB → временные и компрессионные оценки → анализ ошибок.
 Реальные данные, веса и результаты остаются локально.
 
-## Рабочие команды
+Фьюзинг на всех TRAIN-пикселях из кэша и эксперимент с памятью вариативности:
+[протокол и команды от 2026-11-08](docs/2026-11-08-variability-memory.md).
+После остановки обучения `python -m data_analysis memory-evaluate` оценивает
+завершённый seed из сохранённых признаков и моделей без повторного обучения.
+`python -m data_analysis memory-followups` добавляет подмену истории у одного
+checkpoint, сравнение линейного фьюзинга с MLP и память межкадровых переходов
+на том же кэше: [протокол и команда](docs/2026-11-08-memory-followups.md).
 
-Используйте существующую среду `scd_bench`; рабочие Torch/CUDA и веса повторно
+## Основной workflow
+
+**Подготовка данных → обучение при необходимости → бенчмаркинг → галерея.**
+
+Единый вход: `python -m facade_change workflow STAGE TASK ...`.
+Используйте существующую среду; рабочие Torch/CUDA и веса повторно
 не устанавливайте без конкретной причины.
 
-| Задача | Команда | Подробности |
+| Стадия | Команда | Что входит |
 |---|---|---|
-| Новый COCO / уточнение метаданных | `python scripts/prepare_dataset.py COCO IMAGES` | [Данные и split](docs/2026-10-11_two_path_dataset_preparation.md) |
-| Оригинальные кропы + две аугментации | `python -m facade_change.segmentation --prepare-only` | [Сегментация](docs/2026-10-11_dino_semantic_training.md) |
-| Обучение головы DINOv2 | `python -m facade_change.segmentation --augmentations ...` | [Обучение и метрики](docs/2026-10-11_dino_semantic_training.md) |
-| Устойчивость готовой головы | `python -m facade_change.segmentation --evaluate-run ...` | [VAL и вероятности](docs/2026-10-11_dino_semantic_training.md) |
-| Фиксированный checkpoint на TRAIN/VAL/TEST и целые фотографии | `python -m facade_change.segmentation --evaluate-run ... --evaluation-mode originals --splits train val test` | [Оценка и общая галерея](docs/2026-10-11_dino_semantic_training.md) |
-| Пятикадровые синтетические истории | `python -m facade_change prepare-history` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
-| Реальные совмещённые кропы переходов классов + контекст 100 px | `python -m facade_change mine-transitions --context-padding 100` | [Истории и реальные кандидаты](docs/2026-10-11_paid_hypotheses_reference_context.md) |
-| Одна страница синтетических и реальных историй | `python -m facade_change review-transitions --synthetic-run ... --candidate-runs ...` | [Просмотр историй](docs/2026-10-11_paid_hypotheses_reference_context.md) |
-| Выравнивание временных пар | `python -m facade_change batch` | [Геометрия и кропы](docs/2026-10-04_geoscd_and_crop_preparation.md) |
-| Сравнение методов на фиксированных H0/H1 | `python -m facade_change h0h1-benchmark` | [Общий runner](docs/2026-10-04_common_runner.md) |
-| Возобновляемый TRAIN/VAL: обучение MSDZip, семантическая DINO, пары и память | `python -m facade_change temporal-experiment` | [Запуск и восстановление](docs/2026-10-14_temporal_experiment.md) |
-| CPU-галерея реальных пар, фильтры GT → ручной выбор → устойчивость восьми методов к освещению | `python scripts/real_eval/real_robustness.py prepare/review/run/report` | [Просмотр, запуск и метрики](docs/2026-10-17_real_robustness.md) |
-| Аудит TRAIN/VAL/TEST → изменяющиеся фасады → пилот скорости → PREVIOUS/EARLIEST/HISTORY | `python scripts/real_eval/real_temporal_night.py audit/prepare/pilot/run/report` | [Ночная очередь и дальнейший план](docs/2026-10-17_real_temporal_night.md) |
-| SAM3, MaskCLIP/LPOSS и DINO: smoke всех маршрутов → VAL/TEST/TRAIN, общий кэш | `python -m scripts.real_eval.semantic_routes run --smoke-first --resume ...` | [OVS, маршруты и оценка времени](docs/2026-10-18-semantic-routes.md) |
-| Реальные GT-метрики, LOFO, классы, сочетания и повторный GeoSCD | `scripts/real_eval/` | [Перенесённые инструменты](docs/2026-10-17_real_eval_tools.md) |
-| Анализ готовых карт и потерь Recall | `python -m data_analysis` | [Анализ результатов](data_analysis/README.md) |
-| Оплаченные H0/H1 и контекст опоры | `python -m facade_change.research` | [Прототипы](docs/2026-10-11_paid_hypotheses_reference_context.md) |
-| План очистки локальных результатов | `python scripts/audit_environment.py --cleanup-plan` | Раздел ниже |
+| Подготовка | `python -m facade_change workflow prepare --help` | Реальные/синтетические данные, split, RGB alignment, кропы, аугментации, истории |
+| Обучение | `python -m facade_change workflow train --help` | Семантическая голова, MSDZip, ArIB, BCM; готовые модели переиспользуются |
+| Бенчмаркинг | `python -m facade_change workflow benchmark --help` | Синтетика, реальные пары, PREVIOUS/EARLIEST/HISTORY, robustness, сохранённые метрики, LOFO и fusion |
+| Галерея | `python -m facade_change workflow gallery --help` | Истории, сравнения, ошибки, листы для слайдов, сохранённый LOFO и локальный atlas |
 
-Флаги: `python -m facade_change --help` и
-`python -m facade_change.segmentation --help`.
+[Основная инструкция, входы/выходы и план переноса кода](docs/2026-10-24-main-workflow.md).
+Каждая стадия запускается отдельно; `STAGE TASK --help` показывает её параметры.
+Сохранённые данные, модели и карты позволяют продолжать с нужной стадии.
+Прежние команды остаются совместимыми. Составной `temporal-experiment`
+сохраняет [прежний контракт обучения и resume](docs/2026-10-14_temporal_experiment.md).
+
+Локальный `data/dataset_statistics.py` со статистикой и инкрементальным
+выравниванием развивается отдельно. Этот PR его не добавляет и не заменяет;
+его завершённая сессия подключается к `prepare crops --alignment-session` и
+`prepare real-audit --alignment-session` без повторного выравнивания. Выбор метода,
+review, split и ссылки на Canny/cycle/drift сохраняются; синтетика работает как раньше.
+После отдельного quality rerun можно явно передать `--quality-report`: импорт
+проверяет сохранённые хеши и сохраняет исходный статус preparation без его правки.
+
+Для эмбеддингов историй: `workflow prepare crop-histories` собирает RGB-кропы
+в координатах самой ранней фотографии каждого вида, а `workflow prepare history-features`
+извлекает frozen DINOv2-признаки и сохраняет интервалы по годам. Геометрия берётся
+из существующей сессии; изображения и признаки кэшируются отдельно.
+[Команды, формат данных и продолжение эксперимента](docs/2026-10-25_history_features.md).
+
+Готовые признаки используются без повторного DINO: `workflow benchmark history-scores`
+строит оценки и таблицу для выборочной проверки, `workflow train history-models` обучает pair,
+pooled, GRU и Transformer, `workflow benchmark history-models` оценивает сохранённые
+модели. `workflow prepare temporal-embeddings` экспортирует обученные векторы.
+[Контракт меток событий, команды и проверки](docs/2026-10-25_history_models.md).
+
+Существующие целевые COCO-маски подключаются через `workflow prepare history-targets`.
+`--features` использует истории, `--crops data/crops` — готовые парные кропы.
+Оба режима используют общий перенос аннотаций и дают автоматические метки различий;
+парный режим работает на CPU. Деревья,
+автобусы и прочий контекст остаются в RGB; неразмеченные области остаются неизвестными.
+Для бинарного `history-models` нужен явный `--allow-derived-labels`; метрики сохраняют
+это происхождение. Заполнять все строки `review.csv` для такого запуска не требуется.
+[Маски, частичные перекрытия, команды и ограничения](docs/2026-10-25_history_targets.md).
+
+Для отбора реальных пар по классам и величине различий используйте
+[`prepare synthetic --plan-only`](docs/2026-10-25-crop-selection.md):
+точный список, причины и бюджет сохраняются до генерации. Этот же план
+задаёт настоящие A→T(B) и контролируемые A→T(edit(A)) примеры.
+
+`prepare targets --crops ... --selection-plan ...` переносит маски только для
+зафиксированной выборки. `benchmark crops` оценивает обе готовые ветви с порогами
+по чистому TRAIN и F1/IoU изменений по классам на VAL.
+[Команды, маски 500 пар, метрики и resume](docs/2026-10-25-crop-benchmark.md).
+
+Текущий общий набор для пар и историй — готовые кропы 224 px с шагом 192:
+`prepare real --histories ...`, затем `benchmark pilot` и `benchmark real`.
+Семь готовых методов работают в PREVIOUS/EARLIEST/HISTORY на одинаковых шагах;
+полный VAL выбирает пороги, TRAIN и TEST получают зафиксированные решения.
+RGB не пересоздаётся, обучение не запускается; карты, состояния памяти и метрики сохраняются.
+[Точный набор, команды пилота/полного запуска, метрики и ограничения](docs/2026-11-04-canonical-history-benchmark.md).
+Для завершённого прогона `python -m data_analysis history-fusion` сравнивает
+OR/AND, среднее, обучаемые веса, предсказанную семантику и PREVIOUS+HISTORY.
+Карты семи методов переиспользуются; один дополнительный semantic-проход
+сохраняет вероятности классов. [Запуск и полный отчёт](docs/2026-11-06-history-fusion.md).
+Прежний отдельный парный экспорт через `benchmark crops` сохраняет свой
+[исходный протокол](docs/2026-11-04-full-evaluation.md).
+
+Для пространственных предсказаний: `workflow train spatial-change` обучает pair,
+mean и ConvGRU на patch-токенах и поклассовых целях. `benchmark spatial-change`
+сравнивает их с DINO-разностью и AnyChange, сохраняет карты, F1/IoU и галерею.
+[Команды, оценка по зданиям и интерфейс будущего OVS/гессиана/SET](docs/2026-10-25_spatial_change.md).
 
 ## Данные и научный контракт
 
@@ -102,9 +159,9 @@ zstd/LZMA, MSDZip, JPEG-LS/H.264, ArIB-BPS и BCM-Net. Метрики разны
 
 | Каталог | Назначение |
 |---|---|
-| `facade_change/` | Подготовка, геометрия, benchmark; `methods/` — адаптеры, `segmentation/` — семантика, `research/` — исследовательские прототипы |
+| `facade_change/` | Подготовка, геометрия, benchmark; `methods/` — адаптеры, `segmentation/` — семантика, `research/` — исследовательские прототипы и temporal snapshot, `gallery/` — atlas, экспорт и сохранённые галереи |
 | `data_analysis/` | Анализ уже вычисленных карт без повторного inference |
-| `scripts/` | Установка, настройка и аудит |
+| `scripts/` | Установка, настройка, аудит и совместимые входы; real_eval переносится поэтапно |
 | `configs/`, `docs/`, `tests/` | Контракты, инструкции и проверки действующего кода |
 | `data/`, `weights/`, `models/`, `third_party/`, `runs/` | Локальные данные, зависимости и результаты вне Git |
 

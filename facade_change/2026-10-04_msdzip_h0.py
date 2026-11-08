@@ -799,13 +799,57 @@ def train_msdzip_h0(dataset_run, out, representations=("abs", "mod256"), device=
         raise
 
 
+def _evaluation_split_audit(metadata, evaluation_split):
+    """Audit frozen checkpoint exposure using stable project building IDs only."""
+    if not isinstance(evaluation_split, dict):
+        raise ValueError("MSDZip evaluation requires a reviewed building split")
+    assignments = evaluation_split.get("building_assignments", {})
+    if (evaluation_split.get("mode") != "reviewed" or evaluation_split.get("development_only") is not False
+            or not isinstance(assignments, dict) or not assignments
+            or any(not isinstance(key, str) or not key or value not in {"train", "val", "test"}
+                   for key, value in assignments.items())):
+        raise ValueError("MSDZip evaluation requires a reviewed building split")
+    buildings = metadata["buildings"]
+    if any(not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values)
+           for values in buildings.values()):
+        raise ValueError("MSDZip checkpoint building identities must be explicit strings")
+    overlaps = {
+        role: {part: sorted(set(values) & {key for key, value in assignments.items() if value == part})
+               for part in ("train", "val", "test")}
+        for role, values in buildings.items()
+    }
+    train_holdout_overlap = bool(overlaps["train"]["val"] or overlaps["train"]["test"])
+    selection_test_overlap = bool(overlaps["val"]["test"])
+    warnings = []
+    if train_holdout_overlap:
+        warnings.append("MSDZip checkpoint TRAIN overlaps current VAL/TEST; affected results are exploratory")
+    if selection_test_overlap:
+        warnings.append("MSDZip checkpoint selection VAL overlaps current TEST; affected results are exploratory")
+    return {
+        "evaluation_split_sha256": _digest(evaluation_split),
+        "checkpoint_overlap_by_current_split": overlaps,
+        "checkpoint_buildings_outside_evaluation": {
+            role: sorted(set(values) - set(assignments)) for role, values in buildings.items()},
+        "scope": "stable project building IDs only; image identities and external pretraining are not audited",
+        "overlap_policy": "record_only",
+        "known_checkpoint_train_holdout_overlap": train_holdout_overlap,
+        "known_checkpoint_selection_test_overlap": selection_test_overlap,
+        "known_checkpoint_holdout_overlap": train_holdout_overlap or selection_test_overlap,
+        "exploratory_splits": [part for part in ("val", "test")
+                               if overlaps["train"][part] or (part == "test" and selection_test_overlap)],
+        "warnings": warnings,
+        "checkpoint_holdout_overlap_rejected": False,
+        "unseen_facades_verified": False,
+    }
+
+
 class MSDZipScorer:
     """Load once; frozen original byte probabilities on each independent case."""
 
-    def __init__(self, checkpoint_path, device="cpu", dataset_fingerprint=None, trust_checkpoint=False, representation=None):
+    def __init__(self, checkpoint_path, device="cpu", dataset_fingerprint=None, trust_checkpoint=False,
+                 representation=None, evaluation_split=None):
         torch = _torch()
         self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
-        self.device = _device(device)
         try:
             checkpoint = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
         except TypeError as exc:
@@ -836,6 +880,10 @@ class MSDZipScorer:
             raise ValueError("MSDZip checkpoint lacks its fixed window group count")
         if dataset_fingerprint is not None and dataset_fingerprint != fingerprint:
             raise ValueError("MSDZip checkpoint dataset/split fingerprint differs from benchmark")
+        evaluation_audit = None
+        if evaluation_split is not None:
+            evaluation_audit = _evaluation_split_audit(metadata, evaluation_split)
+        self.device = _device(device)
         self.model = _new_model(metadata["model_args"], self.device)
         self.model.load_state_dict(checkpoint["state_dict"], strict=True)
         self.model.eval()
@@ -843,6 +891,8 @@ class MSDZipScorer:
             parameter.requires_grad_(False)
         self.metadata = {**metadata, "checkpoint_path": str(self.checkpoint_path), "checkpoint_sha256": sha256(self.checkpoint_path),
                          "checkpoint_dataset_verified": dataset_fingerprint is not None, "device": str(self.device)}
+        if evaluation_audit is not None:
+            self.metadata["evaluation_split_audit"] = evaluation_audit
         self.raw_scores = None
 
     def __call__(self, reference, source, support):

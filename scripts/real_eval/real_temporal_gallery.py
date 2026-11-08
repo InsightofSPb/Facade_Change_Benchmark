@@ -363,7 +363,7 @@ def run(run_path, snapshot_path, out_path, max_facades=3, crops_per_facade=1, se
     return summary
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", required=True)
     parser.add_argument("--snapshot", required=True)
@@ -372,5 +372,10 @@ if __name__ == "__main__":
     parser.add_argument("--crops-per-facade", type=int, default=1)
     parser.add_argument("--sequence-ids", nargs="+")
     parser.add_argument("--geoscd-run", help="Separate GeoSCD retry output; original run stays unchanged")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     run(args.run, args.snapshot, args.out, args.max_facades, args.crops_per_facade, args.sequence_ids, args.geoscd_run)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,137 @@
+{
+  "locations": [
+    {
+      "id": "krasnoarmeyskaya_8_14",
+      "label": "8-я Красноармейская, 14",
+      "address": "Санкт-Петербург, 8-я Красноармейская улица, 14",
+      "lat": 59.914268,
+      "lon": 30.301441,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/8_ya_krasnoarmeyskaya_ulitsa_14/Z0kYdQdhTUEGQFtjfXVwdX5lbA==/",
+      "source_ref": "turn27view0",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "Kamennoostrovskii_61",
+      "label": "Каменноостровский проспект, 61",
+      "address": "Санкт-Петербург, Каменноостровский проспект, 61",
+      "lat": 59.972956,
+      "lon": 30.305726,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/kamennoostrovskiy_prospekt_61/Z0kYdQdlTkcBQFtjfXV2c3VmYg==/",
+      "source_ref": "turn19view0",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "manezhnyi_7",
+      "label": "Манежный переулок, 7",
+      "address": "Санкт-Петербург, Манежный переулок, 7",
+      "lat": 59.943048,
+      "lon": 30.35622,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/Z0kYdQJmS0cHQFtjfXV1cnxnbA==/",
+      "source_ref": "turn19view1",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "Voskova_10",
+      "label": "улица Воскова, 10",
+      "address": "Санкт-Петербург, улица Воскова, 10",
+      "lat": 59.957895,
+      "lon": 30.305394,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/ulitsa_voskova_10/Z0kYdQdlSkwDQFtjfXV0dnRqYQ==/",
+      "source_ref": "turn26view0",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. Карточка адреса Воскова, 10 отображается с альтернативным адресом Кропоткина, 24Б. Связь подтверждает также управляющая организация: https://kiproko.ru/tszh-voskova-10/informatsiya-tszh-voskova-10 ."
+    },
+    {
+      "id": "Bolshoi_prospect_petrogradskoii_10b",
+      "label": "Большой проспект П.С., 10Б",
+      "address": "Санкт-Петербург, Большой проспект Петроградской стороны, 10Б",
+      "lat": 59.954421,
+      "lon": 30.292287,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/bolshoy_prospekt_petrogradskoy_storony_10b/Z0kYdA5iS00AQFtjfXV0dXhhZQ==/",
+      "source_ref": "turn27view1",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "zakharievskaya_9",
+      "label": "Захарьевская улица, 9",
+      "address": "Санкт-Петербург, Захарьевская улица, 9",
+      "lat": 59.947577,
+      "lon": 30.352385,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/zakharyevskaya_ulitsa_9/Z0kYdQJiSk0CQFtjfXV1dnlkYw==/",
+      "source_ref": "turn24view1",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "Instrumentalnaya_3a",
+      "label": "Инструментальная улица, 3А",
+      "address": "Санкт-Петербург, Инструментальная улица, 3А",
+      "lat": 59.973325,
+      "lon": 30.325112,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/instrumentalnaya_ulitsa_3a/Z0kYdQVlSEQFQFtjfXV2cn9hYQ==/",
+      "source_ref": "turn24view0",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "marata_44",
+      "label": "улица Марата, 44",
+      "address": "Санкт-Петербург, улица Марата, 44",
+      "lat": 59.924745,
+      "lon": 30.35163,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/ulitsa_marata_44/Z0kYdQJhT0YHQFtjfXVzdXtnYQ==/",
+      "source_ref": "turn25view0",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "Kamennoostrovskii_57",
+      "label": "Каменноостровский проспект, 57",
+      "address": "Санкт-Петербург, Каменноостровский проспект, 57",
+      "lat": 59.972069,
+      "lon": 30.306355,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/kamennoostrovskiy_prospekt_57/Z0kYdQdmSkACQFtjfXV2c3xlbQ==/",
+      "source_ref": "turn25view2",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. "
+    },
+    {
+      "id": "Vsevoloda_Vishnevskogo_9",
+      "label": "улица Всеволода Вишневского, 9",
+      "address": "Санкт-Петербург, улица Всеволода Вишневского, 9",
+      "lat": 59.967867,
+      "lon": 30.300669,
+      "location_precision": "building",
+      "source_url": "https://yandex.com/maps/2/saint-petersburg/house/ulitsa_vsevoloda_vishnevskogo_9/Z0kYdQdgT0MOQFtjfXV3dnRlYw==/",
+      "source_ref": "turn25view1",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты здания явно указаны в карточке Яндекс Карт. Маркер здания; сторона фасада и точка съёмки не определялись. Угловое здание; карточка адреса отображается как Чкаловский проспект, 52, с адресом Всеволода Вишневского, 9 у организаций в том же здании."
+    },
+    {
+      "id": "ryileeva_26",
+      "label": "улица Рылеева, 26",
+      "address": "Санкт-Петербург, улица Рылеева, 26 / улица Радищева, 42",
+      "lat": 59.942493,
+      "lon": 30.363236,
+      "location_precision": "building",
+      "source_url": "https://yandex.ru/maps/2/saint-petersburg/house/ulitsa_ryleyeva_26/Z0kYdQFjS0YBQFtjfXV1c3hqZw==/services/",
+      "source_ref": "turn28search6",
+      "verification_note": "Адрес сопоставлен с названием объекта в датасете. Адрес и координаты явно указаны в индексированном тексте карточки Яндекс Карт. Альтернативный адрес Радищева, 42 подтверждён карточкой дома Domclick: https://spb.domclick.ru/building/centralnyj--smolninskoe--ulica-ryleeva--radisheva--26 . Маркер здания; сторона фасада и точка съёмки не определялись."
+    }
+  ],
+  "unresolved": [
+    {
+      "id": "Ulitsa_Mira_15",
+      "label": "улица Мира, 15",
+      "address": "Санкт-Петербург, улица Мира, 15",
+      "lat": null,
+      "lon": null,
+      "location_precision": null,
+      "source_url": null,
+      "verification_note": "В исходном идентификаторе не указан корпус. Найдена карточка Мира, 15к1, но соответствие показанной в датасете стены этому корпусу не подтверждено. Координаты не назначены."
+    }
+  ]
+}

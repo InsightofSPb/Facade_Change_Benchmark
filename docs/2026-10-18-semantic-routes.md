@@ -261,6 +261,53 @@ python -u -m scripts.real_eval.semantic_routes smoke \
   --resume
 ```
 
+### Исправление загрузки LPOSS и SAM3 после smoke 2026-10-18
+
+В присланном отчёте config003 все 396 неуспешных единиц относятся к двум
+ошибкам и их зависимым маршрутам: 198 для LPOSS, 198 для SAM3. Это ошибки
+инициализации, а не измеренное плохое качество моделей.
+
+Старый PyTorch окружения LPOSS не поддерживает аргумент `weights_only`.
+Для уже используемых локальных весов DINO разрешение legacy-загрузки задаётся
+явно. Команда ниже создаёт новый JSON, меняет только `stock_lposs.trust_checkpoint`
+и добавляет запись происхождения; пути config003 и остальные настройки сохраняются:
+
+```bash
+python -m scripts.real_eval.semantic_routes repair-config \
+  --config runs/2026-10-18-semantic-config-003.json \
+  --out runs/2026-10-18-semantic-config-004.json \
+  --trust-lposs-checkpoint
+```
+
+SAM3 checkpoint содержит `backbone.vision_backbone.sam2_convs.*`, хотя текстовая
+image-модель создаётся с `enable_inst_interactivity=False`. Это вспомогательная
+ветвь: [официальный builder](https://github.com/facebookresearch/sam3/blob/7f473cfd983d5eb43040ff608f66bff0d7bdcb53/sam3/model_builder.py)
+передаёт флаг в `add_sam2_neck`, а [neck](https://github.com/facebookresearch/sam3/blob/7f473cfd983d5eb43040ff608f66bff0d7bdcb53/sam3/model/necks.py)
+создаёт её копированием `convs` только при включённой интерактивности.
+Адаптер исключает только ключи этой отсутствующей ветви с существующим
+соответствующим `convs`-параметром той же формы. После этого используется
+`strict=True`: пропущенные обязательные веса, другие лишние ключи и несовпадающие
+формы по-прежнему вызывают ошибку. Список исключённых ключей сохраняется в
+`checkpoint_loading.omitted_inactive_keys`; исходный checkpoint не изменяется.
+
+Перед общей очередью можно проверить только эти два сегментатора на одной VAL-паре
+с быстрым CD, во всех словарях и трёх маршрутах:
+
+```bash
+python -u -m scripts.real_eval.semantic_routes smoke \
+  --config runs/2026-10-18-semantic-config-004.json \
+  --splits val --pairs-per-split 1 \
+  --methods dinov2 --segmenters sam3 lposs_stock \
+  --out runs/2026-10-18-semantic-run-001/loading-check \
+  --progress on --resume
+```
+
+После успешной проверки основная команда `run --smoke-first --resume` использует
+config004 и прежний основной `--out`. Поскольку файл адаптеров общий для всех
+сегментаторов, его изменение меняет хеш семантических вычислений: прежние
+семантические карты будут пересчитаны. Кэш исходного CD и CD на тех же RGB-кропах
+сохраняет совместимость, включая дорогие вызовы AnyChange. Старые записи не удаляются.
+
 В отчёте проверяются ошибки моделей, формы масок, порядок классов, исходные и
 послойные маски SAM3, а также `estimate.json`. Пилот оценивает время, но не
 обещает точную длительность полного прогона: загрузка, попадания в кэш и число

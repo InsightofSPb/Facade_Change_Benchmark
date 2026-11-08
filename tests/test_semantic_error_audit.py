@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-base = importlib.import_module('test_2026-10-19_continuous_semantic_updates')
+base = importlib.import_module('test_continuous_semantic_updates')
 audit = importlib.import_module('scripts.real_eval.2026-10-20_semantic_error_audit')
 pilot, runner = audit.pilot, audit.continuous
 

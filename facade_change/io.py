@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import subprocess
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,12 +105,18 @@ def run_record(kind: str, config: dict) -> dict:
             "config_sha256": hashlib.sha256(serialized).hexdigest(), "environment": environment()}
 
 
-def finish_record(out: Path, record: dict, status: str, error: str | None = None) -> None:
+def finish_record(out: Path, record: dict, status: str, error: str | None = None,
+                  *, progress_desc: str | None = None) -> None:
     record.update(status=status, finished_utc=datetime.now(timezone.utc).isoformat(),
                   run_id=out.name)
     if error:
         record["error"] = error
-    record["artifact_sha256"] = {str(p.relative_to(out)): sha256(p)
-                                 for p in sorted(out.rglob("*"))
-                                 if p.is_file() and p != out / "run.json"}
+    paths = [p for p in sorted(out.rglob("*")) if p.is_file() and p != out / "run.json"]
+    if progress_desc is None:
+        progress = nullcontext(paths)
+    else:
+        from tqdm import tqdm
+        progress = tqdm(paths, desc=progress_desc, unit="file", dynamic_ncols=True, leave=False)
+    with progress as artifacts:
+        record["artifact_sha256"] = {str(p.relative_to(out)): sha256(p) for p in artifacts}
     write_json(out / "run.json", record)

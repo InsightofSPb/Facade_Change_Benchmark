@@ -8,8 +8,9 @@ import sys
 from collections import Counter
 from pathlib import Path
 import importlib.util
+from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -54,6 +55,103 @@ class ResidualContextTests(unittest.TestCase):
                     self.assertEqual(positions[index] % 4, lane)
                     visited.append(int(index))
         self.assertEqual(sorted(visited), list(range(len(positions))))
+
+
+class FrozenCheckpointSplitTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.checkpoint = Path(self.directory.name) / "checkpoint.pt"
+        self.checkpoint.write_bytes(b"mock checkpoint bytes")
+        self.split = {"mode": "reviewed", "development_only": False, "building_assignments": {
+            "b_train": "train", "b_val": "val", "b_test": "test", "b_added": "test"}}
+        self.fingerprint = {key: key for key in ("parent_run", "parent_summary", "parent_index", "split", "config")}
+        self.metadata = {
+            "schema_version": 1, "kind": "original_msdzip_h0_frozen", "representation": "abs",
+            "source_sha256": msdzip.SOURCE_SHA256, "source_commit": msdzip.SOURCE_COMMIT,
+            "protocol": msdzip.PROTOCOL, "reviewed_split": copy.deepcopy(self.split),
+            "input_sha256": self.fingerprint, "buildings": {"train": ["b_train"], "val": ["b_val"]},
+            "window_groups": 1, "model_args": {},
+        }
+
+    def _load(self, **options):
+        fake_torch = Mock()
+        fake_torch.load.return_value = {"metadata": self.metadata, "state_dict": {}}
+        model = Mock()
+        model.parameters.return_value = []
+        with patch.object(msdzip, "_torch", return_value=fake_torch), \
+                patch.object(msdzip, "_device", return_value="cpu"), \
+                patch.object(msdzip, "_new_model", return_value=model):
+            return msdzip.MSDZipScorer(self.checkpoint, **options)
+
+    def test_new_snapshot_records_exposure_without_claiming_same_dataset_or_unseen_facades(self):
+        scorer = self._load(evaluation_split=self.split)
+        self.assertFalse(scorer.metadata["checkpoint_dataset_verified"])
+        audit = scorer.metadata["evaluation_split_audit"]
+        self.assertEqual(audit["evaluation_split_sha256"], msdzip._digest(self.split))
+        self.assertEqual(audit["checkpoint_overlap_by_current_split"]["train"]["train"], ["b_train"])
+        self.assertEqual(audit["checkpoint_overlap_by_current_split"]["val"]["val"], ["b_val"])
+        self.assertEqual(audit["checkpoint_overlap_by_current_split"]["train"]["test"], [])
+        self.assertEqual(audit["overlap_policy"], "record_only")
+        self.assertFalse(audit["known_checkpoint_holdout_overlap"])
+        self.assertFalse(audit["checkpoint_holdout_overlap_rejected"])
+        self.assertEqual(audit["exploratory_splits"], [])
+        self.assertEqual(audit["warnings"], [])
+        self.assertFalse(audit["unseen_facades_verified"])
+        self.assertNotIn("evaluation_split_audit", self.metadata)
+
+    def test_holdout_exposure_is_recorded_without_blocking_frozen_inference(self):
+        for building, part in (("b_train", "val"), ("b_train", "test"), ("b_val", "test")):
+            with self.subTest(building=building, part=part):
+                split = copy.deepcopy(self.split)
+                split["building_assignments"][building] = part
+                scorer = self._load(evaluation_split=split)
+                scorer.model.load_state_dict.assert_called_once_with({}, strict=True)
+                scorer.model.eval.assert_called_once_with()
+                audit = scorer.metadata["evaluation_split_audit"]
+                role = "train" if building == "b_train" else "val"
+                self.assertEqual(audit["checkpoint_overlap_by_current_split"][role][part], [building])
+                self.assertTrue(audit["known_checkpoint_holdout_overlap"])
+                self.assertEqual(audit["known_checkpoint_train_holdout_overlap"], role == "train")
+                self.assertEqual(audit["known_checkpoint_selection_test_overlap"], role == "val")
+                self.assertEqual(audit["exploratory_splits"], [part])
+                self.assertEqual(len(audit["warnings"]), 1)
+                self.assertFalse(audit["checkpoint_holdout_overlap_rejected"])
+                self.assertFalse(audit["unseen_facades_verified"])
+                self.assertEqual(self.metadata["reviewed_split"], self.split)
+
+    def test_combined_exposure_reports_both_reasons_and_all_affected_splits(self):
+        split = copy.deepcopy(self.split)
+        split["building_assignments"].update(b_train="val", b_val="test")
+        audit = self._load(evaluation_split=split).metadata["evaluation_split_audit"]
+        self.assertTrue(audit["known_checkpoint_train_holdout_overlap"])
+        self.assertTrue(audit["known_checkpoint_selection_test_overlap"])
+        self.assertEqual(audit["exploratory_splits"], ["val", "test"])
+        self.assertEqual(len(audit["warnings"]), 2)
+
+    def test_invalid_evaluation_split_rejected_and_original_fingerprint_check_retained(self):
+        for split in ([], {}, {**self.split, "mode": "unreviewed"},
+                      {**self.split, "building_assignments": {"b_train": "unknown"}}):
+            with self.subTest(split=split):
+                with self.assertRaisesRegex(ValueError, "reviewed building split"):
+                    self._load(evaluation_split=split)
+        with self.assertRaisesRegex(ValueError, "dataset/split fingerprint"):
+            self._load(dataset_fingerprint={**self.fingerprint, "split": "different"}, evaluation_split=self.split)
+        scorer = self._load(dataset_fingerprint=self.fingerprint)
+        self.assertTrue(scorer.metadata["checkpoint_dataset_verified"])
+        self.assertNotIn("evaluation_split_audit", scorer.metadata)
+
+    def test_record_only_policy_does_not_accept_inconsistent_checkpoint_training_split(self):
+        self.metadata["buildings"]["train"].append("b_val")
+        with self.assertRaisesRegex(ValueError, "training buildings disagree"):
+            self._load(evaluation_split=self.split)
+
+    def test_registry_forwards_evaluation_split_to_msdzip_only(self):
+        from facade_change.methods import registry
+        from facade_change.methods import msdzip as adapter
+        with patch.object(adapter, "MSDZipScorer") as constructor:
+            registry.make_method("msdzip_abs", checkpoint_path=str(self.checkpoint), evaluation_split=self.split)
+        constructor.assert_called_once_with("abs", checkpoint_path=str(self.checkpoint), evaluation_split=self.split)
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("cv2"), "PyTorch/OpenCV required for original predictor smoke")
@@ -379,7 +477,7 @@ class OriginalMSDZipTests(unittest.TestCase):
     def test_actual_temporal_runner_trains_scores_reports_and_resumes_both_representations(self):
         from facade_change.io import read_json
         spec = importlib.util.spec_from_file_location(
-            "msdzip_temporal_fixture", Path(__file__).with_name("test_2026-10-14_temporal_inputs.py"))
+            "msdzip_temporal_fixture", Path(__file__).with_name("test_temporal_inputs.py"))
         fixtures = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fixtures)
         fixture = fixtures.TemporalInputsTests()

@@ -202,12 +202,12 @@ Main outputs: `2026-10-14_temporal_summary.json`,
 ```bash
 python -s -m unittest discover -s tests -v
 python -s -m unittest \
-  'tests/test_2026-10-04_msdzip.py' \
-  'tests/test_2026-10-14_semantic_dino.py' \
-  'tests/test_2026-10-14_temporal_inputs.py' \
-  'tests/test_2026-10-14_temporal_history.py' \
-  'tests/test_2026-10-14_temporal_reports.py' \
-  'tests/test_2026-10-14_temporal_experiment.py' -v
+  'tests/test_msdzip.py' \
+  'tests/test_semantic_dino.py' \
+  'tests/test_temporal_inputs.py' \
+  'tests/test_temporal_history.py' \
+  'tests/test_temporal_reports.py' \
+  'tests/test_temporal_experiment.py' -v
 ```
 
 The second command is required because standard unittest discovery skips
