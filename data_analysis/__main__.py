@@ -12,6 +12,8 @@ def main(argv=None):
         return importlib.import_module("data_analysis.2026-11-06_history_fusion").main(argv[1:])
     if argv and argv[0] == "variability-memory":
         return importlib.import_module("data_analysis.2026-11-08_variability_memory").main(argv[1:])
+    if argv and argv[0] == "memory-evaluate":
+        return importlib.import_module("data_analysis.2026-11-08_memory_evaluate").main(argv[1:])
     from .runner import run_analysis
 
     parser = argparse.ArgumentParser(description=__doc__)
