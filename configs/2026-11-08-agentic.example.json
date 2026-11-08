@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "store_root": "../data/agentic/regions",
+  "knowledge_root": "../data/agentic/knowledge",
+  "cache_root": "../data/agentic/cache",
+  "gpu_mode": "sequential",
+  "worker_timeout": 300,
+  "retrieval_encoder": null,
+  "modes": [
+    "pair",
+    "fixed_context",
+    "agent"
+  ],
+  "methods": [
+    "ssim",
+    "lzma_abs"
+  ],
+  "method_options": {},
+  "thresholds": {
+    "ssim": 0.15
+  },
+  "diagnostic_baseline": "ssim",
+  "fusion": null,
+  "max_region_pixels": 4000000,
+  "alignment": {
+    "method": "sift",
+    "device": "cpu"
+  },
+  "budgets": {
+    "max_actions": 4,
+    "max_model_calls": 5,
+    "max_images": 8,
+    "max_total_images": 32,
+    "max_input_tokens": 4096,
+    "max_total_input_tokens": 16384,
+    "max_output_tokens": 1024,
+    "max_total_output_tokens": 4096,
+    "max_seconds": 300,
+    "max_invalid_replies": 1,
+    "max_same_action": 1,
+    "history_limit": 3,
+    "retrieval_limit": 5,
+    "max_map_images": 2
+  },
+  "models": {
+    "qwen": {
+      "python": "/home/sasha/miniconda3/envs/change-agentic-rag/bin/python",
+      "model_id": "Qwen/Qwen3.5-4B",
+      "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+      "device": "cuda",
+      "local_files_only": true,
+      "precision": "bfloat16",
+      "attention": "sdpa",
+      "enable_thinking": false,
+      "do_sample": false,
+      "max_images": 8,
+      "max_input_tokens": 4096,
+      "max_new_tokens": 1024,
+      "image_min_pixels": 65536,
+      "image_max_pixels": 262144
+    },
+    "sam3": {
+      "python": "/home/sasha/miniconda3/envs/sam3_facades_20260907/bin/python",
+      "revision": "660a5e9e1b8b4c02c0ad97229b88a09a6e4ff5b7",
+      "checkpoint_path": "/home/sasha/Facade_Change_Benchmark/models/sam3.pt",
+      "checkpoint_bytes": 3450062241,
+      "device": "cuda"
+    },
+    "jina": {
+      "python": "/home/sasha/miniconda3/envs/change-agentic-rag/bin/python",
+      "model_id": "jinaai/jina-clip-v2",
+      "revision": "e10d47f5691d0454a0fb5d13f46f2199b74cb436",
+      "local_files_only": true,
+      "trust_remote_code": true,
+      "device": "cuda"
+    }
+  },
+  "availability_policy": {
+    "version": 1,
+    "history": "dated available prefix; current observations excluded",
+    "similar_cases": "train only; exclude target building, views and image hashes",
+    "gt": "evaluator only; never available to methods, retrieval or VLM",
+    "unknown_visibility": "unknown; geometric support is not physical visibility"
+  }
+}

@@ -11,6 +11,13 @@
 
 ## Основной workflow
 
+Новые пары без GT, постоянные области, причинный поиск и Qwen/SAM3:
+[`2026-11-08: change-agentic-rag`](docs/2026-11-08-change-agentic-rag.md).
+Вход `python -m facade_change.agentic --help`; интеграция с основным workflow:
+`workflow benchmark agentic`, `workflow prepare agentic-index`, `workflow gallery agentic`.
+CPU-пример проверяет SIFT/SSIM/LZMA, историю и отчёт; настоящие Qwen/SAM3
+проверяются отдельно в уже настроенных WSL-окружениях, без скачивания весов.
+
 **Подготовка данных → обучение при необходимости → бенчмаркинг → галерея.**
 
 Единый вход: `python -m facade_change workflow STAGE TASK ...`.

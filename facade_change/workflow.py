@@ -29,6 +29,7 @@ ROBUSTNESS = "scripts.real_eval.real_robustness"
 
 COMMANDS = {
     "prepare": {
+        "agentic-index": Command("facade_change.agentic.cli", "Local causal observation embeddings", ("index",)),
         "dataset": Command("facade_change.dataset_setup", "COCO, reviewed identities and facade-disjoint splits"),
         "align": Command(CORE, "Align original RGB pairs; optionally export crops", ("batch",)),
         "crops": Command(CORE, "Export a crop dataset from saved alignment", ("crop-dataset",)),
@@ -61,6 +62,7 @@ COMMANDS = {
         "bcm": Command(CORE, "Adapt BCM-Net on TRAIN H0 RGB tiles", ("bcm-train",)),
     },
     "benchmark": {
+        "agentic": Command("facade_change.agentic.cli", "New RGB pairs, persistent regions and bounded Qwen tools", ("run",)),
         "crops": Command("facade_change.crop_benchmark", "Selected controls or full RGB export; TRAIN thresholds and separate split/class metrics"),
         "spatial-change": Command("facade_change.research.2026-10-25_spatial_change",
                                   "Shared spatial evaluation with DINO and AnyChange baselines", ("evaluate",)),
@@ -90,6 +92,7 @@ COMMANDS = {
                                       "Cache-only raw-pair or directed-delta event fusion"),
     },
     "gallery": {
+        "agentic": Command("facade_change.agentic.cli", "Saved image evidence, tool trace and costs", ("report",)),
         "spatial-change": Command("facade_change.research.2026-10-25_spatial_change",
                                   "Rebuild spatial comparisons from saved maps", ("gallery",)),
         "sheets": Command("facade_change.gallery.report_sheets", "Compose pair and chronology sheets from saved report panels"),
