@@ -611,10 +611,50 @@ def _frozen_fusion(spec, arrays, maps, support, out):
     return dict(status="completed", decision="changed" if mask.any() else "no_change",
         mask_path=str(mask_path), scores_path=str(scores_path), threshold=float(threshold),
         scope="region contains at least one positive supported pixel; not an independently calibrated region classifier",
-        variant=variant, threshold_selection=choice, positive_pixels=int(mask.sum()),
+        variant=variant, threshold_selection=choice, positive_pixels=int(mask.sum()), input_methods=required,
+        threshold_origin={"selection": calibration_kind, "selection_split": "val",
+                          "path": str(threshold_path), "sha256": sha256(threshold_path)},
         provenance={"run": str(root), "fit_split": "train", "threshold_split": "val",
+            "model_artifacts": model_paths,
             "artifacts": {**{str(p): sha256(p) for p in paths}, **method_contracts, **model_paths},
             "application_scope": "one non-overlapping supplied region; raw-score spatial merge is required for whole-facade evaluation"})
+
+
+def _fusion_evidence(baseline, case, observations, support, source_rgb, store, out):
+    """Expose the saved fusion as its own prediction, retaining component evidence."""
+    inputs = [item for item in case["maps"] if item["method"] in baseline["input_methods"]]
+    source_ids = [item["evidence_id"] for item in inputs]
+    source = {**baseline["provenance"], "input_methods": [
+        {"method": item["method"], "evidence_id": item["evidence_id"],
+         "scores_path": item["scores_path"], "scores_sha256": sha256(item["scores_path"]),
+         "source_artifact_sha256": item["source_artifact_sha256"]} for item in inputs]}
+    scores = np.load(baseline["scores_path"], allow_pickle=False)
+    weight = np.nan_to_num(scores, nan=0.)[..., None] * .65
+    preview = np.rint(source_rgb * (1-weight) + np.array([255., 30., 20.]) * weight).astype(np.uint8)
+    preview[~support] = 40
+    preview_path = out / "fusion_score_preview.png"
+    Image.fromarray(preview).save(preview_path)
+    record = store.add_evidence(dict(kind="prediction", region_id=case["region_id"],
+        observation_ids=[row["observation_id"] for row in observations],
+        available_at=observations[1]["available_at"], source_evidence_ids=source_ids,
+        coordinate_system="region_crop_pixels", model="frozen_canonical_history_fusion",
+        artifacts=[_artifact(baseline["scores_path"], "scores_path", "application/octet-stream"),
+                   _artifact(baseline["mask_path"], "prediction_path", "image/png"),
+                   _artifact(case["support_path"], "support_path", "image/png"),
+                   _artifact(preview_path, "score_preview", "image/png")],
+        summary={"method": "fusion", "status": "completed", "variant": baseline["variant"],
+                 "threshold": baseline["threshold"], "threshold_selection": baseline["threshold_selection"],
+                 "threshold_origin": baseline["threshold_origin"], "positive_pixels": baseline["positive_pixels"],
+                 "support_pixels": int(support.sum()), "scope": baseline["scope"],
+                 "score_type": "frozen_fusion_score", "scale": "[0,1]; not a calibrated region probability",
+                 "preview_interpretation": "red overlay shows fusion score; grey is outside geometric overlap"},
+        parameters={"method": "fusion", "output_kind": "frozen_fusion_score", "units": "score",
+                    "direction": "higher is more change", "geometry": {
+                        "crop_shape": list(support.shape), "bbox_xyxy": case["geometry"]["bbox_xyxy"],
+                        "anchor_sha256": case["geometry"]["anchor_sha256"]}},
+        source=source, provenance=baseline["provenance"]))
+    baseline["evidence_id"] = record["evidence_id"]
+    case["method_evidence"].append(record)
 
 
 def prepare_case(config, pair_spec, out, store, pool_factory=RemotePool):
@@ -768,6 +808,7 @@ def prepare_case(config, pair_spec, out, store, pool_factory=RemotePool):
             if config.get("fusion"):
                 try:
                     case["baseline"] = _frozen_fusion(config["fusion"], arrays, case["maps"], support, out)
+                    _fusion_evidence(case["baseline"], case, observations, support, rgb_arrays[1], store, out)
                 except Exception as exc:
                     case["baseline"] = dict(status="error", decision="insufficient_data", error=f"{type(exc).__name__}: {exc}")
             elif config.get("diagnostic_baseline"):

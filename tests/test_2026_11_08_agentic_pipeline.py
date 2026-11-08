@@ -37,6 +37,38 @@ class ExistingCpuPool:
     release = close
 
 
+def saved_stack_fixture(root, methods, metadata):
+    """A tiny saved TRAIN-model/VAL-threshold contract, not a learned quality claim."""
+    fusion = importlib.import_module("data_analysis.2026-11-06_history_fusion")
+    saved, source = root / "fusion", root / "source"
+    saved.mkdir(); source.mkdir()
+    (source / "method_contracts").mkdir()
+    (saved / "maps").mkdir(); (saved / "units").mkdir()
+    columns = len(fusion.METHODS) * len(fusion.MODES)
+    item = dict(id="stack--previous", mode="previous", kind="stack", method="stack",
+                columns=[fusion.METHODS.index(method) for method in methods], native=False,
+                context_size=1, context_offset=0)
+    write_json(saved / "experiment_contract.json", dict(fit_split="train", threshold_split="val",
+        variants=[item], code={Path(fusion.__file__).name: sha256(fusion.__file__)}))
+    write_json(source / "thresholds.json", {method: {mode: {"threshold": .5}
+        for mode in fusion.MODES} for method in fusion.METHODS})
+    summary = dict(source=str(source), source_sha256={str(source / "thresholds.json"): sha256(source / "thresholds.json")})
+    write_json(saved / (fusion.PREFIX + "summary.json"), summary)
+    write_json(saved / "run.json", dict(kind="canonical_history_fusion", status="completed",
+        summary_sha256=sha256(saved / (fusion.PREFIX + "summary.json"))))
+    write_json(saved / (fusion.PREFIX + "normalizer.json"), dict(low=[0]*columns, high=[1]*columns))
+    write_json(saved / (fusion.PREFIX + "thresholds.json"), {item["id"]: {"threshold": .5, "selection_split": "val"}})
+    identifier = fusion.PREFIX + "model-" + item["id"]
+    model = dict(center=np.zeros(len(methods)), scale=np.ones(len(methods)),
+                 parameters=np.r_[-1., np.ones(len(methods))])
+    np.savez(saved / "maps/model.npz", **model)
+    write_json(saved / "units" / (identifier + ".json"), dict(unit_id=identifier, variant=item,
+        split="train", artifact_path="maps/model.npz", artifact_sha256=sha256(saved / "maps/model.npz")))
+    for method in methods:
+        write_json(source / "method_contracts" / (method + ".json"), metadata[method])
+    return saved
+
+
 class PairIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -149,6 +181,68 @@ class PairIntegrationTests(unittest.TestCase):
             self.assertNotIn("scores_path", case["maps"][0])
             self.assertEqual(case["baseline"]["decision"], "insufficient_data")
 
+    def test_prepared_fusion_is_exposed_by_maps_and_fixed_context_but_not_pair(self):
+        from facade_change.agentic.reasoning import run_reasoning
+        from facade_change.agentic.retrieval import KnowledgeBase, SearchIndex
+        from facade_change.agentic.tools import ToolService
+
+        saved = saved_stack_fixture(self.root, ["ssim"], {"ssim": make_method("ssim").metadata})
+        config = {**self.config, "methods": ["ssim"], "fusion": {"run": str(saved)}}
+        class InspectPool:
+            models = {"qwen": {"model": "explicit-test-double"}}
+            def __init__(self):
+                self.messages = []
+            def call(self, role, request):
+                self.messages.append(request["messages"])
+                return {"status": "ok", "text": json.dumps({"type": "final", "decision": "insufficient_data",
+                    "visible_difference": "Test contract only", "evidence_ids": [], "localization": None,
+                    "limitations": [], "missing_information": []}), "usage": {"model_calls": 1}}
+
+        with RegionStore(self.root / "store") as store, patch(
+                "facade_change.agentic.pipeline._alignment", side_effect=self.alignment):
+            case = prepare_case(config, self.pair, self.root / "case", store, ExistingCpuPool)
+            self.assertEqual(case["status"], "completed", case)
+            self.assertEqual(len(case["maps"]), 1)
+            self.assertEqual(len(case["method_evidence"]), 2)
+            pool = InspectPool()
+            search, knowledge = SearchIndex(store), KnowledgeBase(self.root / "knowledge")
+            service = ToolService(store, search, knowledge, pool, case, self.root / "tool")
+            result = service.execute("get_maps", {"method": "fusion"})
+            self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(len(result["evidence"]), 1)
+            record = result["evidence"][0]
+            self.assertEqual(record["evidence_id"], case["baseline"]["evidence_id"])
+            self.assertEqual(record["coordinate_system"], "region_crop_pixels")
+            self.assertEqual(record["summary"]["variant"]["id"], "stack--previous")
+            self.assertEqual(record["summary"]["threshold_origin"]["selection_split"], "val")
+            self.assertEqual(record["source_evidence_ids"], [case["maps"][0]["evidence_id"]])
+            self.assertEqual(record["source"]["input_methods"][0]["method"], "ssim")
+            self.assertEqual(record["source"]["model_artifacts"][str(saved / "maps/model.npz")],
+                             sha256(saved / "maps/model.npz"))
+            artifacts = {item["role"]: item for item in record["artifacts"]}
+            self.assertEqual(set(artifacts), {"scores_path", "prediction_path", "support_path", "score_preview"})
+            self.assertEqual(len(result["images"]), 1)
+            np.testing.assert_array_equal(np.load(artifacts["scores_path"]["path"]),
+                                          np.load(case["baseline"]["scores_path"]))
+            for artifact in artifacts.values():
+                self.assertEqual(artifact["sha256"], sha256(artifact["path"]))
+            limited = service.execute("get_maps", {"limit": 1})
+            self.assertEqual(limited["images"][0]["evidence_id"], record["evidence_id"])
+            self.assertEqual(len(limited["evidence"]), 2)
+            for mode in ("pair", "fixed_context"):
+                output = self.root / mode
+                service = ToolService(store, search, knowledge, pool, case, output)
+                run_reasoning(mode, case, service, pool, output, budgets={"max_map_images": 1})
+                messages = json.dumps(pool.messages[-1])
+                if mode == "pair":
+                    self.assertNotIn(record["evidence_id"], messages)
+                    self.assertNotIn("stack--previous", messages)
+                else:
+                    self.assertIn(record["evidence_id"], messages)
+                    self.assertIn("stack--previous", messages)
+                    self.assertIn(artifacts["score_preview"]["path"], messages)
+                    self.assertIn(case["maps"][0]["evidence_id"], messages)
+
     def test_prepared_three_date_history_reuses_immutable_observations_without_gt(self):
         history = self.root / "histories"
         history.mkdir()
@@ -202,36 +296,14 @@ class FrozenFusionTests(unittest.TestCase):
         fusion = importlib.import_module("data_analysis.2026-11-06_history_fusion")
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            saved, source, out = root / "fusion", root / "source", root / "out"
-            saved.mkdir(); source.mkdir(); out.mkdir()
-            (source / "method_contracts").mkdir()
-            (saved / "maps").mkdir(); (saved / "units").mkdir()
-            columns = len(fusion.METHODS) * len(fusion.MODES)
-            item = dict(id="stack--previous", mode="previous", kind="stack", method="stack",
-                        columns=list(range(len(fusion.METHODS))), native=False,
-                        context_size=1, context_offset=0)
-            write_json(saved / "experiment_contract.json", dict(fit_split="train", threshold_split="val",
-                variants=[item], code={Path(fusion.__file__).name: sha256(fusion.__file__)}))
-            write_json(source / "thresholds.json", {m: {mode: {"threshold": .5}
-                for mode in fusion.MODES} for m in fusion.METHODS})
-            summary = dict(source=str(source), source_sha256={str(source / "thresholds.json"): sha256(source / "thresholds.json")})
-            write_json(saved / (fusion.PREFIX + "summary.json"), summary)
-            write_json(saved / "run.json", dict(kind="canonical_history_fusion", status="completed",
-                summary_sha256=sha256(saved / (fusion.PREFIX + "summary.json"))))
-            write_json(saved / (fusion.PREFIX + "normalizer.json"), dict(low=[0]*columns, high=[1]*columns))
-            write_json(saved / (fusion.PREFIX + "thresholds.json"), {item["id"]: {"threshold": .5, "selection_split": "val"}})
-            identifier = fusion.PREFIX + "model-" + item["id"]
-            model = dict(center=np.zeros(len(fusion.METHODS)), scale=np.ones(len(fusion.METHODS)),
-                         parameters=np.r_[-1., np.ones(len(fusion.METHODS))])
-            np.savez(saved / "maps/model.npz", **model)
-            write_json(saved / "units" / (identifier + ".json"), dict(unit_id=identifier, variant=item,
-                split="train", artifact_path="maps/model.npz", artifact_sha256=sha256(saved / "maps/model.npz")))
+            out = root / "out"
+            out.mkdir()
+            metadata_by_method = {method: {"method": method, "output_kind": "score"} for method in fusion.METHODS}
+            saved = saved_stack_fixture(root, fusion.METHODS, metadata_by_method)
             maps, arrays = [], {}
             support = np.ones((2, 2), bool)
             for method in fusion.METHODS:
-                metadata = {"method": method, "output_kind": "score"}
-                maps.append(dict(method=method, status="completed", metadata=metadata))
-                write_json(source / "method_contracts" / (method + ".json"), metadata)
+                maps.append(dict(method=method, status="completed", metadata=metadata_by_method[method]))
                 arrays[method] = {"scores": np.full((2, 2), .3, np.float32)}
             result = _frozen_fusion({"run": str(saved)}, arrays, maps, support, out)
             self.assertEqual(result["decision"], "changed")
