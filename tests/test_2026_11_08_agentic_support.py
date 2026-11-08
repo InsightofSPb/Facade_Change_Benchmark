@@ -91,7 +91,14 @@ class PairSupportRegressionTests(unittest.TestCase):
                 support = next(row for row in pair_packet["evidence"] if row.get("method") == "pair_geometric_support")
                 self.assertEqual(support["summary"]["common_pixels"], 8)
                 self.assertEqual(support["summary"]["source_only_pixels"], 8)
-                preview = next(a["path"] for a in support["artifacts"] if a["role"] == "geometric_support_categories")
+                self.assertTrue(all("path" not in a and "sha256" not in a for a in support["artifacts"]))
+                preview = next(block["path"] for message in request["messages"] for block in message["content"]
+                               if block["type"] == "image" and block["evidence_id"] == support["evidence_id"])
+                saved_support = next(row for row in read_json(out / "evidence.json")["evidence"]
+                                     if row["evidence_id"] == support["evidence_id"])
+                saved_preview = next(a for a in saved_support["artifacts"] if a["role"] == "geometric_support_categories")
+                self.assertEqual(saved_preview["path"], preview)
+                self.assertEqual(saved_preview["sha256"], sha256(preview))
                 pixels = np.asarray(Image.open(preview))
                 np.testing.assert_array_equal(pixels[0, 0], support["summary"]["legend_rgb"]["common_support"])
                 np.testing.assert_array_equal(pixels[0, 3], support["summary"]["legend_rgb"]["source_only_first_observation"])

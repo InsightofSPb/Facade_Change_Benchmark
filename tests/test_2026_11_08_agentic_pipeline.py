@@ -242,6 +242,20 @@ class PairIntegrationTests(unittest.TestCase):
                     self.assertIn("stack--previous", messages)
                     self.assertIn(artifacts["score_preview"]["path"], messages)
                     self.assertIn(case["maps"][0]["evidence_id"], messages)
+                    packet = next(json.loads(block["text"])["observation"]
+                        for message in pool.messages[-1] for block in message["content"]
+                        if block["type"] == "text" and block["text"].startswith('{"observation":')
+                        and json.loads(block["text"]).get("operation") == "get_maps")
+                    exposed = next(row for row in packet["evidence"] if row["evidence_id"] == record["evidence_id"])
+                    self.assertNotIn(str(saved), json.dumps(exposed))
+                    self.assertNotIn(sha256(saved / "maps/model.npz"), json.dumps(exposed))
+                    self.assertEqual(exposed["source"]["fit_split"], "train")
+                    self.assertEqual(exposed["source"]["threshold_split"], "val")
+                    self.assertEqual(exposed["source"]["input_methods"], [
+                        {"method": "ssim", "evidence_id": case["maps"][0]["evidence_id"]}])
+                    stored = next(row for row in read_json(output / "evidence.json")["evidence"]
+                                  if row["evidence_id"] == record["evidence_id"])
+                    self.assertEqual(stored["source"], record["source"])
 
     def test_prepared_three_date_history_reuses_immutable_observations_without_gt(self):
         history = self.root / "histories"

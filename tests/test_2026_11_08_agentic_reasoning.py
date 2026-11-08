@@ -115,6 +115,63 @@ class ToolReasoningTests(unittest.TestCase):
         self.assertTrue((out / "messages.json").is_file())
         self.assertTrue((out / "trace.jsonl").is_file())
         self.assertEqual(self.store.get_evidence(result["hypothesis_evidence_id"])["kind"], "agent_hypothesis")
+        content = read_json(out / "messages.json")[1]["content"]
+        packet = json.loads(content[1]["text"])["observation"]
+        for index, block in enumerate(content):
+            if block["type"] != "image":
+                continue
+            # The processor consumes adjacent text; image metadata itself is stripped.
+            self.assertEqual(set(block), {"type", "path", "evidence_id"})
+            self.assertEqual(content[index - 1]["type"], "text")
+            label = json.loads(content[index - 1]["text"])
+            original = service.evidence[block["evidence_id"]]
+            exposed = next(row for row in packet["evidence"] if row["evidence_id"] == block["evidence_id"])
+            self.assertEqual(label["evidence_id"], original["evidence_id"])
+            self.assertEqual(label["coordinate_system"], original["coordinate_system"])
+            self.assertEqual(label["region_id"], original["region_id"])
+            if original["kind"] == "observation":
+                self.assertEqual(label["date"], original["date"])
+                self.assertEqual(label["observation_id"], original["observation_id"])
+                self.assertEqual(exposed["artifact_coordinates"], original["artifact_coordinates"])
+            else:
+                self.assertEqual([label["reference_date"], label["source_date"]], ["2010", "2020"])
+                self.assertEqual(exposed["summary"], original["summary"])
+            self.assertEqual(exposed["geometry"], original["geometry"])
+            prompt_text = " ".join(b["text"] for b in content if b["type"] == "text")
+            for artifact in original["artifacts"]:
+                self.assertNotIn(artifact["path"], prompt_text)
+                self.assertNotIn(artifact["sha256"], prompt_text)
+
+    def test_json_parse_failure_records_generation_without_accepting_incomplete_content(self):
+        broken = '{"type":"final","visible_difference":"unfinished'
+        # Cached replies have zero current cost, but retain the original generation lengths.
+        for name, generation in (
+                ("at-limit", {"actual_output_tokens": 64, "max_new_tokens": 64, "reached_max_new_tokens": True}),
+                ("below-limit", {"actual_output_tokens": 31, "max_new_tokens": 64, "reached_max_new_tokens": False}),
+                ("unknown", None)):
+            with self.subTest(name=name):
+                class BrokenPool(FakePool):
+                    def call(self, role, request):
+                        response = super().call(role, request)
+                        return {**response, "text": broken, "generation": generation, "cache_hit": True,
+                                "source_usage": response["usage"],
+                                "usage": {"input_tokens": 0, "output_tokens": 0, "model_calls": 0, "cache_hits": 1}}
+
+                pool = BrokenPool()
+                service, out = self.service("broken-" + name, pool)
+                result = run_reasoning("pair", self.case, service, pool, out, {"max_invalid_replies": 1})
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["reason"], "invalid_reply_limit")
+                self.assertIn("Unterminated string", result["error"])
+                self.assertEqual(len(pool.requests), 2)
+                self.assertEqual([request["max_new_tokens"] for _, request in pool.requests], [1024, 1024])
+                errors = [json.loads(line) for line in (out / "trace.jsonl").read_text().splitlines()
+                          if json.loads(line)["event_type"] == "validation_error"]
+                expected = generation or dict.fromkeys(("actual_output_tokens", "max_new_tokens", "reached_max_new_tokens"))
+                self.assertEqual([row["generation"] for row in errors], [expected, expected])
+                replies = [message["content"][0]["text"] for message in read_json(out / "messages.json")
+                           if message["role"] == "assistant"]
+                self.assertEqual(replies, [broken, broken])
 
     def test_history_excludes_current_future_and_unexposed_id_access(self):
         service, _ = self.service()
