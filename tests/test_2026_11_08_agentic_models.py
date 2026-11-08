@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 
 from facade_change.agentic.models import ModelPool, WorkerError, _Worker
-from facade_change.agentic.model_worker import Adapter, DinoAdapter, QwenAdapter, SAM3Adapter, serve
+from facade_change.agentic.model_worker import Adapter, DinoAdapter, JinaAdapter, QwenAdapter, SAM3Adapter, serve
 
 
 class FakeWorker:
@@ -200,6 +200,38 @@ class FakeProcessor:
         return ProcessorInputs(self.tokens, self.materialize)
 
 
+class JinaTokenizer:
+    """Token counting fixture that really applies the encoder's truncation policy."""
+    model_max_length = 8192
+
+    def __call__(self, texts, *, max_length=None, truncation=False, padding=False,
+                 add_special_tokens=True, **kwargs):
+        rows = [list(range(len(text.split()) + (2 if add_special_tokens else 0))) for text in texts]
+        if truncation:
+            rows = [row[:max_length] for row in rows]
+        return {"input_ids": rows}
+
+
+class JinaEncoder:
+    """Mirrors the pinned API's instruction and default 512-token truncation."""
+    instruction = "Represent the query for retrieving evidence documents: "
+
+    def __init__(self):
+        self.tokenizer = JinaTokenizer()
+        self.text_model = SimpleNamespace(get_instruction_from_task=lambda task: self.instruction if task else None)
+        self.encoded = []
+
+    def encode_text(self, texts, *, task=None, batch_size=32, show_progress_bar=None,
+                    convert_to_numpy=True, normalize_embeddings=True, truncate_dim=1024, **tokenizer_kwargs):
+        tokenizer_kwargs.setdefault("padding", True)
+        tokenizer_kwargs.setdefault("max_length", 512)
+        tokenizer_kwargs.setdefault("truncation", True)
+        instruction = self.text_model.get_instruction_from_task(task) or ""
+        tokens = self.tokenizer([instruction + text for text in texts], **tokenizer_kwargs)["input_ids"]
+        self.encoded.append({"texts": texts, "task": task, "kwargs": tokenizer_kwargs, "tokens": tokens})
+        return np.ones((len(texts), truncate_dim), np.float32)
+
+
 class AdapterContractTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -219,6 +251,51 @@ class AdapterContractTests(unittest.TestCase):
     def request(self):
         return {"op": "measure", "messages": [{"role": "user", "content": [
             {"type": "text", "text": "compare"}, {"type": "image", "path": str(self.image), "evidence_id": "e1"}]}]}
+
+    def jina(self, **options):
+        adapter = JinaAdapter("jina", options)
+        adapter.model = JinaEncoder()
+        adapter.provenance["space"] = {"model": "explicit-tokenization-test-double"}
+        adapter._load = lambda: None
+        adapter._begin()
+        return adapter
+
+    def test_jina_default_rejects_over_512_instead_of_silent_encoder_truncation(self):
+        text = "word " * 600
+        # The fixture exposes the pinned API's failure mode rather than ignoring kwargs.
+        raw = JinaEncoder()
+        raw.encode_text([text])
+        self.assertEqual(len(raw.encoded[0]["tokens"][0]), 512)
+        adapter = self.jina()
+        with self.assertRaisesRegex(ValueError, "max_text_tokens"):
+            adapter.handle({"op": "embed", "texts": [text]})
+        self.assertEqual(adapter.model.encoded, [])
+        self.assertEqual(adapter.usage["model_calls"], 0)
+
+    def test_jina_explicit_longer_limit_encodes_full_text_and_counts_instruction(self):
+        adapter = self.jina(max_text_tokens=768)
+        result = adapter.handle({"op": "embed", "texts": ["word " * 600], "task": "retrieval.query"})
+        call = adapter.model.encoded[0]
+        self.assertEqual(call["kwargs"], {"max_length": 768, "truncation": False,
+                                         "padding": True, "add_special_tokens": True})
+        self.assertEqual(len(call["tokens"][0]), 609)
+        self.assertEqual(adapter.usage["input_tokens"], 609)
+        self.assertEqual(result["text_processing"]["token_lengths"], [609])
+        self.assertEqual(result["text_processing"]["instruction"], JinaEncoder.instruction)
+        self.assertFalse(result["text_processing"]["truncation"])
+        self.assertEqual(adapter.provenance["text_processing"], result["text_processing"])
+
+    def test_jina_instruction_overflow_is_rejected_and_limit_binds_cache(self):
+        adapter = self.jina()
+        text = "word " * 505  # 507 alone, 514 with retrieval instruction and special tokens.
+        with self.assertRaisesRegex(ValueError, "instruction and special tokens"):
+            adapter.handle({"op": "embed", "texts": [text], "task": "retrieval.query"})
+        self.assertEqual(adapter.model.encoded, [])
+        with ModelPool({"jina": {"python": sys.executable}}, Path(self.temp.name) / "jina-logs") as pool:
+            request = {"op": "embed", "texts": ["crack"], "task": "retrieval.query"}
+            default_key = pool._key("jina", request)
+            pool.models["jina"]["max_text_tokens"] = 768
+            self.assertNotEqual(default_key, pool._key("jina", request))
 
     def test_dino_live_space_matches_shared_contract_and_tracks_encoder_resources(self):
         from facade_change.agentic.retrieval import dino_embedding_space

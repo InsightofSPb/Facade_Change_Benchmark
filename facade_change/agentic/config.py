@@ -64,7 +64,7 @@ def defaults():
                 "python": "/home/sasha/miniconda3/envs/change-agentic-rag/bin/python",
                 "model_id": "jinaai/jina-clip-v2", "revision": JINA_REVISION,
                 "local_files_only": True, "trust_remote_code": True,
-                "device": "cuda",
+                "device": "cuda", "max_text_tokens": 512,
             },
         },
         "availability_policy": copy.deepcopy(AVAILABILITY_POLICY),

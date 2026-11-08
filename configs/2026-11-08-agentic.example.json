@@ -72,7 +72,8 @@
       "revision": "e10d47f5691d0454a0fb5d13f46f2199b74cb436",
       "local_files_only": true,
       "trust_remote_code": true,
-      "device": "cuda"
+      "device": "cuda",
+      "max_text_tokens": 512
     }
   },
   "availability_policy": {

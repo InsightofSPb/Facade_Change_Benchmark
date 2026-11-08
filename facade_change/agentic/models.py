@@ -47,7 +47,7 @@ DEFAULTS = {
              "text_config_revision": JINA_TEXT_CONFIG_REVISION,
              "text_code_revision": JINA_TEXT_CODE_REVISION,
              "precision": "float32", "max_images": 16, "max_texts": 32,
-             "max_image_pixels": 16777216, "max_text_chars": 8192,
+             "max_image_pixels": 16777216, "max_text_chars": 8192, "max_text_tokens": 512,
              "truncate_dim": 1024, "trust_remote_code": True},
     "dino": {"device": "cpu", "trust_checkpoint": False,
              "max_images": 16, "max_image_pixels": 16777216},

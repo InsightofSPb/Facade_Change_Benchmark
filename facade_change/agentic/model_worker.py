@@ -453,10 +453,19 @@ class SAM3Adapter(Adapter):
 
 
 class JinaAdapter(Adapter):
+    def _text_policy(self):
+        maximum = self.options["max_text_tokens"]
+        if type(maximum) is not int or not 1 <= maximum <= 8192:
+            raise ValueError("Jina max_text_tokens must be an integer in 1..8192")
+        return {"max_length": maximum, "truncation": False, "padding": True,
+                "add_special_tokens": True, "overflow": "reject",
+                "instruction_policy": "pinned text_model.get_instruction_from_task(task), counted before encoding"}
+
     def _check(self):
         if self.checked:
             return
         options = self.options
+        text_policy = self._text_policy()
         if options["model_id"] != "jinaai/jina-clip-v2":
             raise ValueError("The joint encoder adapter requires jinaai/jina-clip-v2")
         if not options.get("trust_remote_code"):
@@ -496,9 +505,11 @@ class JinaAdapter(Adapter):
                                       "dimensions": options["truncate_dim"], "joint_image_text": True,
                                       "preprocessing": {"image": "pinned Jina image processor",
                                                         "text": "pinned Jina tokenizer; optional retrieval.query task",
+                                                        "text_processing": text_policy,
                                                         "normalize_embeddings": True,
                                                         "truncate_dim": options["truncate_dim"]}},
                                preprocessing="pinned model tokenizer and image processor, native Jina encode APIs",
+                               text_processing=text_policy,
                                use_text_flash_attn=False, use_vision_xformers=False)
         self.checked = True
 
@@ -570,24 +581,43 @@ class JinaAdapter(Adapter):
         task = request.get("task")
         if task not in {None, "retrieval.query"}:
             raise ValueError("Jina supports no task or retrieval.query in this adapter")
+        text_policy = self._text_policy()
         self._load()
         options = {"batch_size": 1, "show_progress_bar": False, "convert_to_numpy": True,
                    "normalize_embeddings": True, "truncate_dim": self.options["truncate_dim"]}
-        self.usage.update(model_calls=1, images=0 if text_mode else len(values))
+        processing = None
         if text_mode:
-            tokens = self.model.tokenizer(values, padding=False, truncation=False)["input_ids"]
+            # Pinned encode_text prepends this exact instruction, then defaults
+            # to max_length=512/truncation=True. Check the same complete strings
+            # and override both defaults explicitly; never count discarded text.
+            instruction = self.model.text_model.get_instruction_from_task(task)
+            if instruction is not None and not isinstance(instruction, str):
+                raise ValueError("Jina task instruction must be text or None")
             limit = getattr(self.model.tokenizer, "model_max_length", 8192)
-            if any(len(row) > min(limit, 8192) for row in tokens):
-                raise ValueError("Jina text exceeds tokenizer context; no silent truncation")
+            if type(limit) is not int or limit < 1:
+                raise ValueError("Jina tokenizer requires an explicit positive model_max_length")
+            limit = min(limit, text_policy["max_length"], 8192)
+            prefixed = [(instruction or "") + value for value in values]
+            tokens = self.model.tokenizer(prefixed, padding=False, truncation=False,
+                                          add_special_tokens=True)["input_ids"]
+            processing = {**text_policy, "max_length": limit, "configured_max_text_tokens": self.options["max_text_tokens"],
+                          "instruction": instruction, "task": task, "token_lengths": [len(row) for row in tokens]}
+            self.provenance["text_processing"] = processing
+            if any(len(row) > limit for row in tokens):
+                raise ValueError(f"Jina text exceeds max_text_tokens/context limit {limit}, including instruction and special tokens; no truncation")
             self.usage["input_tokens"] = sum(len(row) for row in tokens)
-            embeddings = self.model.encode_text(inputs, task=task, **options)
+            self.usage["model_calls"] = 1
+            embeddings = self.model.encode_text(inputs, task=task, max_length=limit,
+                                                 truncation=False, padding=True, add_special_tokens=True, **options)
         else:
+            self.usage.update(model_calls=1, images=len(values))
             embeddings = self.model.encode_image(inputs, **options)
         embeddings = np.asarray(embeddings, np.float32)
         if embeddings.shape != (len(values), self.options["truncate_dim"]) or not np.isfinite(embeddings).all():
             raise ValueError("Invalid Jina embedding dimensions/values")
         return {"vectors": embeddings.tolist(), "space": self.provenance["space"],
-                "modality": "text" if text_mode else "image", "task": task}
+                "modality": "text" if text_mode else "image", "task": task,
+                **({"text_processing": processing} if processing is not None else {})}
 
     def close(self):
         super().close()
