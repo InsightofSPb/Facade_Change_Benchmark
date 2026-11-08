@@ -208,16 +208,26 @@ class ToolService:
         identifier = str(observation["observation_id"])
         with Image.open(path) as source_image:
             image_shape = [source_image.height, source_image.width]
-        record = {"evidence_id": "observation-" + digest([identifier, view])[:32], "kind": "observation",
+        geometry = dict(observation.get("geometry", {}))
+        region = self.store.get_region(observation["region_id"])
+        geometry["anchor_sha256"] = region["anchor_sha256"]
+        geometry.setdefault("bbox_xyxy", region["bbox_xyxy"])
+        if "native_shape" not in geometry:
+            with Image.open(observation["original_path"]) as original:
+                geometry["native_shape"] = [original.height, original.width]
+        record = {"evidence_id": "observation-" + digest([identifier, view, "geometric-support-v2"])[:32], "kind": "observation",
                   "observation_ids": [identifier], "region_id": observation["region_id"],
+                  "observation_id": identifier,
                   "date": observation.get("date"), "date_status": observation.get("date_status"),
                   "available_at": observation.get("available_at"),
                   "visibility": observation.get("visibility", "unknown"),
                   "correspondence_status": observation.get("correspondence_status", "unknown"),
-                  "coordinate_system": "canonical_crop" if view == "crop" else "observation_native",
+                  "coordinate_system": "region_crop_pixels" if view == "crop" else "observation_native",
                   "image_shape": image_shape,
-                  "geometry": observation.get("geometry", {}),
-                  "artifacts": [self._artifact(path, "rgb", "image/png")]}
+                  "geometry": geometry,
+                  "summary": "Unmodified RGB. The separate geometric support artifact is not an occlusion mask.",
+                  "artifacts": [self._artifact(path, "rgb", "image/png"),
+                                self._artifact(observation["support_path"], "geometric_support")]}
         self._remember(record)
         image = {"type": "image", "path": str(Path(path).resolve()), "evidence_id": record["evidence_id"]}
         return record, image
@@ -228,21 +238,106 @@ class ToolService:
         keys = ("evidence_id", "kind", "region_id", "observation_ids", "date", "date_status", "available_at",
                 "visibility", "correspondence_status", "coordinate_system", "summary", "method",
                 "output_kind", "units", "direction", "model", "revision", "concept_id", "text",
-                "status", "source", "author", "source_event_id", "source_evidence_ids", "semantic_mapping", "class_binding", "native_shape", "image_shape")
+                "status", "source", "author", "source_event_id", "source_evidence_ids", "semantic_mapping", "class_binding", "native_shape", "image_shape",
+                "observation_id", "geometry", "artifact_coordinates", "input_observation")
         result = {key: record[key] for key in keys if key in record}
         result["artifacts"] = [{k: a[k] for k in ("path", "sha256", "role", "media_type") if k in a}
                                for a in record.get("artifacts", ())]
         return result
 
     def base_pair(self):
-        records, images = [], []
+        records, images, observations = [], [], []
         for identifier in self.current:
-            record, image = self._observation_evidence(self._observation(identifier))
+            observation = self._observation(identifier)
+            observations.append(observation)
+            record, image = self._observation_evidence(observation)
             records.append(self._public(record))
             images.append(image)
+        support_record, support_image = self._pair_support(observations)
+        records.append(self._public(support_record))
+        images.append(support_image)
         return {"status": "ok", "evidence": records, "images": images,
                 "comparability": self.case.get("comparability", "unknown"),
                 "limitations": self.case.get("limitations", []), "usage": {}}
+
+    def _pair_support(self, observations):
+        """Expose one labelled geometric map, alongside both untouched RGB images."""
+        supports = []
+        shape = tuple(observations[0]["geometry"]["crop_shape"])
+        for observation in observations:
+            if tuple(observation["geometry"]["crop_shape"]) != shape:
+                raise ValueError("Compared observations need the same fixed region grid")
+            path = Path(observation["support_path"])
+            if sha256(path) != observation["support_sha256"]:
+                raise ValueError("Observation geometric support changed")
+            if path.suffix == ".npy":
+                support = np.load(path, allow_pickle=False)
+                if support.dtype != bool:
+                    raise ValueError("Stored numpy geometric support must be boolean")
+            else:
+                with Image.open(path) as image:
+                    support = np.asarray(image)
+                if support.ndim != 2 or not np.isin(support, [0, 1, 255]).all():
+                    raise ValueError("Stored geometric support must be a binary grid")
+                support = support > 0
+            if support.shape != shape:
+                raise ValueError("Geometric support is not on the region grid")
+            supports.append(support)
+        common = supports[0] & supports[1]
+        source_only = supports[1] & ~supports[0]
+        reference_only = supports[0] & ~supports[1]
+        if self.case.get("support_path"):
+            with Image.open(self.case["support_path"]) as image:
+                prepared = np.asarray(image) > 0
+            if prepared.shape != common.shape or not np.array_equal(prepared, common):
+                raise ValueError("Prepared common support disagrees with observation supports")
+        identity = {"version": 1, "region_id": self.case["region_id"], "observations": self.current,
+                    "support_sha256": [row["support_sha256"] for row in observations]}
+        directory = self.out / "pair_support"
+        directory.mkdir(exist_ok=True)
+        arrays = {"common_support": common, "source_only_support": source_only,
+                  "reference_only_support": reference_only}
+        artifacts = []
+        for role, mask in arrays.items():
+            path = directory / (role + ".npy")
+            if path.exists():
+                if not np.array_equal(np.load(path, allow_pickle=False), mask):
+                    raise ValueError("Saved pair support changed")
+            else:
+                np.save(path, mask, allow_pickle=False)
+            artifacts.append(self._artifact(path, role))
+        # Four exclusive categories, on exactly the same pixel grid as the RGB.
+        colors = {"common_support": [40, 190, 70], "source_only_first_observation": [240, 40, 180],
+                  "reference_only": [40, 100, 230], "neither_observed": [0, 0, 0]}
+        visual = np.zeros((*shape, 3), np.uint8)
+        visual[common] = colors["common_support"]
+        visual[source_only] = colors["source_only_first_observation"]
+        visual[reference_only] = colors["reference_only"]
+        preview = directory / "geometric_support_categories.png"
+        if preview.exists():
+            with Image.open(preview) as image:
+                if not np.array_equal(np.asarray(image), visual):
+                    raise ValueError("Saved support visualization changed")
+        else:
+            Image.fromarray(visual).save(preview)
+        artifacts.append(self._artifact(preview, "geometric_support_categories", "image/png"))
+        region = self.store.get_region(self.case["region_id"])
+        record = {"evidence_id": "pair-support-" + digest(identity)[:32], "kind": "measurement",
+                  "method": "pair_geometric_support", "region_id": self.case["region_id"],
+                  "observation_ids": self.current, "available_at": self.case["cutoff"],
+                  "coordinate_system": "region_crop_pixels", "image_shape": list(shape),
+                  "geometry": {"crop_shape": list(shape), "bbox_xyxy": region["bbox_xyxy"],
+                               "anchor_sha256": region["anchor_sha256"]},
+                  "summary": {"visualization": "Categorical geometric support; not RGB, not physical occlusion",
+                      "legend_rgb": colors, "common_pixels": int(common.sum()),
+                      "source_only_pixels": int(source_only.sum()), "reference_only_pixels": int(reference_only.sum()),
+                      "neither_pixels": int((~(supports[0] | supports[1])).sum()),
+                      "decision_scope": "Only common support can establish temporal change or absence of change",
+                      "first_observation_rule": "Source-only pixels have no reference observation; not temporal change",
+                      "localization_rule": "A definitive localized verdict requires full common support in the canonical bbox envelope"},
+                  "artifacts": artifacts}
+        self._remember(record)
+        return record, {"type": "image", "path": str(preview), "evidence_id": record["evidence_id"]}
 
     def execute(self, name, arguments, timeout_seconds=None):
         started = time.monotonic()
@@ -306,8 +401,12 @@ class ToolService:
         if method is not None:
             method = _text(method, "method", 256)
         records, images = [], []
-        for item in sorted(self.method_evidence, key=lambda x: x if isinstance(x, str) else str(x.get("evidence_id", ""))):
-            row = self.store.get_evidence(item) if isinstance(item, str) else dict(item)
+        rows = [self.store.get_evidence(item) if isinstance(item, str) else dict(item)
+                for item in self.method_evidence]
+        # Keep the configured fusion visible even under the fixed-context preview
+        # budget; independent methods retain all of their summaries and artifacts.
+        for row in sorted(rows, key=lambda row: (
+                row.get("method", row.get("parameters", {}).get("method")) != "fusion", str(row.get("evidence_id", "")))):
             if row.get("kind") not in {"prediction", "measurement"}:
                 raise ValueError("Only prediction/measurement evidence is available as maps")
             parameters = row.get("parameters", {})
@@ -330,7 +429,7 @@ class ToolService:
             record = {"evidence_id": row["evidence_id"], "kind": row["kind"], "region_id": row["region_id"],
                       "observation_ids": list(row.get("observation_ids", ())), "method": name,
                       "summary": row.get("summary", ""), "artifacts": artifacts,
-                      "coordinate_system": row.get("coordinate_system", "canonical_crop"),
+                      "coordinate_system": row.get("coordinate_system", "region_crop_pixels"),
                       "available_at": row.get("available_at")}
             for field in ("output_kind", "units", "direction", "semantic_mapping", "status"):
                 if field in row or field in parameters or field in summary:
@@ -338,6 +437,9 @@ class ToolService:
             for field in ("model", "revision"):
                 if field in row:
                     record[field] = row[field]
+            for field in ("source", "source_evidence_ids", "geometry"):
+                if field in row or field in parameters:
+                    record[field] = row.get(field, parameters.get(field))
             self._remember(record)
             records.append(self._public(record))
             for artifact in artifacts:
@@ -347,7 +449,7 @@ class ToolService:
                     images.append({"type": "image", "path": artifact["path"], "evidence_id": record["evidence_id"]})
         return {"status": "ok" if records else "unavailable", "evidence": records, "images": images[:limit],
                 "selected_preview_count": min(limit, len(images)), "total_preview_count": len(images),
-                "selection": "first preview images in sorted evidence-ID order; all method summaries retained", "limit": limit}
+                "selection": "fusion preview first, then evidence-ID order; all method summaries retained", "limit": limit}
 
     def _filters(self):
         observations = [self._observation(identifier) for identifier in self.current]
@@ -384,7 +486,7 @@ class ToolService:
             result = self.search.similar(encoded["vectors"][0], encoded["space"], limit=limit, **filters)
         elif observation_id is not None:
             observation = self._observation(observation_id)
-            candidates = [row for row in self.search.list_embeddings() if row["observation_id"] == observation["observation_id"]]
+            candidates = self.search.list_embeddings(observation_id=observation["observation_id"])
             if self.embedding_role:
                 settings = getattr(self.pool, "models", {}).get(self.embedding_role, {})
                 if self.embedding_role == "jina":
@@ -485,6 +587,7 @@ class ToolService:
                 raise ValueError("Text differs from the bound concept name/aliases")
         signature = digest({"observation": observation["observation_id"], "crop_sha256": observation["crop_sha256"],
                             "geometry": observation["geometry"], "text": text, "concept_id": concept_id,
+                            "available_at": self.case["cutoff"],
                             "model": getattr(self.pool, "models", {}).get("sam3", {}),
                             "tool_implementation_sha256": sha256(__file__)})
         destination = self.out / "sam3" / signature[:24]
@@ -533,20 +636,31 @@ class ToolService:
         Image.fromarray(overlay).save(overlay_path)
         provenance = result.get("provenance", {})
         options = provenance.get("options", {})
+        crop_frame = {"coordinate_system": "region_crop_pixels", "region_id": observation["region_id"]}
+        native_frame = {"coordinate_system": "observation_native", "observation_id": observation["observation_id"]}
+        artifact_coordinates = {"instance_masks": crop_frame, "overlay": crop_frame,
+            "mapped_masks": {"union_crop": crop_frame, "union_observation": native_frame,
+                             "observation_support": native_frame}}
         record = {"evidence_id": "sam3-" + digest({"signature": signature, "provenance": provenance})[:32],
-                  "kind": "prediction", "region_id": self.case["region_id"],
+                  "kind": "prediction", "region_id": observation["region_id"],
+                  "observation_id": observation["observation_id"],
                   "observation_ids": [observation["observation_id"]], "method": "sam3_text_refinement",
                   "status": "empty" if not masks.shape[0] else "ok", "text": text,
                   "available_at": self.case["cutoff"],
                   "concept_id": concept_id, "class_binding": concept_id if concept else None,
                   "summary": "Text-conditioned mask prediction; not temporal change ground truth",
-                  "coordinate_system": "observation_native; source masks also retained on canonical_crop",
+                  "coordinate_system": "region_crop_pixels", "geometry": geometry,
+                  "image_shape": list(rgb.shape[:2]), "artifact_coordinates": artifact_coordinates,
+                  "input_observation": {key: observation.get(key) for key in ("observation_id", "region_id",
+                      "building_id", "view_id", "date", "date_status", "available_at", "original_sha256",
+                      "crop_sha256", "support_sha256", "record_sha256", "source_event_id")},
                   "native_shape": list(native.shape), "model": options.get("model_id", provenance.get("model", "sam3")),
                   "revision": options.get("revision", provenance.get("revision")), "provenance": provenance,
                   "artifacts": [self._artifact(result["masks_path"], "instance_masks"),
                                 self._artifact(mapped, "mapped_masks"), self._artifact(overlay_path, "overlay", "image/png")]}
         if result.get("probabilities_path"):
             record["artifacts"].append(self._artifact(result["probabilities_path"], "probabilities"))
+            record["artifact_coordinates"]["probabilities"] = crop_frame
         self._remember(record)
         return {"status": record["status"], "evidence": [self._public(record)],
                 "images": [{"type": "image", "path": str(overlay_path), "evidence_id": record["evidence_id"]}],

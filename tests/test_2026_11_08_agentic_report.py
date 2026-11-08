@@ -90,6 +90,93 @@ class SavedAgenticReports(unittest.TestCase):
         self.assertEqual(row["localization"]["best_box_iou"], 1.)
         self.assertFalse(list((self.root / "comparison").glob("*.npy")))
 
+    def test_real_pipeline_mask_and_validated_vlm_box_share_one_label_grid(self):
+        """Exercise producer formats; copied mask labels test coordinates, not accuracy."""
+        from facade_change.agentic.acceptance import fixture
+        from facade_change.agentic.config import defaults
+        from facade_change.agentic.pipeline import prepare_case
+        from facade_change.agentic.reasoning import validate_final
+        from facade_change.agentic.retrieval import KnowledgeBase, SearchIndex
+        from facade_change.agentic.store import RegionStore
+        from facade_change.agentic.tools import ToolService
+
+        pair = fixture(self.root / "rgb-fixture")[0]
+        pair.update(case_id="a", building_id="A", view_id="A-front", split="test")
+        config = defaults()
+        config.update(methods=["ssim"], method_options={}, cache_root=str(self.root / "cache"))
+        base = self.run / "cases" / "a"
+        (base / "case.json").unlink()
+        mode = base / "modes" / "pair"
+        with RegionStore(self.root / "store") as store:
+            case = prepare_case(config, pair, base, store)
+            service = ToolService(store, SearchIndex(store), KnowledgeBase(self.root / "knowledge"),
+                                  None, case, mode)
+            exposed = service.base_pair()
+            identifier = next(record["evidence_id"] for record in exposed["evidence"]
+                              if record["kind"] == "observation"
+                              and record["observation_ids"] == [case["source_observation_id"]])
+            box = [140, 110, 150, 120]
+            value = {"type": "final", "decision": "change", "visible_difference": "Fixture patch",
+                     "semantic_interpretation": None, "evidence_ids": [identifier],
+                     "localization": {"evidence_id": identifier, "coordinate_system": "canonical_crop",
+                                      "bbox_xyxy": box}, "limitations": [], "missing_information": []}
+            prediction = validate_final(value, case, set(service.evidence), service.evidence)
+            self.assertEqual(prediction["localization"]["coordinate_system"], "region_crop_pixels")
+            save(mode / "result.json", prediction)
+        with Image.open(case["baseline"]["mask_path"]) as image:
+            np.save(self.root / "coordinate-truth.npy", np.asarray(image) > 0)
+        with Image.open(case["baseline"]["support_path"]) as image:
+            np.save(self.root / "coordinate-support.npy", np.asarray(image) > 0)
+        labels = json.loads((self.root / "labels.json").read_text())
+        labels["cases"][0].update(mask_path="coordinate-truth.npy", support_path="coordinate-support.npy",
+                                   mask_task="temporal_change", coordinate_system="region_crop_pixels",
+                                   boxes_xyxy=[box])
+        # Both label spellings and legacy saved VLM spelling denote the same crop.
+        for index, (label_frame, vlm_frame) in enumerate((
+                ("region_crop_pixels", "region_crop_pixels"),
+                ("canonical_crop", "region_crop_pixels"),
+                ("region_crop_pixels", "canonical_crop"))):
+            labels["cases"][0]["coordinate_system"] = label_frame
+            prediction["localization"]["coordinate_system"] = vlm_frame
+            save(self.root / "labels.json", labels)
+            save(mode / "result.json", prediction)
+            report = self.compare(f"coordinate-comparison-{index}")
+            rows = {row["mode"]: row for row in report["cases"] if row["case_id"] == "a"}
+            self.assertEqual(rows["baseline"]["pixels"]["iou"], 1.)
+            self.assertEqual(rows["pair"]["localization"]["best_box_iou"], 1.)
+            self.assertEqual(rows["pair"]["pixels"]["status"], "not_available")
+            self.assertFalse(list((self.root / f"coordinate-comparison-{index}").glob("*.npy")))
+
+    def test_native_localization_requires_the_same_explicit_image_owner(self):
+        for index, (frame, owner_key) in enumerate((("observation_native", "observation_id"),
+                                                   ("anchor_native", "anchor_sha256"))):
+            owner_a, owner_b = ("a" * 64, "b" * 64) if frame == "anchor_native" else ("native-image-a", "native-image-b")
+            labels = json.loads((self.root / "labels.json").read_text())
+            labels["cases"][0].update(coordinate_system=frame, boxes_xyxy=[[0, 0, 2, 2]])
+            labels["cases"][0][owner_key] = owner_a
+            save(self.root / "labels.json", labels)
+            location = {"coordinate_system": frame, "bbox_xyxy": [0, 0, 2, 2], owner_key: owner_b}
+            for suffix, owner, expected in (("other", owner_b, "coordinate_owner_mismatch"),
+                                             ("missing", None, "coordinate_owner_required"),
+                                             ("same", owner_a, None)):
+                if owner is None:
+                    location.pop(owner_key, None)
+                else:
+                    location[owner_key] = owner
+                self.result("a", "pair", "change", localization=location)
+                report = self.compare(f"native-{index}-{suffix}")
+                row = next(row for row in report["cases"] if row["case_id"] == "a" and row["mode"] == "pair")
+                if expected:
+                    self.assertEqual(row["localization"]["reason"], expected)
+                else:
+                    self.assertEqual(row["localization"]["best_box_iou"], 1.)
+            # Equal numbers on a native image and a region crop are not a transform.
+            location["coordinate_system"] = "region_crop_pixels"
+            self.result("a", "pair", "change", localization=location)
+            row = next(row for row in self.compare(f"native-{index}-crop")["cases"]
+                       if row["case_id"] == "a" and row["mode"] == "pair")
+            self.assertEqual(row["localization"]["reason"], "coordinate_system_mismatch")
+
     def test_pixel_metrics_require_temporal_semantics_and_matching_support(self):
         base = self.run / "cases" / "a"
         np.save(base / "prediction.npy", np.ones((2, 2), bool))

@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 
 from ..io import finish_record, new_directory, read_json, run_record, sha256, write_json
+from .coordinates import coordinate_mismatch, normalize_coordinate_system
 
 
 MODES = ("baseline", "pair", "fixed_context", "agent")
@@ -177,15 +178,16 @@ def box_iou(left, right):
     return float(intersection / union)
 
 
-def _pixel_result(prediction, target, prediction_root, target_root):
+def _pixel_result(prediction, target, prediction_root, target_root, *, region_id=None):
     """Require explicit temporal-mask semantics and the exact coordinate frame."""
     if not target or not target.get("mask_path") or not prediction.get("mask_path"):
         return {"status": "not_available"}
     if prediction.get("mask_task") != "temporal_change" or target.get("mask_task") != "temporal_change":
         return {"status": "not_evaluated", "reason": "mask_is_not_explicit_temporal_change"}
-    frame = prediction.get("coordinate_system")
-    if not frame or frame != target.get("coordinate_system"):
-        return {"status": "not_evaluated", "reason": "coordinate_system_mismatch"}
+    mismatch = coordinate_mismatch(prediction, target, region_id=region_id)
+    if mismatch:
+        return {"status": "not_evaluated", "reason": mismatch}
+    frame = normalize_coordinate_system(prediction["coordinate_system"])
     if not prediction.get("support_path") or not target.get("support_path"):
         return {"status": "not_evaluated", "reason": "explicit_support_required"}
     try:
@@ -271,16 +273,18 @@ def _row(run, case, mode, target, target_root):
     row["costs_incomplete"] = any(bool(node.get("incomplete") or node.get("unobserved_worker_cost"))
                                   for node in _usage_nodes(costs))
     row.update(cost_allocation(actual, mode, costs))
-    row["pixels"] = _pixel_result(prediction, target, prediction_root, target_root)
+    region_id = actual.get("region_id")
+    row["pixels"] = _pixel_result(prediction, target, prediction_root, target_root, region_id=region_id)
     row["classes"] = {}
     for name, expected in (target or {}).get("class_masks", {}).items():
         candidate = prediction.get("class_masks", {}).get(name, {})
-        row["classes"][str(name)] = _pixel_result(candidate, expected, prediction_root, target_root)
+        row["classes"][str(name)] = _pixel_result(candidate, expected, prediction_root, target_root, region_id=region_id)
     location, boxes = prediction.get("localization"), (target or {}).get("boxes_xyxy")
     row["localization"] = {"status": "not_available"}
     if location and boxes:
-        if not location.get("coordinate_system") or location["coordinate_system"] != target.get("coordinate_system"):
-            row["localization"] = {"status": "not_evaluated", "reason": "coordinate_system_mismatch"}
+        mismatch = coordinate_mismatch(location, target, region_id=region_id)
+        if mismatch:
+            row["localization"] = {"status": "not_evaluated", "reason": mismatch}
         elif location.get("bbox_xyxy"):
             row["localization"] = {"status": "evaluated", "best_box_iou": max(box_iou(location["bbox_xyxy"], box) for box in boxes)}
     return row

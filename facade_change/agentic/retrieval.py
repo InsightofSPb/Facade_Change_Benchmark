@@ -188,8 +188,12 @@ class SearchIndex:
             "signature": signature, "space": contract, "vector": vector,
             "dimensions": len(vector)})
 
-    def list_embeddings(self):
+    def list_embeddings(self, *, observation_id=None):
         records = self.store._list("embeddings")
+        if observation_id is not None:
+            # Select metadata before reading any RGB/support artifacts. A
+            # query must not depend on excluded or future observation files.
+            records = [row for row in records if row["observation_id"] == observation_id]
         for record in records:
             self._checked_embedding(record)
         return records
@@ -213,11 +217,14 @@ class SearchIndex:
             for r in self.store.list_observations()), "embeddings": sorted((r["embedding_id"], r["record_sha256"])
             for r in self.list_embeddings()), "implementation_sha256": sha256(__file__)})
 
-    def _eligible(self, cutoff, allowed_splits, exclude_buildings, exclude_observation_ids, exclude_hashes):
+    def _eligible(self, cutoff, allowed_splits, exclude_buildings, exclude_observation_ids, exclude_hashes,
+                  *, candidate_ids=None):
         if temporal_value(cutoff) is None:
             raise ValueError("Retrieval requires a cutoff")
         selected = []
         for row in self.store.list_observations():
+            if candidate_ids is not None and row["observation_id"] not in candidate_ids:
+                continue
             if (row["split"] not in allowed_splits or row["building_id"] in exclude_buildings
                     or row["observation_id"] in exclude_observation_ids
                     or row["original_sha256"] in exclude_hashes or row["crop_sha256"] in exclude_hashes
@@ -242,10 +249,14 @@ class SearchIndex:
             "exclude_buildings": sorted(set(exclude_buildings)),
             "exclude_observation_ids": sorted(set(exclude_observation_ids)),
             "exclude_hashes": sorted(set(exclude_hashes)), "limit": limit}
-        eligible = self._eligible(cutoff, splits, exclude_buildings, exclude_observation_ids, exclude_hashes)
+        # A visual candidate needs a matching representation as well as the
+        # causal/split filters. Select both from metadata before touching RGB.
+        candidates = [r for r in self.store._list("embeddings") if r["space"] == contract]
+        eligible = self._eligible(cutoff, splits, exclude_buildings, exclude_observation_ids, exclude_hashes,
+                                  candidate_ids={r["observation_id"] for r in candidates})
         eligible_ids = {row["observation_id"] for row in eligible}
-        embeddings = {r["observation_id"]: self._checked_embedding(r) for r in self.store._list("embeddings")
-                      if r["space"] == contract and r["observation_id"] in eligible_ids}
+        embeddings = {r["observation_id"]: self._checked_embedding(r) for r in candidates
+                      if r["observation_id"] in eligible_ids}
         version = self._query_version(eligible, embeddings.values())
         key = digest({"op": "visual", "vector": query, "space": contract, "filters": filters, "corpus": version})
         def compute():

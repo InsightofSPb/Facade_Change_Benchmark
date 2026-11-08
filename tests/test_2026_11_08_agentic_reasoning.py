@@ -107,7 +107,7 @@ class ToolReasoningTests(unittest.TestCase):
         result = run_reasoning("pair", case, service, self.pool, out)
         self.assertEqual(result["status"], "completed")
         request = self.pool.requests[0][1]
-        self.assertEqual(len([b for m in request["messages"] for b in m["content"] if b["type"] == "image"]), 2)
+        self.assertEqual(len([b for m in request["messages"] for b in m["content"] if b["type"] == "image"]), 3)
         text = json.dumps(request)
         self.assertNotIn("hidden marker", text)
         self.assertNotIn("future secret", text)
@@ -203,7 +203,7 @@ class ToolReasoningTests(unittest.TestCase):
             run_reasoning("pair", self.case, service, pool, out)
         state = read_json(out / "state.json")
         self.assertEqual(state["phase"], "qwen_pending")
-        self.assertEqual(len(state["image_sha256"]), 2)
+        self.assertEqual(len(state["image_sha256"]), 3)
         with self.assertRaises(ValueError):
             run_reasoning("pair", self.case, service, pool, out, {"max_actions": 3}, resume=True)
         result = run_reasoning("pair", self.case, service, pool, out, resume=True)
