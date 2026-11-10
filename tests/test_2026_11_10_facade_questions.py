@@ -1,0 +1,273 @@
+"""Hand-checkable CPU acceptance for private curation and fixed-cohort QA metrics."""
+import copy
+import importlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+import numpy as np
+
+from facade_change.agentic.reasoning import _public_result
+from facade_change.agentic.retrieval import KnowledgeBase
+from facade_change.agentic.store import reject_forbidden
+from facade_change.io import read_json, sha256, write_json
+
+
+qa = importlib.import_module("facade_change.agentic.2026-11-10_questions")
+evaluation = importlib.import_module("facade_change.agentic.2026-11-10_qa_evaluation")
+demo = importlib.import_module("facade_change.agentic.2026-11-10_qa_demo")
+
+
+class FacadeQuestionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.run = self.root / "demo"
+        demo.demo(self.run)
+        self.questions_path = self.run / "export/questions.json"
+        self.answers_path = self.run / "export/answers.private.json"
+        self.public = read_json(self.questions_path)
+        self.private = read_json(self.answers_path)
+        self.questions = {r["region_id"]: r for r in self.public["questions"]}
+        self.predictions = read_json(self.run / "saved-predictions.json")
+        self.result = read_json(self.run / "evaluation/evaluation.json")
+
+    def metric(self, result=None, k=10, iou=.25):
+        result = self.result if result is None else result
+        return next(r for r in result["pooled"]["localization"] if r["k"] == k and r["iou_threshold"] == iou)
+
+    def evaluate(self, predictions, name="evaluation", questions=None, answers=None):
+        path = self.root / (name + "-predictions.json")
+        write_json(path, predictions)
+        evaluation.evaluate(questions or self.questions_path, answers or self.answers_path, path, self.root / name)
+        return read_json(self.root / name / "evaluation.json")
+
+    def test_hand_checked_counts_deduplicate_events_and_do_not_pad_rankings(self):
+        row = self.metric()
+        self.assertEqual([row[k] for k in ("eligible_events", "matched", "missed", "available_predictions", "unmatched_predictions")],
+                         [4, 1, 3, 4, 3])
+        self.assertEqual((row["region_recall"], row["region_precision"]), (.25, .25))
+        first = self.metric(k=1)
+        self.assertEqual((first["matched"], first["available_predictions"], first["unmatched_predictions"]), (1, 2, 1))
+        self.assertEqual(self.result["buildings"]["b1"]["localization"][3]["eligible_events"], 2)
+        self.assertEqual(len(self.result["buildings"]), 7)
+        for k in (3, 5, 10):
+            self.assertEqual(self.metric(k=k)["available_predictions"], 4)
+
+    def test_earliest_presence_is_not_an_onset_or_temporal_change(self):
+        cases = read_json(self.run / "candidates/candidates.json")["candidates"]
+        earliest = next(r for r in cases if r["candidate_type"] == "earliest_damage")
+        self.assertIn("2009", earliest["provisional_answer"])
+        self.assertIn("неизвестно", earliest["provisional_answer"])
+        label = next(r["reviewed_labels"] for r in self.private["cases"] if r["question_id"] == earliest["question_id"])
+        self.assertEqual((label["present_by"], label["onset"], label["events"]), ("2009", "unknown", []))
+        self.assertEqual(self.result["pooled"]["coverage"]["earliest_evidence_correct"], 1)
+        self.assertNotIn(earliest["question_id"], [r["question_id"] for e in self.result["pooled"]["events"] for r in e["representations"]])
+        wrong = copy.deepcopy(self.predictions)
+        next(r for r in wrong["cases"] if r["question_id"] == earliest["question_id"])["decision"] = "no_change"
+        self.assertEqual(self.evaluate(wrong)["pooled"]["coverage"]["earliest_evidence_correct"], 0)
+
+    def test_observability_is_separate_from_underlying_state_errors_and_missing(self):
+        counts = self.result["pooled"]["coverage"]
+        self.assertEqual((counts["missing"], counts["technical_errors"], counts["justified_abstentions"],
+                          counts["unsupported_confident_decisions"], counts["false_alarm_cases"]), (2, 1, 1, 1, 1))
+        self.assertEqual(counts["false_alarm_rate"], 1.)
+        hidden = next(r["reviewed_labels"] for r in self.private["cases"]
+                      if r["question_id"] == self.questions["occluded"]["question_id"])
+        self.assertEqual(hidden["underlying_state"]["assessment"], "confirmed_change")
+        self.assertEqual(hidden["events"], [])
+        changed = copy.deepcopy(self.predictions)
+        row = next(r for r in changed["cases"] if r["question_id"] == self.questions["occluded"]["question_id"])
+        row.update(status="error", decision="insufficient_data", error="worker failed")
+        result = self.evaluate(changed)
+        self.assertEqual(result["pooled"]["coverage"]["justified_abstentions"], 0)
+        self.assertEqual(result["pooled"]["coverage"]["technical_errors"], 2)
+        self.assertEqual(self.metric(result)["eligible_events"], 4)
+
+    def test_mask_area_uses_fixed_reference_and_never_box_area(self):
+        row = self.metric()
+        one, five = row["area_subsets"]
+        self.assertEqual((one["minimum_fraction"], one["eligible_events"], one["matched"]), (.01, 3, 1))
+        self.assertEqual((five["minimum_fraction"], five["eligible_events"], five["matched"]), (.05, 1, 1))
+        self.assertEqual(self.result["pooled"]["area_availability"], {"available": 3, "unavailable_box_only": 1})
+        events = {r["event_id"]: r for r in self.result["pooled"]["events"]}
+        self.assertEqual(events["e1"]["mask_area"]["reference_pixels"], 100)
+        self.assertEqual(events["e1"]["mask_area"]["shape"], [10, 10])
+        self.assertIsNone(events["e3"]["mask_area"])
+        self.assertEqual(row["eligible_events"], 4)
+
+    def test_no_private_fields_or_archival_photo_reach_public_manifest_or_online_evidence(self):
+        text = self.questions_path.read_text()
+        for value in ("provisional_answer", "reference_answer", "private_notes", "generation_reasons",
+                      "annotation_evidence", "underlying_state", "private-underlying-state", "fixture-private-archive"):
+            self.assertNotIn(value, text)
+        qa.validate_public(self.public)
+        with self.assertRaises(ValueError):
+            reject_forbidden({"provenance": self.private})
+        with self.assertRaises(ValueError):
+            _public_result({"status": "ok", "evidence": [self.private]})
+        with self.assertRaises(ValueError):
+            _public_result({"status": "ok", "limitations": [json.dumps({"reference_answer": "private answer"})]})
+        knowledge = KnowledgeBase(self.root / "knowledge")
+        with self.assertRaises(ValueError):
+            knowledge.import_document({"document_id": "leak", "available_at": "2026", "concepts": [], "relations": [],
+                "source": {"kind": "user_document", "title": "Forbidden fixture", "locator": "fixture"},
+                "fragments": [{"fragment_id": "f", "text": json.dumps(self.private)}]})
+        dirty = copy.deepcopy(self.public)
+        dirty["questions"][0]["observations"][0]["geometry"]["private_payload"] = "not allowed"
+        with self.assertRaises(ValueError):
+            qa.validate_public(dirty)
+
+    def test_review_revisions_do_not_overwrite_candidates_and_only_approved_export(self):
+        candidates = self.run / "candidates/candidates.json"
+        previous = self.run / "review/reviewed.json"
+        original = (sha256(candidates), sha256(previous))
+        identifier = self.questions["stable"]["question_id"]
+        decisions = self.root / "decisions.json"
+        write_json(decisions, {"candidate_sha256": sha256(candidates), "decisions": [
+            {"question_id": identifier, "expected_revision": 1, "status": "rejected", "reviewer": "fixture-reviewer-2",
+             "private_notes": "Synthetic correction"}]})
+        qa.review(candidates, decisions, self.root / "revision", previous)
+        revised = read_json(self.root / "revision/reviewed.json")
+        self.assertEqual(revised["states"][identifier]["revision"], 2)
+        self.assertEqual(revised["history"], [{"path": str(previous), "sha256": original[1]}])
+        qa.export(self.root / "revision/reviewed.json", self.root / "export-2")
+        self.assertNotIn(identifier, [r["question_id"] for r in read_json(self.root / "export-2/questions.json")["questions"]])
+        self.assertEqual(original, (sha256(candidates), sha256(previous)))
+        with self.assertRaisesRegex(ValueError, "Stale"):
+            qa.review(candidates, decisions, self.root / "stale", self.root / "revision/reviewed.json")
+
+    def test_coordinate_mismatch_and_duplicate_overlap_predictions_cannot_add_hits(self):
+        wrong = copy.deepcopy(self.predictions)
+        row = next(r for r in wrong["cases"] if r["question_id"] == self.questions["change"]["question_id"])
+        for prediction in row["regions"]:
+            prediction.update(coordinate_system="observation_native", observation_id="change-2015")
+        result = self.evaluate(wrong, "wrong-frame")
+        self.assertEqual((self.metric(result)["matched"], self.metric(result)["missed"]), (0, 4))
+        self.assertEqual(result["pooled"]["coverage"]["coordinate_issue_predictions"], 3)
+        repeated = copy.deepcopy(self.predictions)
+        repeated["cases"].append({"question_id": self.questions["overlap"]["question_id"], "status": "completed", "decision": "change",
+            "regions": [{"prediction_id": "overlapping-crop-duplicate", "rank": 1, "coordinate_system": "region_crop_pixels",
+                         "region_id": "overlap", "bbox_xyxy": [1, 1, 4, 4]}]})
+        result = self.evaluate(repeated, "duplicate")
+        self.assertEqual((self.metric(result)["eligible_events"], self.metric(result)["matched"], self.metric(result)["unmatched_predictions"]), (4, 1, 4))
+
+    def test_single_saved_agentic_box_is_one_prediction_at_every_k(self):
+        case = self.questions["change"]
+        path = self.root / "result.json"
+        write_json(path, {"status": "completed", "decision": "change", "localization": {
+            "coordinate_system": "region_crop_pixels", "region_id": "change", "bbox_xyxy": [3, 1, 6, 4],
+            "kind": "vlm_bbox_hypothesis", "evidence_id": "saved-fixture-evidence"}})
+        document = {"kind": "facade_qa_predictions", "model_manifest_sha256": sha256(self.questions_path),
+            "ranking_source": {"kind": "single_box", "source": "existing saved agentic result.json"},
+            "cases": [{"question_id": case["question_id"], "result_path": str(path), "result_sha256": sha256(path)}]}
+        result = self.evaluate(document)
+        for row in result["pooled"]["localization"]:
+            self.assertEqual((row["available_predictions"], row["matched"], row["missed"]), (1, 1, 3))
+
+    def test_matching_is_one_to_one_maximum_cardinality_and_broad_box_is_not_a_hit(self):
+        frame = {"coordinate_system": "region_crop_pixels", "region_id": "r", "question_id": "q"}
+        events = {"a": {"representations": [{**frame, "bbox_xyxy": [0, 0, 2, 2]}]},
+                  "b": {"representations": [{**frame, "bbox_xyxy": [1, 0, 3, 2]}]}}
+        broad = [{**frame, "prediction_id": "broad", "bbox_xyxy": [0, 0, 10, 10]}]
+        self.assertEqual(evaluation.match_one_to_one(broad, events, .25), [])
+        one = [{**frame, "prediction_id": "one", "bbox_xyxy": [0, 0, 3, 2]}]
+        self.assertEqual(len(evaluation.match_one_to_one(one, events, .5)), 1)
+        two = [*one, {**frame, "prediction_id": "two", "bbox_xyxy": [0, 0, 2, 2]}]
+        matched = evaluation.match_one_to_one(two, events, .5)
+        self.assertEqual(len(matched), 2)
+        self.assertEqual(matched, evaluation.match_one_to_one(two, events, .5))
+
+    def test_pixel_scores_require_actual_compatible_temporal_masks(self):
+        document = copy.deepcopy(self.predictions)
+        row = next(r for r in document["cases"] if r["question_id"] == self.questions["change"]["question_id"])
+        event = next(r["reviewed_labels"]["events"][0] for r in self.private["cases"] if r["question_id"] == row["question_id"])
+        row["regions"][0].update({key: event[key] for key in ("mask_path", "mask_sha256", "mask_task", "support_path", "support_sha256")})
+        result = self.evaluate(document, "masks")
+        self.assertEqual(self.metric(result)["matches"][0]["pixels"]["status"], "evaluated")
+        self.assertEqual(self.metric(result)["matches"][0]["pixels"]["iou"], 1.)
+        row["regions"][0]["mask_task"] = "semantic_damage"
+        result = self.evaluate(document, "semantic-mask")
+        self.assertEqual(self.metric(result)["matches"][0]["pixels"]["reason"], "mask_is_not_explicit_temporal_change")
+        self.assertEqual(self.metric()["matches"][0]["pixels"]["status"], "not_available")
+
+    def test_unknown_visibility_and_missing_annotations_do_not_create_stability_gt(self):
+        cases = read_json(self.run / "candidates/candidates.json")["candidates"]
+        self.assertTrue(all(r["observability"] == "unknown" and r["status"] == "candidate" for r in cases))
+        uncertain = next(r for r in cases if r["region_id"] == "occluded")
+        self.assertEqual(uncertain["candidate_type"], "uncertain_control")
+        stable = next(r for r in cases if r["region_id"] == "stable")
+        self.assertIn("do_not_prove_stability", stable["generation_reasons"][0])
+        bad = {"assessment": "confirmed_change", "observability": "occluded", "reference_answer": "Hidden truth", "events": []}
+        with self.assertRaisesRegex(ValueError, "underlying_state"):
+            qa._checked_label(uncertain, bad, qa.Fingerprints())
+        case = next(r for r in cases if r["region_id"] == "change")
+        for box in ([1, 1, 1, 1], [False, 1, 2, 3], ["1", 1, 2, 3], [-1, 0, 2, 2]):
+            label = {"assessment": "confirmed_change", "observability": "visible", "reference_answer": "Visible change",
+                     "events": [{"event_id": "bad-box", "coordinate_system": "region_crop_pixels",
+                                 "region_id": "change", "bbox_xyxy": box}]}
+            with self.assertRaises(ValueError):
+                qa._checked_label(case, label, qa.Fingerprints())
+
+    def test_knowledge_availability_is_separate_from_task_dates(self):
+        case = self.questions["change"]
+        self.assertEqual((case["task_dates"], case["knowledge_cutoff"], case["task_mode"]), (["2009", "2015"], "2026", "retrospective"))
+        inputs = self.run / "fixture"
+        qa.generate(inputs / "histories", self.root / "as-of", annotation_targets=inputs / "annotation-targets/index.json",
+                    knowledge_cutoff="2009", task_mode="as_of", available_at="observation_date")
+        earlier = read_json(self.root / "as-of/candidates.json")["candidates"]
+        self.assertTrue(earlier)
+        self.assertTrue(all(o["date"] == "2009" for c in earlier for o in c["observations"]))
+        qa.generate(inputs / "histories", self.root / "not-yet-archived", annotation_targets=inputs / "annotation-targets/index.json",
+                    knowledge_cutoff="2009", task_mode="as_of", available_at="2026")
+        self.assertEqual(read_json(self.root / "not-yet-archived/candidates.json")["candidates"], [])
+
+    def test_spatial_expansion_with_identical_present_classes_is_a_change_candidate(self):
+        histories, annotation_path, _ = demo.fixture(self.root / "expansion-fixture")
+        index = read_json(annotation_path)
+        for year, stop in ((2009, 3), (2015, 5)):
+            mapping = index["observations"][f"stable-{year}"]
+            artifact = annotation_path.parent / mapping["artifact_path"]
+            packed = np.ones((10, 10), np.uint16)
+            packed[1:stop, 1:stop] |= 2
+            np.savez_compressed(artifact, packed=packed, support=np.ones((10, 10), bool))
+            mapping["artifact_sha256"] = sha256(artifact)
+        write_json(annotation_path, index)
+        write_json(annotation_path.parent / "run.json", {"status": "completed", "synthetic_fixture": True,
+                                                         "artifact_sha256": {"index.json": sha256(annotation_path)}})
+        qa.generate(histories, self.root / "expansion-candidates", annotation_targets=annotation_path,
+                    knowledge_cutoff="2026", task_mode="retrospective", available_at="observation_date")
+        case = next(r for r in read_json(self.root / "expansion-candidates/candidates.json")["candidates"]
+                    if r["region_id"] == "stable" and r["task"] == "temporal_change")
+        classes = [r["categories_present"] for r in case["annotation_evidence"].values()]
+        self.assertEqual(classes[0], classes[1])
+        self.assertEqual(case["candidate_type"], "possible_change")
+        self.assertEqual(case["status"], "candidate")
+
+    def test_ranking_cannot_be_selected_from_gt_and_cohort_mismatch_is_rejected(self):
+        document = copy.deepcopy(self.predictions)
+        document["ranking_source"]["kind"] = "gt_iou"
+        with self.assertRaisesRegex(ValueError, "ranking"):
+            self.evaluate(document)
+        document = copy.deepcopy(self.predictions)
+        document["model_manifest_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "identical fixed"):
+            self.evaluate(document, "different-cohort")
+
+    def test_empty_positive_cohort_has_undefined_recall_and_retains_missing_case(self):
+        identifier = self.questions["stable"]["question_id"]
+        public = {**self.public, "questions": [self.questions["stable"]]}
+        questions = self.root / "stable-only.json"
+        write_json(questions, public)
+        private = {**self.private, "model_manifest_sha256": sha256(questions),
+                   "cases": [r for r in self.private["cases"] if r["question_id"] == identifier]}
+        answers = self.root / "stable-only.private.json"
+        write_json(answers, private)
+        document = {**self.predictions, "model_manifest_sha256": sha256(questions), "cases": []}
+        result = self.evaluate(document, questions=questions, answers=answers)
+        self.assertEqual(result["pooled"]["coverage"]["cohort_cases"], 1)
+        self.assertEqual(result["pooled"]["coverage"]["missing"], 1)
+        self.assertIsNone(self.metric(result)["region_recall"])
+        self.assertTrue(all(r["region_recall"] is None for r in self.metric(result)["area_subsets"]))

@@ -17,6 +17,7 @@ import numpy as np
 
 from ..io import read_json, sha256, write_json
 from .coordinates import REGION_CROP, normalize_coordinate_system
+from .store import reject_forbidden
 from .tools import TOOL_SCHEMAS, digest
 
 
@@ -310,7 +311,9 @@ def _public_result(result):
     allowed = ("status", "error", "reason", "evidence", "comparability", "limitations", "matches",
                "concepts", "related", "total_available", "selected_count", "selection", "limit",
                "corpus_version", "scores", "boxes", "selected_preview_count", "total_preview_count")
-    return _prompt_context({key: result[key] for key in allowed if key in result})
+    public = {key: result[key] for key in allowed if key in result}
+    reject_forbidden(public)
+    return _prompt_context(public)
 
 
 def _content(result, prefix, case):
@@ -371,6 +374,7 @@ def run_reasoning(mode, case, tools, model_pool, out, budgets=None, event=None, 
         raise ValueError("Unknown Qwen mode")
     config = validate_budgets(budgets)
     case = {key: case[key] for key in CASE_FIELDS if key in case}
+    reject_forbidden(case)
     required = {"case_id", "region_id", "cutoff", "reference_observation_id", "source_observation_id"}
     if not required.issubset(case):
         raise ValueError("Missing case identity")

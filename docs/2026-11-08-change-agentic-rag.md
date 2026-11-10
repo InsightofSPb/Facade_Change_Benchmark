@@ -4,6 +4,9 @@
 `codex/2026-10-24-main-workflow`, исходный commit
 `b2d3acebfc27eabba3955f2366ee0c8e2c9e1689`.
 
+Подготовка вопросов, приватных reviewed labels и оценка локализации/наблюдаемости:
+[дополнение от 2026-11-10](2026-11-10-facade-questions.md), команда `agentic qa`.
+
 ## Что запускается
 
 `python -m facade_change.agentic` принимает новую пару RGB без GT либо ID изображений
