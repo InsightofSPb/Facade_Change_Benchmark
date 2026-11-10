@@ -12,9 +12,9 @@ from ..history_features import Fingerprints
 from ..io import read_json, sha256, write_json
 from ..visualization import write_static_gallery
 from .coordinates import coordinate_mismatch
-from .evaluation import _csv, _pixel_result, _verify_recorded_artifacts, box_iou
+from .evaluation import _binary, _csv, _pixel_result, _verify_recorded_artifacts, box_iou
 from .runner import complete_run, new_run
-from .store import reject_forbidden
+from .store import PrivateEvidenceError, reject_forbidden
 
 
 K_VALUES = (1, 3, 5, 10)
@@ -30,86 +30,125 @@ def _file(path, fingerprints, expected=None):
     return read_json(path)
 
 
+def _ranking(ranking):
+    if (not isinstance(ranking, dict) or not isinstance(ranking.get("kind"), str)
+            or ranking["kind"] not in {"single_box", "saved_rank", "score_descending"}
+            or not isinstance(ranking.get("source"), str) or not ranking["source"].strip()):
+        raise ValueError("Document a saved, non-GT ranking source (single_box/saved_rank/score_descending)")
+    return ranking
+
+
+def _prediction_case(row, case, root, fingerprints, ranking):
+    """Only this case's data is parsed here; cohort/ranking/GT checks stay outside."""
+    identifier = row["question_id"]
+    reject_forbidden(row)
+    if "result_path" in row:
+        path = Path(row["result_path"]).expanduser()
+        path = (path if path.is_absolute() else root / path).resolve()
+        row["result_path"] = str(path)
+        saved = _file(path, fingerprints, row.get("result_sha256"))
+        reject_forbidden(saved, private_only=True)
+        reject_forbidden(saved)
+        if not isinstance(saved, dict):
+            raise ValueError("Saved result must be a JSON object")
+        if "regions" in saved and not isinstance(saved["regions"], list):
+            raise ValueError("Saved regions must be a ranked list")
+        row.update({k: saved.get(k) for k in ("status", "decision", "error", "earliest_observation_id")})
+        location = saved.get("localization")
+        if location is not None and not isinstance(location, dict):
+            raise ValueError("Saved localization must be an object or null")
+        row["regions"] = ([{**location, "prediction_id": identifier + ":single", "rank": 1}]
+                          if location is not None and saved.get("decision") == "change" else [])
+    status, decision = row.get("status"), row.get("decision")
+    regions = row.get("regions", [])
+    if not isinstance(regions, list):
+        raise ValueError("Saved regions must be a ranked list")
+    if ranking["kind"] == "single_box" and len(regions) > 1:
+        raise ValueError("Do not manufacture a multi-region ranking from one VLM box")
+    if status not in {"completed", "abstained", "error", "failed", "missing"}:
+        raise ValueError("Unknown prediction status")
+    if ((status == "abstained" and (decision not in {"insufficient_data", "incomparable"} or regions))
+            or (status == "completed" and decision not in {"change", "no_change", "earliest_presence"})
+            or (status == "completed" and regions and decision != "change")):
+        raise ValueError("Inconsistent status/decision/regions")
+    row.update(status=status, ranking_source=ranking, regions=[], supplied_prediction_count=len(regions))
+    if status != "completed":
+        return row
+    ids, ranks = set(), set()
+    for prediction in regions:
+        if not isinstance(prediction, dict):
+            raise ValueError("Each saved region must be an object")
+        prediction = copy.deepcopy(prediction)
+        name = prediction.get("prediction_id", identifier + ":single" if ranking["kind"] == "single_box" else None)
+        if not isinstance(name, str) or not name or name in ids:
+            raise ValueError("Predictions require unique saved IDs")
+        ids.add(name)
+        if ranking["kind"] == "score_descending":
+            score = prediction.get("score")
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+                raise ValueError("Saved prediction score must be finite")
+        else:
+            rank = 1 if ranking["kind"] == "single_box" else prediction.get("rank")
+            if type(rank) is not int or rank < 1 or rank in ranks:
+                raise ValueError("Saved model ranks must be distinct positive integers")
+            ranks.add(rank)
+            prediction["rank"] = rank
+        prediction.update(prediction_id=name, question_id=identifier)
+        prediction["coordinate_issue"] = coordinate_mismatch(prediction, case["frame"], region_id=case["region_id"])
+        try:
+            bbox = prediction.get("bbox_xyxy")
+            if any(isinstance(v, bool) for v in bbox):
+                raise ValueError("Boolean bbox coordinate")
+            box_iou(bbox, bbox)
+            if not prediction["coordinate_issue"]:
+                height, width = case["frame"]["shape"]
+                if bbox[0] < 0 or bbox[1] < 0 or bbox[2] > width or bbox[3] > height:
+                    raise ValueError("Prediction box exceeds its coordinate grid")
+        except (ValueError, TypeError) as exc:
+            prediction["coordinate_issue"] = "invalid_box: " + str(exc)
+        prediction.pop("pixel_diagnostic", None)
+        for key in ("mask", "support"):
+            if prediction.get(key + "_path"):
+                try:
+                    path = Path(prediction[key + "_path"]).expanduser()
+                    path = (path if path.is_absolute() else root / path).resolve()
+                    prediction[key + "_path"] = str(path)
+                    fingerprints.add(path, prediction.get(key + "_sha256"))
+                    if _binary(path.parent, str(path)).shape != tuple(case["frame"]["shape"]):
+                        raise ValueError("Prediction pixel artifact does not share the question grid")
+                except (OSError, ValueError, TypeError, EOFError) as exc:
+                    prediction["pixel_diagnostic"] = {"status": "error", "reason": "prediction_pixel_artifact_error",
+                        "artifact": key, "path": prediction[key + "_path"], "error": str(exc)}
+        row["regions"].append(prediction)
+    key = (lambda p: (-p["score"], p["prediction_id"])) if ranking["kind"] == "score_descending" else (lambda p: (p["rank"], p["prediction_id"]))
+    row["regions"].sort(key=key)
+    return row
+
+
 def _predictions(document, questions, root, fingerprints):
-    if document.get("kind") != "facade_qa_predictions":
-        raise ValueError("Expected a saved facade_qa_predictions manifest")
-    reject_forbidden(document)
+    if document.get("kind") != "facade_qa_predictions" or not isinstance(document.get("cases"), list):
+        raise ValueError("Expected a saved facade_qa_predictions manifest with a cases list")
+    reject_forbidden(document, private_only=True)
+    reject_forbidden({key: value for key, value in document.items() if key != "cases"})
+    if "ranking_source" in document:
+        _ranking(document["ranking_source"])
     cases = {}
     for supplied in document["cases"]:
-        identifier = supplied["question_id"]
-        if identifier not in questions or identifier in cases:
+        identifier = supplied.get("question_id") if isinstance(supplied, dict) else None
+        if not isinstance(identifier, str) or identifier not in questions or identifier in cases:
             raise ValueError("Prediction cohort has unknown/duplicate question IDs")
         row = copy.deepcopy(supplied)
-        ranking = row.get("ranking_source", document.get("ranking_source"))
-        if not isinstance(ranking, dict) or ranking.get("kind") not in {"single_box", "saved_rank", "score_descending"} or not ranking.get("source"):
-            raise ValueError("Document a saved, non-GT ranking source (single_box/saved_rank/score_descending)")
-        if row.get("result_path"):
-            path = Path(row["result_path"])
-            path = path if path.is_absolute() else root / path
-            saved = _file(path, fingerprints, row.get("result_sha256"))
-            if ranking["kind"] != "single_box":
-                raise ValueError("Existing agentic result.json supplies at most one box")
-            row.update({k: saved[k] for k in ("status", "decision", "error", "earliest_observation_id") if k in saved})
-            location = saved.get("localization")
-            row["regions"] = ([{**location, "prediction_id": identifier + ":single", "rank": 1}]
-                              if location and location.get("bbox_xyxy") and saved.get("decision") == "change" else [])
-        status, decision = row.get("status"), row.get("decision")
-        regions = row.get("regions", [])
-        if not isinstance(regions, list):
-            raise ValueError("Saved regions must be a ranked list")
-        if ranking["kind"] == "single_box" and len(regions) > 1:
-            raise ValueError("Do not manufacture a multi-region ranking from one VLM box")
-        if status not in {"completed", "abstained", "error", "failed", "missing"}:
-            status, row["error"] = "error", "unknown_prediction_status"
-        if ((status == "abstained" and (decision not in {"insufficient_data", "incomparable"} or regions))
-                or (status == "completed" and decision not in {"change", "no_change", "earliest_presence"})
-                or (status == "completed" and regions and decision != "change")):
-            status, row["error"] = "error", "inconsistent_status_decision_or_regions"
-        row.update(status=status, ranking_source=ranking, regions=[], supplied_prediction_count=len(regions))
-        if status != "completed":
-            cases[identifier] = row
-            continue
-        ids, ranks = set(), set()
-        for index, prediction in enumerate(regions):
-            prediction = copy.deepcopy(prediction)
-            name = prediction.get("prediction_id", identifier + ":single" if ranking["kind"] == "single_box" else None)
-            if not isinstance(name, str) or not name or name in ids:
-                raise ValueError("Predictions require unique saved IDs")
-            ids.add(name)
-            if ranking["kind"] == "score_descending":
-                score = prediction.get("score")
-                if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
-                    raise ValueError("Saved prediction score must be finite")
-            else:
-                rank = 1 if ranking["kind"] == "single_box" else prediction.get("rank")
-                if type(rank) is not int or rank < 1 or rank in ranks:
-                    raise ValueError("Saved model ranks must be distinct positive integers")
-                ranks.add(rank)
-                prediction["rank"] = rank
-            prediction.update(prediction_id=name, question_id=identifier)
-            prediction["coordinate_issue"] = coordinate_mismatch(prediction, questions[identifier]["frame"],
-                                                                   region_id=questions[identifier]["region_id"])
-            try:
-                bbox = prediction.get("bbox_xyxy")
-                if any(isinstance(v, bool) for v in bbox):
-                    raise ValueError("Boolean bbox coordinate")
-                box_iou(bbox, bbox)
-                if not prediction["coordinate_issue"]:
-                    height, width = questions[identifier]["frame"]["shape"]
-                    if bbox[0] < 0 or bbox[1] < 0 or bbox[2] > width or bbox[3] > height:
-                        raise ValueError("Prediction box exceeds its coordinate grid")
-            except (ValueError, TypeError) as exc:
-                prediction["coordinate_issue"] = "invalid_box: " + str(exc)
-            for key in ("mask", "support"):
-                if prediction.get(key + "_path"):
-                    path = Path(prediction[key + "_path"])
-                    path = (path if path.is_absolute() else root / path).resolve()
-                    fingerprints.add(path, prediction.get(key + "_sha256"))
-                    prediction[key + "_path"] = str(path)
-            row["regions"].append(prediction)
-        key = (lambda p: (-p["score"], p["prediction_id"])) if ranking["kind"] == "score_descending" else (lambda p: (p["rank"], p["prediction_id"]))
-        row["regions"].sort(key=key)
-        cases[identifier] = row
+        ranking = _ranking(row.get("ranking_source", document.get("ranking_source")))
+        if "result_path" in row and ranking["kind"] != "single_box":
+            raise ValueError("Existing agentic result.json supplies at most one box")
+        try:
+            cases[identifier] = _prediction_case(row, questions[identifier], root, fingerprints, ranking)
+        except PrivateEvidenceError:
+            raise  # Never downgrade label leakage to a per-case technical failure.
+        except (OSError, ValueError, TypeError) as exc:
+            cases[identifier] = {"question_id": identifier, "status": "missing" if isinstance(exc, FileNotFoundError) else "error",
+                "decision": None, "regions": [], "supplied_prediction_count": 0, "ranking_source": ranking,
+                "error": f"{identifier} ({row.get('result_path', 'inline result')}): {type(exc).__name__}: {exc}"}
     for identifier in questions:
         cases.setdefault(identifier, {"question_id": identifier, "status": "missing", "decision": None,
                                       "regions": [], "supplied_prediction_count": 0, "ranking_source": None})
@@ -185,8 +224,9 @@ def match_one_to_one(predictions, events, threshold):
         overlap, truth = representations[index, name]
         matches.append({"event_id": name, "question_id": predictions[index]["question_id"],
                         "prediction_id": predictions[index]["prediction_id"], "iou": overlap,
-                        "pixels": _pixel_result(predictions[index], truth, Path("/"), Path("/"),
-                                                 region_id=truth.get("region_id"))})
+                        "pixels": predictions[index].get("pixel_diagnostic") or _pixel_result(
+                            predictions[index], truth, Path("/"), Path("/"),
+                            region_id=truth.get("region_id"), support_policy="fixed_target")})
     return matches
 
 
@@ -204,6 +244,8 @@ def _aggregate(questions, labels, predictions, thresholds):
             "coordinate_issues": sum(bool(p.get("coordinate_issue")) for p in prediction["regions"]),
             "coordinate_diagnostics": [{"prediction_id": p["prediction_id"], "reason": p["coordinate_issue"]}
                                        for p in prediction["regions"] if p.get("coordinate_issue")],
+            "pixel_diagnostics": [{"prediction_id": p["prediction_id"], **p["pixel_diagnostic"]}
+                                  for p in prediction["regions"] if p.get("pixel_diagnostic")],
             "false_alarm": assessment == "confirmed_stability" and status == "completed" and prediction.get("decision") == "change",
             "justified_abstention": assessment == "insufficient_evidence" and status == "abstained",
             "unsupported_confident_decision": assessment == "insufficient_evidence" and status == "completed",
@@ -267,16 +309,26 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
     if private.get("kind") != "facade_qa_answers" or private.get("access") != qa.PRIVATE:
         raise ValueError("Only approved private QA answers can be scored")
     review_source = private["review_source"]
-    _file(review_source["path"], fingerprints, review_source["sha256"])
+    _verify_recorded_artifacts(Path(review_source["path"]).resolve().parent, fingerprints.files)
+    reviewed = _file(review_source["path"], fingerprints, review_source["sha256"])
     if private.get("model_manifest_sha256") != model_sha or saved.get("model_manifest_sha256") != model_sha:
         raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
     questions = {r["question_id"]: r for r in public["questions"]}
     if len(private["cases"]) != len(questions) or {r["question_id"] for r in private["cases"]} != set(questions):
         raise ValueError("Private answers must cover the exact approved cohort once")
+    fingerprints.add(reviewed["candidates_path"], reviewed["candidate_sha256"])
+    candidates = {r["question_id"]: r for r in qa._load_candidates(reviewed["candidates_path"], fingerprints)["candidates"]}
     labels = {}
     for row in private["cases"]:
         if row["review"].get("status") != "approved" or not row["review"].get("reviewer"):
             raise ValueError("Unapproved cases cannot enter scored evaluation")
+        if row["review"] != reviewed["states"].get(row["question_id"]):
+            raise ValueError("Private labels disagree with the immutable review source")
+        original = candidates[row["question_id"]]
+        expected = {**{key: original[key] for key in qa.PUBLIC_KEYS},
+                    "question": row["review"].get("reviewed_question", original["question"])}
+        if questions[row["question_id"]] != expected:
+            raise ValueError("Public question disagrees with its reviewed wording/coordinate provenance")
         label = row["reviewed_labels"]
         if label != row["review"]["label"]:
             raise ValueError("Private labels disagree with the approved review revision")
@@ -284,6 +336,10 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
             for key in ("mask", "support"):
                 if event.get(key + "_path"):
                     fingerprints.add(event[key + "_path"], event[key + "_sha256"])
+        # Reuse curation validation: the domain is the immutable earlier reference,
+        # with checked ownership, grid, support hash and fixed mask-area denominator.
+        if qa._checked_label(original, label, fingerprints) != label:
+            raise ValueError("Reviewed labels disagree with their fixed reference support/mask provenance")
         labels[row["question_id"]] = label
     predictions = _predictions(saved, questions, Path(predictions_path).resolve().parent, fingerprints)
     protocol = {"k": list(K_VALUES), "iou_thresholds": list(thresholds), "matching": "deterministic_maximum_cardinality_one_to_one",
@@ -291,6 +347,7 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
         "event_deduplication": "reviewed physical event_id shared across overlapping crops, within building and temporal interval",
         "threshold_status": "0.25 is an initial coarse-localization choice; 0.5 stricter diagnostic, neither universally validated",
         "area_denominator": "fixed earlier reference geometric support; never reduced using later visibility",
+        "pixel_support_policy": "fixed reviewed reference domain; prediction must cover every required pixel",
         "empty_positive_cohort": "recall undefined", "statistical_unit": "building", "protocol": qa.PROTOCOL}
     journal = new_run(out, {"model_manifest_sha256": model_sha, "inputs": fingerprints.files, **protocol}, "facade_qa_offline_evaluation")
     try:
@@ -314,6 +371,8 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
             {key: row[key] for key in ("eligible_events", "matched", "missed", "available_predictions", "unmatched_predictions", "region_recall", "region_precision", "area_subsets")}, ensure_ascii=False), "panels": []}
             for row in pooled["localization"]]
         sections += [{"title": "Здание " + name, "caption": json.dumps(value["coverage"], ensure_ascii=False), "panels": []} for name, value in buildings.items()]
+        sections += [{"title": row["question_id"], "caption": json.dumps(row, ensure_ascii=False), "panels": []}
+                     for row in pooled["cases"] if row["error"] or row["coordinate_diagnostics"] or row["pixel_diagnostics"]]
         write_static_gallery(journal.out, "PRIVATE — офлайн-оценка фасадных вопросов", sections, notes=[
             "Оценка supplied-region QA не является автоматическим поиском изменений на всём фасаде.",
             "Размер изменения определяется только проверенной временной маской, не площадью bbox.",

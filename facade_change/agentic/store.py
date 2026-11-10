@@ -29,7 +29,7 @@ FORBIDDEN = {"gt", "ground_truth", "groundtruth", "annotations", "annotation",
              "packed", "labels", "targets", "target_mask", "gt_mask", "gt_path",
              "provisional_answer", "reference_answer", "generation_reasons", "private_notes",
              "reviewed_labels", "underlying_state", "annotation_evidence", "annotation_previews",
-             "candidate_type", "supporting_evidence_ids"}
+             "candidate_type", "supporting_evidence_ids", "reviewed_question"}
 GEOMETRY_FIELDS = {"source_to_crop", "crop_to_source", "source_to_reference",
     "reference_to_crop", "native_shape", "crop_shape", "bbox_xyxy", "bbox_xywh",
     "coordinate_system", "source_to_anchor", "crop_to_anchor", "anchor_to_crop",
@@ -48,26 +48,30 @@ EVIDENCE_KINDS = {"observation", "prediction", "measurement", "agent_hypothesis"
 REGISTERED = {"verified", "aligned", "anchor", "provided", "geometrically_registered"}
 
 
-def reject_forbidden(value):
-    """Reject annotation-bearing objects even when nested under provenance."""
+class PrivateEvidenceError(ValueError):
+    """Private evidence is a fatal boundary violation, not a malformed prediction."""
+
+
+def reject_forbidden(value, *, private_only=False):
+    """Privacy preflight can precede isolatable JSON/shape errors in saved outputs."""
     if isinstance(value, dict):
         if value.get("access") == "private_evaluation":
-            raise ValueError("Private evaluation data cannot enter online evidence")
+            raise PrivateEvidenceError("Private evaluation data cannot enter online evidence")
         for key, item in value.items():
             if not isinstance(key, str) or key.lower() in FORBIDDEN or key.lower().startswith("gt_"):
-                raise ValueError(f"Field is not allowed in online evidence: {key}")
-            reject_forbidden(item)
+                raise PrivateEvidenceError(f"Field is not allowed in online evidence: {key}")
+            reject_forbidden(item, private_only=private_only)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            reject_forbidden(item)
+            reject_forbidden(item, private_only=private_only)
     elif isinstance(value, str):
         keys = re.findall(r'["\']([A-Za-z_][A-Za-z_0-9]*)["\']\s*:', value)
         if (any(key.lower() in FORBIDDEN or key.lower().startswith("gt_") for key in keys)
                 or re.search(r'["\']access["\']\s*:\s*["\']private_evaluation["\']', value)):
-            raise ValueError("Serialized private evaluation data cannot enter online evidence")
-    elif isinstance(value, float) and not math.isfinite(value):
+            raise PrivateEvidenceError("Serialized private evaluation data cannot enter online evidence")
+    elif not private_only and isinstance(value, float) and not math.isfinite(value):
         raise ValueError("Non-finite JSON value")
-    elif value is not None and not isinstance(value, (str, int, float, bool)):
+    elif not private_only and value is not None and not isinstance(value, (str, int, float, bool)):
         raise ValueError("Online records require bounded JSON data, not arrays or objects")
 
 

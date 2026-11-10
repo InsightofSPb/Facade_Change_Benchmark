@@ -178,8 +178,10 @@ def box_iou(left, right):
     return float(intersection / union)
 
 
-def _pixel_result(prediction, target, prediction_root, target_root, *, region_id=None):
-    """Require explicit temporal-mask semantics and the exact coordinate frame."""
+def _pixel_result(prediction, target, prediction_root, target_root, *, region_id=None, support_policy="intersection"):
+    """The fixed_target caller must verify the reviewed domain and its provenance."""
+    if support_policy not in {"intersection", "fixed_target"}:
+        raise ValueError("Unknown pixel evaluation support policy")
     if not target or not target.get("mask_path") or not prediction.get("mask_path"):
         return {"status": "not_available"}
     if prediction.get("mask_task") != "temporal_change" or target.get("mask_task") != "temporal_change":
@@ -188,6 +190,8 @@ def _pixel_result(prediction, target, prediction_root, target_root, *, region_id
     if mismatch:
         return {"status": "not_evaluated", "reason": mismatch}
     frame = normalize_coordinate_system(prediction["coordinate_system"])
+    if support_policy == "fixed_target" and not target.get("support_path"):
+        return {"status": "not_available", "reason": "evaluation_domain_unavailable"}
     if not prediction.get("support_path") or not target.get("support_path"):
         return {"status": "not_evaluated", "reason": "explicit_support_required"}
     try:
@@ -197,8 +201,20 @@ def _pixel_result(prediction, target, prediction_root, target_root, *, region_id
         known = _binary(target_root, target["support_path"])
         if support.shape != known.shape:
             raise ValueError("Prediction and evaluation support grids differ")
-        values = _mask_metrics(pred, truth, support & known)
-        return {"status": "evaluated", "coordinate_system": frame, **values}
+        domain, coverage = support & known, {}
+        if support_policy == "fixed_target":
+            if pred.shape != known.shape or truth.shape != known.shape:
+                raise ValueError("Prediction, target and fixed evaluation domain grids differ")
+            required, covered = int(known.sum()), int((support & known).sum())
+            coverage = {"required_pixels": required, "covered_pixels": covered,
+                        "coverage_fraction": _ratio(covered, required)}
+            if not required:
+                return {"status": "not_available", "reason": "empty_evaluation_domain", **coverage}
+            if covered != required:
+                return {"status": "not_available", "reason": "incomplete_prediction_support", **coverage}
+            domain = known
+        values = _mask_metrics(pred, truth, domain)
+        return {"status": "evaluated", "coordinate_system": frame, **coverage, **values}
     except (OSError, ValueError) as error:
         return {"status": "error", "reason": str(error)}
 

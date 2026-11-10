@@ -79,6 +79,7 @@ def _review_view(out, candidates, decisions=None):
     for case in candidates:
         review = decisions.get(case["question_id"], {})
         label = review.get("label") or {}
+        question = review.get("reviewed_question", case["question"])
         panels = []
         for observation in case["observations"]:
             relative = _copy(out, observation["rgb_path"], out, sources)
@@ -87,14 +88,14 @@ def _review_view(out, candidates, decisions=None):
             relative = _copy(out, preview["path"], out, sources)
             panels.append({"src": relative, "label": preview["caption"]})
         status = review.get("status", "candidate")
-        sections.append({"title": case["question_id"] + " — " + case["question"], "panels": panels,
+        sections.append({"title": case["question_id"] + " — " + question, "panels": panels,
             "caption": json.dumps({"access": PRIVATE, "status": status, "candidate_type": case["candidate_type"],
                 "provisional_answer": case["provisional_answer"], "issues": case["unresolved_issues"],
                 "observability": case["observability"], "archival_status": case["archival_status"],
                 "review": review}, ensure_ascii=False)})
         table.append({"question_id": case["question_id"], "status": status, "revision": review.get("revision", 0),
             "building_id": case["building_id"], "view_id": case["view_id"], "region_id": case["region_id"],
-            "candidate_type": case["candidate_type"], "question": case["question"],
+            "candidate_type": case["candidate_type"], "question": question,
             "provisional_answer": case["provisional_answer"], "task_dates": " / ".join(case["task_dates"]),
             "observability": label.get("observability", case["observability"]),
             "archival_status": label.get("archival_status", case["archival_status"]),
@@ -361,11 +362,22 @@ def review(candidates_path, decisions_path, out, previous=None):
     try:
         touched = set()
         for decision in supplied["decisions"]:
+            if not isinstance(decision, dict):
+                raise ValueError("Each review decision must be an object")
+            unknown = set(decision) - {"question_id", "expected_revision", "status", "reviewer",
+                                       "private_notes", "label", "reviewed_question"}
+            if unknown:
+                raise ValueError(f"Review {decision.get('question_id')}: unknown decision fields {sorted(unknown)}; "
+                                 "use reviewed_question to override question wording")
+            if "reviewed_question" in decision:
+                if not isinstance(decision["reviewed_question"], str) or not decision["reviewed_question"].strip():
+                    raise ValueError("reviewed_question must be a nonempty string")
+                reject_forbidden(decision["reviewed_question"])
             identifier = decision["question_id"]
             if identifier not in cases or identifier in touched:
                 raise ValueError("Unknown or duplicate question in review decisions")
             touched.add(identifier)
-            if not decision.get("reviewer") and decision.get("status") == "candidate":
+            if not decision.get("reviewer") and decision.get("status") == "candidate" and "reviewed_question" not in decision:
                 continue  # Unedited template row, not a human decision.
             if not decision.get("reviewer") or not decision.get("private_notes"):
                 raise ValueError("Every review decision needs reviewer and rationale")
@@ -376,8 +388,11 @@ def review(candidates_path, decisions_path, out, previous=None):
             if status not in {"candidate", "approved", "rejected"}:
                 raise ValueError("Review status must be candidate/approved/rejected")
             label = _checked_label(cases[identifier], decision.get("label"), fingerprints) if status == "approved" else None
+            wording = decision.get("reviewed_question", states.get(identifier, {}).get("reviewed_question"))
             states[identifier] = {"status": status, "revision": revision+1, "reviewer": decision["reviewer"],
                 "private_notes": decision["private_notes"], "reviewed_at": datetime.now(timezone.utc).isoformat(), "label": label}
+            if wording is not None:
+                states[identifier]["reviewed_question"] = wording
             journal.event("qa_review_decision", question_id=identifier, **states[identifier])
         result = _private("facade_qa_review", candidate_sha256=candidate_sha,
                           candidates_path=str(Path(candidates_path).resolve()), history=history, states=states,
@@ -441,7 +456,8 @@ def export(review_path, out):
             for observation in case["observations"]:
                 for name in ("rgb", "support"):
                     fingerprints.add(observation[name + "_path"], observation[name + "_sha256"])
-            questions.append({key: copy.deepcopy(case[key]) for key in PUBLIC_KEYS})
+            questions.append({**{key: copy.deepcopy(case[key]) for key in PUBLIC_KEYS},
+                              "question": decision.get("reviewed_question", case["question"])})
             labels.append({"question_id": case["question_id"], "building_id": case["building_id"],
                            "review": decision, "reviewed_labels": label})
         public = validate_public({"schema_version": VERSION, "kind": "facade_qa_questions", "protocol": PROTOCOL,

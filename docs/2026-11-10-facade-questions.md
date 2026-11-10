@@ -70,6 +70,33 @@ previews и шаблон на месте нельзя: последующие к
 цепочка ссылок с SHA и событие `qa_review_decision`. Старые файлы не перезаписываются;
 устаревшая revision отклоняется.
 
+Необязательный `reviewed_question` задаёт непустую человеческую формулировку.
+Original candidate/question остаётся неизменным, ID вопроса сохраняется. При первом
+review без override используется шаблон; в последующих ревизиях отсутствие поля
+сохраняет ранее проверенный текст. Чтобы восстановить шаблон, явно передайте его
+исходный текст. CSV/HTML показывают действующую формулировку, а публичный экспорт —
+её в обычном поле `question`, без приватных полей review. Изменение формулировки
+меняет SHA публичного manifest: старые прогнозы не подходят к новому экспорту.
+
+Минимальная строка decisions для редактирования ещё не утверждённого кандидата
+(ID и revision берутся из ваших файлов; это не утверждение реального GT):
+
+```json
+{
+  "question_id": "existing-question-id",
+  "expected_revision": 0,
+  "status": "candidate",
+  "reviewer": "local-reviewer",
+  "private_notes": "Уточнена формулировка; ответ ещё требует проверки.",
+  "reviewed_question": "Какие видимые различия есть между наблюдениями этого участка?"
+}
+```
+
+Строка помещается в `decisions` скопированного шаблона с его `candidate_sha256`.
+Для approved по-прежнему нужен проверенный label. Неизвестные поля строки review
+отклоняются: ошибочный ключ `question` даёт подсказку использовать `reviewed_question`.
+Пустой override тоже является ошибкой, а не неявным сбросом текста.
+
 Пример `label` для видимого изменения. **Замените ID и координаты проверенными
 значениями своего кандидата** — пример не является готовой разметкой:
 
@@ -183,6 +210,20 @@ earliest_presence с earliest_observation_id. Отсутствующая стр�
 Противоречивые status/decision/regions считаются технической ошибкой. При no_change
 локализация не считается детекцией. Раннее свидетельство оценивается по ID отдельно.
 
+Отсутствующий индивидуальный result_path считается missing; нечитаемый JSON,
+неверная структура результата (например, `regions: {}`) или несовпавший SHA
+индивидуального результата — техническая ошибка этого вопроса. Остальные случаи
+продолжают оцениваться, все approved случаи и eligible events остаются в когорте.
+Диагностика в cases.csv/evaluation.json/HTML содержит question ID, путь при наличии
+и причину. Ошибка не считается justified abstention. Сбой необязательной маски или
+support прогноза отключает только pixel diagnostic; допустимая рамка сохраняется.
+
+Глобальные нарушения по-прежнему останавливают оценку: mismatch manifest/cohort SHA,
+дубли/неизвестные question IDs, приватные поля в manifest или загруженном результате,
+недопустимая ranking policy/GT-ordering, некорректный reviewed GT или его hashes.
+Граница обработки ошибок не скрывает эти нарушения. Ошибочные bbox/coordinate
+owners по-прежнему учитываются как unmatched predictions с диагностикой.
+
 Из сохранённого result.json берётся максимум одна исходная рамка; при K=3/5/10
 она не размножается. Другие/неполные координатные владельцы, несовместимая решётка
 и недопустимые рамки дают unmatched prediction с диагностикой. Вывод модели не
@@ -206,9 +247,25 @@ earliest_presence с earliest_observation_id. Отсутствующая стр�
    missing не считается доказанной стабильностью.
 
 Переиспользованы существующие box IoU, coordinate-owner checks и pixel metrics.
-Пиксельные метрики вычисляются для сопоставленных пар с настоящими совместимыми
-temporal-change masks и явной поддержкой обеих сторон; valid_pixels сохраняется.
-Это не полный сегментационный benchmark, box-only случаи масок не получают.
+Для WWW pixel diagnostics явно применяется политика `fixed_target`: область оценки
+берётся из immutable reference_support исходного кандидата и проверенной review,
+независимо от прогноза. Проверяются цепочка SHA, согласие экспортированных labels
+с review, владелец/размер решётки, бинарные маски и фиксированная reference support.
+Для этого исходные candidate/review artifacts должны оставаться доступны.
+Прежний `agentic compare` сохраняет собственную политику intersection; она не меняется
+молча вслед за WWW.
+
+Prediction support должна покрывать **всю** фиксированную область. При полном
+покрытии TP/FP/FN и IoU/F1 считаются на этой области. При неполном покрытии:
+`status=not_available`, `reason=incomplete_prediction_support`, `required_pixels`,
+`covered_pixels`, `coverage_fraction`, без IoU/F1. Пустая support не улучшает оценку.
+Если temporal masks или область оценки не заданы, сопоставимых pixel metrics нет;
+область не достраивается по bbox или ответу модели. Повреждение заявленных GT
+артефактов/хешей остаётся фатальной ошибкой целостности, а не пропуском GT.
+
+Геометрическая support не является физической видимостью. Этот контроль покрытия
+не меняет box matching или фиксированные знаменатели когорты и change-size subsets.
+Это не полный сегментационный benchmark; box-only случаи масок не получают.
 
 Площадь изменения — пиксели reviewed temporal-event mask / **фиксированная ранняя
 геометрическая поддержка reference-кропа**. Сохраняются shape, frame, region ID,
@@ -226,7 +283,7 @@ recall по зданиям с положительными событиями. �
 
 ## Проверка в Cloud и приёмка WSL
 
-В Cloud выполнены только CPU-проверки:
+Исходная CPU-проверка реализации `6c9c0d5`:
 
 ```bash
 /workspace/work/facade-venv/bin/python -s -B -m unittest discover -s tests -p 'test_2026_11_08_agentic*.py' -v
@@ -241,6 +298,45 @@ immutable review, утечки, actual masks, ownership, overlap dedup, ошиб
 CLI demo завершён с JSON в stdout, приватной review-галереей и отчётом метрик;
 контрольные числа приведены ниже. Help нового входа и diff check прошли.
 Полный repository suite, GPU, веса и старые эксперименты не запускались.
+
+После исправлений WWW повторены только затронутые проверки:
+
+```bash
+/workspace/work/facade-venv/bin/python -s -B -m unittest tests.test_2026_11_10_facade_questions tests.test_2026_11_08_agentic_report tests.test_2026_11_08_agentic_reasoning -v
+/workspace/work/facade-venv/bin/python -s -B -m unittest discover -s tests -p 'test_2026_11_08_agentic_store.py' -v
+/workspace/work/facade-venv/bin/python -s -B -m facade_change.agentic qa demo --out /workspace/work/2026-11-10-facade-qa-repair-smoke-001
+git diff --check
+```
+
+Результат: 56 тестов (в том числе 24 QA) — OK; 18 store-тестов — OK, один skip из-за
+отсутствия optional CPU torch. Store-тесты требуют discover для импорта общей
+fixture: первоначальный пакетный вызов дал три ошибки импорта, повтор через
+discover прошёл без изменения окружения. Три новые регрессии сначала воспроизвели
+исходные сбои. CLI demo завершён с корректным JSON stdout и прежними контрольными
+box-counts: eligible=4, matched=1, missed=3, unmatched=3 при K=10/IoU=0,25.
+
+Pixel-регрессия 10×10: GT `[3,1,6,4]`, прогноз `[3,1,9,4]`. Полный support даёт
+TP=9, FP=9, IoU=0,5. Покрытия 1/100 и 0/100 дают incomplete_prediction_support без
+IoU/F1; box match остаётся тем же. Проверены смешанная когорта valid/missing/error,
+повреждённые необязательные маски, фатальные GT/hash/privacy нарушения, версии
+формулировок и отказ принимать прогнозы от старого публичного manifest.
+
+Команды локальной приёмки именно этих исправлений:
+
+```bash
+cd /home/sasha/Facade_Change_Benchmark
+git switch codex/2026-11-08-change-agentic-rag
+git pull --ff-only
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -s -B -m unittest tests.test_2026_11_10_facade_questions tests.test_2026_11_08_agentic_report tests.test_2026_11_08_agentic_reasoning -v
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -s -B -m unittest discover -s tests -p 'test_2026_11_08_agentic_store.py' -v
+/home/sasha/miniconda3/envs/change-agentic-rag/bin/python -s -B -m facade_change.agentic qa demo \
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-10-facade-qa-repair-demo-001
+```
+
+Ожидаются completed, `review/gallery.html`, раздельные export manifests,
+`evaluation/evaluation.json`, `evaluation/cases.csv`, `evaluation/localization.csv`
+и `evaluation/gallery.html`. Каталог должен быть новым. Реальные вопросы и GT
+владелец пишет и утверждает локально; синтетика не подтверждает качество модели.
 
 Локально используйте существующее окружение. При повторе выбирайте новый суффикс
 каталога: существующий out не затирается.

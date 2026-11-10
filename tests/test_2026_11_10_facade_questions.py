@@ -1,10 +1,12 @@
 """Hand-checkable CPU acceptance for private curation and fixed-cohort QA metrics."""
 import copy
+import csv
 import importlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -124,6 +126,8 @@ class FacadeQuestionTests(unittest.TestCase):
         candidates = self.run / "candidates/candidates.json"
         previous = self.run / "review/reviewed.json"
         original = (sha256(candidates), sha256(previous))
+        templates = {r["question_id"]: r["question"] for r in read_json(candidates)["candidates"]}
+        self.assertTrue(all(r["question"] == templates[r["question_id"]] for r in self.public["questions"]))
         identifier = self.questions["stable"]["question_id"]
         decisions = self.root / "decisions.json"
         write_json(decisions, {"candidate_sha256": sha256(candidates), "decisions": [
@@ -192,6 +196,236 @@ class FacadeQuestionTests(unittest.TestCase):
         result = self.evaluate(document, "semantic-mask")
         self.assertEqual(self.metric(result)["matches"][0]["pixels"]["reason"], "mask_is_not_explicit_temporal_change")
         self.assertEqual(self.metric()["matches"][0]["pixels"]["status"], "not_available")
+
+    def test_fixed_pixel_domain_requires_complete_prediction_support(self):
+        identifier = self.questions["change"]["question_id"]
+        event = next(r["reviewed_labels"]["events"][0] for r in self.private["cases"] if r["question_id"] == identifier)
+        mask = np.zeros((10, 10), bool)
+        mask[1:4, 3:9] = True
+        path = self.root / "prediction.npy"
+        np.save(path, mask)
+        document = {**self.predictions, "cases": [{"question_id": identifier, "status": "completed", "decision": "change",
+            "regions": [{"prediction_id": "wider-mask", "rank": 1, "bbox_xyxy": [3, 1, 9, 4],
+                         "coordinate_system": event["coordinate_system"], "region_id": event["region_id"],
+                         "mask_task": "temporal_change", "mask_path": str(path), "mask_sha256": sha256(path)}]}]}
+        area_subsets = None
+        for name, count in (("full", 100), ("tiny", 1), ("empty", 0)):
+            support = np.zeros((10, 10), bool)
+            if name == "full":
+                support[:] = True
+            elif name == "tiny":
+                support[1, 3] = True
+            support_path = self.root / (name + ".npy")
+            np.save(support_path, support)
+            document["cases"][0]["regions"][0].update(support_path=str(support_path), support_sha256=sha256(support_path))
+            result = self.evaluate(document, "domain-" + name)
+            row = self.metric(result)
+            self.assertEqual((row["matched"], row["missed"], row["available_predictions"]), (1, 3, 1))
+            self.assertEqual(row["matches"][0]["iou"], .5)
+            if area_subsets is None:
+                area_subsets = row["area_subsets"]
+            self.assertEqual(row["area_subsets"], area_subsets)
+            pixels = row["matches"][0]["pixels"]
+            if name == "full":
+                self.assertEqual((pixels["tp"], pixels["fp"], pixels["valid_pixels"], pixels["iou"]), (9, 9, 100, .5))
+            else:
+                self.assertEqual((pixels["status"], pixels["reason"]), ("not_available", "incomplete_prediction_support"))
+                self.assertEqual((pixels["required_pixels"], pixels["covered_pixels"], pixels["coverage_fraction"]), (100, count, count/100))
+                self.assertNotIn("iou", pixels)
+                self.assertNotIn("f1", pixels)
+
+    def test_mixed_saved_result_failures_are_isolated_from_the_fixed_cohort(self):
+        document = copy.deepcopy(self.predictions)
+        valid = self.root / "valid-result.json"
+        write_json(valid, {"status": "completed", "decision": "change", "localization": {
+            "coordinate_system": "region_crop_pixels", "region_id": "change", "bbox_xyxy": [3, 1, 6, 4]}})
+        malformed = self.root / "malformed-result.json"
+        write_json(malformed, {"status": "completed", "decision": "change", "localization": "not an object"})
+        missing = self.root / "missing-result.json"
+        for region, path in (("change", valid), ("missing", missing), ("error", malformed)):
+            identifier = self.questions[region]["question_id"]
+            document["cases"] = [r for r in document["cases"] if r["question_id"] != identifier]
+            document["cases"].append({"question_id": identifier, "result_path": str(path),
+                "ranking_source": {"kind": "single_box", "source": "saved test result"}})
+        result = self.evaluate(document, "mixed-results")
+        coverage = result["pooled"]["coverage"]
+        self.assertEqual((coverage["cohort_cases"], coverage["completed"], coverage["abstained"],
+                          coverage["missing"], coverage["technical_errors"]), (8, 4, 1, 2, 1))
+        self.assertEqual(coverage["justified_abstentions"], 1)
+        self.assertEqual(coverage["response_coverage"], 5/8)
+        metric = self.metric(result)
+        self.assertEqual((metric["eligible_events"], metric["matched"], metric["missed"], metric["unmatched_predictions"]), (4, 1, 3, 1))
+        cases = {r["question_id"]: r for r in result["pooled"]["cases"]}
+        for region, path, status in (("missing", missing, "missing"), ("error", malformed, "error")):
+            case = cases[self.questions[region]["question_id"]]
+            self.assertEqual(case["status"], status)
+            self.assertIn(str(path), case["error"])
+            self.assertIn(case["question_id"], case["error"])
+
+    def test_reviewed_question_is_versioned_exported_and_preserved_when_omitted(self):
+        candidates = self.run / "candidates/candidates.json"
+        previous = self.run / "review/reviewed.json"
+        identifier = self.questions["change"]["question_id"]
+        original = self.questions["change"]["question"]
+        wording = "Какие видимые различия есть между этими наблюдениями участка?"
+        hashes = (sha256(candidates), sha256(previous))
+        state = read_json(previous)["states"][identifier]
+        for revision, override in ((1, wording), (2, None), (3, original)):
+            decision = {"question_id": identifier, "expected_revision": revision, "status": "approved",
+                        "reviewer": "synthetic-wording-reviewer", "private_notes": "Synthetic wording revision", "label": state["label"]}
+            if override is not None:
+                decision["reviewed_question"] = override
+            decisions = self.root / f"wording-{revision}.json"
+            write_json(decisions, {"candidate_sha256": sha256(candidates), "decisions": [decision]})
+            out = self.root / f"review-{revision}"
+            qa.review(candidates, decisions, out, previous)
+            previous = out / "reviewed.json"
+            effective = wording if revision < 3 else original
+            self.assertEqual(read_json(previous)["states"][identifier]["reviewed_question"], effective)
+            with (out / "review.csv").open(encoding="utf-8", newline="") as stream:
+                self.assertEqual(next(r for r in csv.DictReader(stream) if r["question_id"] == identifier)["question"], effective)
+            self.assertIn(effective, (out / "gallery.html").read_text())
+            exported = self.root / f"export-wording-{revision}"
+            qa.export(previous, exported)
+            public = read_json(exported / "questions.json")
+            self.assertEqual(next(r for r in public["questions"] if r["question_id"] == identifier)["question"], effective)
+            self.assertNotIn("reviewed_question", json.dumps(public))
+            self.assertNotIn("private_notes", json.dumps(public))
+            if revision == 1:
+                self.assertNotEqual(sha256(exported / "questions.json"), sha256(self.questions_path))
+                with self.assertRaisesRegex(ValueError, "identical fixed"):
+                    self.evaluate(self.predictions, "stale-wording-predictions", exported / "questions.json", exported / "answers.private.json")
+        self.assertEqual(hashes, (sha256(candidates), sha256(self.run / "review/reviewed.json")))
+
+    def test_malformed_individual_outputs_are_errors_not_abstentions(self):
+        identifier = self.questions["occluded"]["question_id"]
+        payloads = ["{\"status\":", "[]", '{"status":"completed","decision":"change","regions":{}}',
+                    '{"status":"completed","decision":"no_change","confidence":NaN}']
+        for index, payload in enumerate(payloads):
+            with self.subTest(payload=payload):
+                path = self.root / f"bad-result-{index}.json"
+                path.write_text(payload)
+                document = copy.deepcopy(self.predictions)
+                document["cases"] = [r for r in document["cases"] if r["question_id"] != identifier]
+                document["cases"].append({"question_id": identifier, "result_path": str(path),
+                    "ranking_source": {"kind": "single_box", "source": "malformed fixture"}})
+                result = self.evaluate(document, f"bad-json-{index}")
+                coverage = result["pooled"]["coverage"]
+                self.assertEqual((coverage["technical_errors"], coverage["justified_abstentions"]), (2, 0))
+                self.assertEqual((self.metric(result)["matched"], self.metric(result)["missed"]), (1, 3))
+                error = next(r for r in result["pooled"]["cases"] if r["question_id"] == identifier)["error"]
+                self.assertIn(str(path), error)
+        for index, regions in enumerate(({}, [None])):
+            document = copy.deepcopy(self.predictions)
+            row = next(r for r in document["cases"] if r["question_id"] == identifier)
+            row.update(status="completed", decision="change", regions=regions)
+            result = self.evaluate(document, f"bad-inline-{index}")
+            self.assertEqual(result["pooled"]["coverage"]["technical_errors"], 2)
+        path = self.root / "unreadable.json"
+        write_json(path, {"status": "abstained", "decision": "insufficient_data"})
+        document["cases"] = [r for r in document["cases"] if r["question_id"] != identifier]
+        document["cases"].append({"question_id": identifier, "result_path": str(path),
+                                "ranking_source": {"kind": "single_box", "source": "unreadable fixture"}})
+        def unreadable(value):
+            if Path(value) == path:
+                raise PermissionError("Synthetic denied read")
+            return read_json(value)
+        with patch.object(evaluation, "read_json", side_effect=unreadable):
+            result = self.evaluate(document, "unreadable-case")
+        self.assertEqual((result["pooled"]["coverage"]["technical_errors"], result["pooled"]["coverage"]["justified_abstentions"]), (2, 0))
+
+    def test_optional_prediction_artifact_failures_keep_valid_box_matches(self):
+        identifier = self.questions["change"]["question_id"]
+        event = next(r["reviewed_labels"]["events"][0] for r in self.private["cases"] if r["question_id"] == identifier)
+        for index, failure in enumerate(("missing_mask", "wrong_hash", "corrupt_mask", "wrong_grid", "missing_support")):
+            document = copy.deepcopy(self.predictions)
+            prediction = next(r for r in document["cases"] if r["question_id"] == identifier)["regions"][0]
+            prediction.update({k: event[k] for k in ("mask_path", "mask_sha256", "mask_task", "support_path", "support_sha256")})
+            path = self.root / (failure + ".npy")
+            if failure == "missing_mask":
+                prediction["mask_path"] = str(path)
+            elif failure == "missing_support":
+                prediction["support_path"] = str(path)
+            elif failure == "wrong_hash":
+                prediction["mask_sha256"] = "0" * 64
+            else:
+                if failure == "wrong_grid":
+                    np.save(path, np.ones((3, 3), bool))
+                else:
+                    path.write_bytes(b"not a mask")
+                prediction.update(mask_path=str(path), mask_sha256=sha256(path))
+            result = self.evaluate(document, f"optional-artifact-{index}")
+            row = self.metric(result, k=1)
+            self.assertEqual((row["matched"], row["missed"]), (1, 3))
+            pixels = row["matches"][0]["pixels"]
+            self.assertEqual((pixels["status"], pixels["reason"]), ("error", "prediction_pixel_artifact_error"))
+            self.assertNotIn("iou", pixels)
+            case = next(r for r in result["pooled"]["cases"] if r["question_id"] == identifier)
+            self.assertEqual(case["status"], "completed")
+            self.assertTrue(case["pixel_diagnostics"])
+
+    def test_missing_reviewed_pixel_domain_is_unavailable_without_losing_box_match(self):
+        event = next(r["reviewed_labels"]["events"][0] for r in self.private["cases"] if r["question_id"] == self.questions["change"]["question_id"])
+        truth = {**event, "question_id": "q"}
+        truth.pop("support_path")
+        prediction = {**event, "question_id": "q", "prediction_id": "p"}
+        match = evaluation.match_one_to_one([prediction], {"e1": {"representations": [truth]}}, .25)[0]
+        self.assertEqual(match["iou"], 1.)
+        self.assertEqual(match["pixels"], {"status": "not_available", "reason": "evaluation_domain_unavailable"})
+
+    def test_global_integrity_and_private_leakage_still_abort(self):
+        duplicate = copy.deepcopy(self.predictions)
+        duplicate["cases"].append(duplicate["cases"][0])
+        unknown = copy.deepcopy(self.predictions)
+        unknown["cases"][0]["question_id"] = "not-in-cohort"
+        invalid_global = {**self.predictions, "ranking_source": {"kind": "gt_iou", "source": "forbidden"}, "cases": []}
+        leak = copy.deepcopy(self.predictions)
+        leak["cases"][0]["private_notes"] = "not a per-case error"
+        for index, document in enumerate((duplicate, unknown, invalid_global, leak)):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.evaluate(document, f"fatal-{index}")
+        path = self.root / "leaked-result.json"
+        write_json(path, {"status": "completed", "decision": "no_change", "reference_answer": "private"})
+        document = {**self.predictions, "ranking_source": {"kind": "single_box", "source": "fixture"},
+                    "cases": [{"question_id": self.questions["change"]["question_id"], "result_path": str(path)}]}
+        with self.assertRaisesRegex(ValueError, "reference_answer"):
+            self.evaluate(document, "fatal-saved-leak")
+        # A malformed value must not hide a later private field during validation.
+        path.write_text('{"confidence":NaN,"reference_answer":"private"}')
+        with self.assertRaisesRegex(ValueError, "reference_answer"):
+            self.evaluate(document, "fatal-saved-leak-after-malformed-value")
+
+    def test_inconsistent_reviewed_truth_and_changed_gt_artifacts_remain_fatal(self):
+        identifier = self.questions["change"]["question_id"]
+        private = copy.deepcopy(self.private)
+        row = next(r for r in private["cases"] if r["question_id"] == identifier)
+        row["reviewed_labels"]["events"][0]["region_id"] = "wrong-owner"
+        row["review"]["label"] = copy.deepcopy(row["reviewed_labels"])
+        path = self.root / "altered-answers.private.json"
+        write_json(path, private)
+        with self.assertRaisesRegex(ValueError, "immutable review"):
+            self.evaluate(self.predictions, "bad-gt", answers=path)
+        event = next(r["reviewed_labels"]["events"][0] for r in self.private["cases"] if r["question_id"] == identifier)
+        np.save(event["mask_path"], np.zeros((10, 10), bool))
+        with self.assertRaisesRegex(ValueError, "Hash mismatch"):
+            self.evaluate(self.predictions, "changed-gt-mask")
+
+    def test_empty_unknown_and_stale_question_edits_are_rejected(self):
+        candidates = self.run / "candidates/candidates.json"
+        previous = self.run / "review/reviewed.json"
+        identifier = self.questions["stable"]["question_id"]
+        base = {"question_id": identifier, "expected_revision": 1, "status": "rejected",
+                "reviewer": "synthetic-reviewer", "private_notes": "Synthetic correction"}
+        invalid = [({"reviewed_question": value}, "nonempty string") for value in ("", "  ", None, 12)]
+        invalid += [({"question": "silently lost?"}, "use reviewed_question"), ({"unexpected": True}, "unexpected"),
+                    ({"expected_revision": 0, "reviewed_question": "Новая формулировка?"}, "Stale")]
+        for index, (changes, message) in enumerate(invalid):
+            decisions = self.root / f"bad-review-{index}.json"
+            write_json(decisions, {"candidate_sha256": sha256(candidates), "decisions": [{**base, **changes}]})
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                qa.review(candidates, decisions, self.root / f"bad-review-out-{index}", previous)
+        with self.assertRaises(ValueError):
+            reject_forbidden({"reviewed_question": "Private review metadata"})
 
     def test_unknown_visibility_and_missing_annotations_do_not_create_stability_gt(self):
         cases = read_json(self.run / "candidates/candidates.json")["candidates"]
