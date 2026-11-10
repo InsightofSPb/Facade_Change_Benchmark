@@ -101,11 +101,13 @@ class WorkflowSyntheticTests(unittest.TestCase):
 
 def load_tests(loader, tests, pattern):
     # unittest discovery skips ISO-dated filenames because '-' is not an identifier.
-    path = Path(__file__).with_name("test_2026-11-04_history_benchmark.py")
-    spec = importlib.util.spec_from_file_location("canonical_history_benchmark_tests", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    tests.addTests(loader.loadTestsFromModule(module))
+    for filename, name in (("test_2026-11-04_history_benchmark.py", "canonical_history_benchmark_tests"),
+                           ("test_2026-11-10_inspection.py", "adaptive_visual_inspection_tests")):
+        path = Path(__file__).with_name(filename)
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tests.addTests(loader.loadTestsFromModule(module))
     return tests
 
 
