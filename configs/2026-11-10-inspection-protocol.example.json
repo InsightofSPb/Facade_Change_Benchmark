@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "kind": "facade_inspection_protocol",
+  "version": "2026-11-10-v1",
+  "scope": "AnyChange-guided inspection inside supplied registered canonical regions",
+  "policies": ["pair", "fixed_history", "heuristic", "agent"],
+  "caps": {
+    "max_actions": 2,
+    "max_model_calls": 5,
+    "max_images": 8,
+    "max_total_images": 32,
+    "max_input_tokens": 16384,
+    "max_total_input_tokens": 65536,
+    "max_output_tokens": 1024,
+    "max_total_output_tokens": 4096,
+    "max_invalid_replies": 1,
+    "max_same_action": 1,
+    "max_seconds": 1800
+  },
+  "history_manifest_sha256": "SET_TO_SHA256_OF_THE_EXACT_LOCAL_CANONICAL_MANIFEST",
+  "questions_sha256": "SET_TO_SHA256_OF_THE_APPROVED_PUBLIC_EXPORT",
+  "archive_available_at": "SET_TO_THE_EXPLICIT_AVAILABILITY_USED_IN_QA_GENERATE",
+  "task_mode": "retrospective",
+  "min_history_observations": 2,
+  "max_native_crop_pixels": 1048576,
+  "enable_sam3": false,
+  "assessability_reviewed_against": "frozen_permitted_rgb_history_universe"
+}

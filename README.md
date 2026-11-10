@@ -18,6 +18,12 @@
 CPU-пример проверяет SIFT/SSIM/LZMA, историю и отчёт; настоящие Qwen/SAM3
 проверяются отдельно в уже настроенных WSL-окружениях, без скачивания весов.
 
+Bounded adaptive inspection inside supplied canonical regions:
+[`2026-11-10: inspection protocol and WSL acceptance`](docs/2026-11-10-adaptive-visual-inspection.md).
+`python -m facade_change.agentic inspection --help` exposes preflight, run,
+evaluate, and an explicitly stubbed CPU demo. The primary comparison is the
+fresh-judge result after agent selection versus a frozen deterministic schedule.
+
 Кандидаты вопросов по готовым историям, ручной review и офлайн-оценка локализации:
 [`2026-11-10: facade questions`](docs/2026-11-10-facade-questions.md).
 Вход `python -m facade_change.agentic qa --help`; сквозной CPU-пример — `qa demo`.
