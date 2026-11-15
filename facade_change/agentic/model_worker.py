@@ -60,7 +60,7 @@ def _resource(path):
 
 def _versions():
     values = {"python": sys.version.split()[0], "executable": sys.executable}
-    for name in ("torch", "torchvision", "transformers", "huggingface-hub", "sam3", "einops", "timm", "Pillow"):
+    for name in ("torch", "torchvision", "transformers", "huggingface-hub", "sam3", "einops", "timm", "requests", "Pillow"):
         try:
             values[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -71,7 +71,7 @@ def _versions():
 def _package_resources():
     """Bind cached results to installed dependency versions without importing GPU libraries."""
     resources = []
-    for name in ("torch", "torchvision", "transformers", "huggingface-hub", "sam3", "einops", "timm", "Pillow", "numpy"):
+    for name in ("torch", "torchvision", "transformers", "huggingface-hub", "sam3", "einops", "timm", "requests", "Pillow", "numpy"):
         try:
             distribution = importlib.metadata.distribution(name)
         except importlib.metadata.PackageNotFoundError:
@@ -478,7 +478,7 @@ class JinaAdapter(Adapter):
             raise ValueError("Jina needs explicit cpu/cuda and float32/bfloat16 configuration")
         from transformers import AutoModel
         from huggingface_hub import snapshot_download
-        import einops, timm  # noqa: F401 -- preflight dependencies, no install side effects
+        import einops, requests, timm  # noqa: F401 -- preflight dependencies, no install side effects
         # Match the prepared PyTorch subset. Hub 1.33 validates every requested
         # cached file; an unfiltered snapshot also requires unused ONNX/BIN copies.
         self.snapshot, resources = _snapshot(options["model_id"], options["revision"],
@@ -519,19 +519,9 @@ class JinaAdapter(Adapter):
                                use_text_flash_attn=False, use_vision_xformers=False)
         self.checked = True
 
-    def _load(self):
-        self._check()
-        if self.model is not None:
-            return
-        import torch
-        from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoImageProcessor
-        options = self.options
-        precision = {"float32": torch.float32, "bfloat16": torch.bfloat16}.get(options["precision"])
-        if precision is None:
-            raise ValueError("Jina precision must explicitly be float32 or bfloat16")
-        self.provenance["hardware"] = _cuda_preflight(options["device"])
-        self.usage["model_loads"] += 1
-        started = time.monotonic()
+    def _prepare_text_bundle(self):
+        from transformers.dynamic_module_utils import get_cached_module_file, get_relative_import_files
+
         # Upstream _build_text_tower hardcodes revision=None. Its configuration
         # can nevertheless point to a local directory. Bind that directory to
         # the explicitly pinned config/code, without changing model weights or
@@ -540,27 +530,67 @@ class JinaAdapter(Adapter):
         local_text = Path(self.text_bundle.name)
         for source in self.text_code.glob("*.py"):
             shutil.copyfile(source, local_text / source.name)
+        # The nested XLM-RoBERTa constructor eagerly loads its own tokenizer
+        # from name_or_path, before the outer CLIP tokenizer can be injected.
+        for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+            shutil.copyfile(Path(self.snapshot) / name, local_text / name)
         text_config = json.loads((self.text_snapshot / "config.json").read_text())
         text_config["auto_map"] = {key: value.split("--")[-1] for key, value in text_config["auto_map"].items()}
         (local_text / "config.json").write_text(json.dumps(text_config), encoding="utf-8")
+        # Transformers 5.5 copies only direct imports for local directories,
+        # but hashes recursive imports before executing a class. Stage the full
+        # dependency closure through its normal cache API first (e.g. LoRA ->
+        # XLM-RoBERTa -> rotary). Do not import unrelated conversion scripts.
+        module_files = set()
+        for reference in text_config["auto_map"].values():
+            source = local_text / (reference.rsplit(".", 1)[0] + ".py")
+            module_files.add(source)
+            module_files.update(map(Path, get_relative_import_files(source)))
+        for source in sorted(module_files):
+            get_cached_module_file(str(local_text), source.name, local_files_only=True)
+        return local_text
+
+    def _load(self):
+        self._check()
+        if self.model is not None:
+            return
+        import torch
+        from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoImageProcessor
+        from safetensors.torch import load_file
+        options = self.options
+        precision = {"float32": torch.float32, "bfloat16": torch.bfloat16}.get(options["precision"])
+        if precision is None:
+            raise ValueError("Jina precision must explicitly be float32 or bfloat16")
+        self.provenance["hardware"] = _cuda_preflight(options["device"])
+        self.usage["model_loads"] += 1
+        started = time.monotonic()
+        local_text = self._prepare_text_bundle()
         config = AutoConfig.from_pretrained(options["model_id"], revision=options["revision"],
                                            code_revision=options["code_revision"],
                                            trust_remote_code=True, local_files_only=True)
         config.text_config.hf_model_name_or_path = str(local_text)
         config.use_text_flash_attn = False
         config.use_vision_xformers = False
-        self.model = AutoModel.from_pretrained(
-            options["model_id"], revision=options["revision"], code_revision=options["code_revision"],
-            config=config, local_files_only=True, trust_remote_code=True,
-            torch_dtype=precision).to(options["device"]).eval()
+        # Transformers 5.5 from_pretrained initializes on meta unconditionally.
+        # The pinned EVA constructor reads scalar tensor values, so construct
+        # on CPU and strictly load the already hashed Safetensors checkpoint.
+        with torch.device("cpu"):
+            model = AutoModel.from_config(
+                config, code_revision=options["code_revision"],
+                trust_remote_code=True, dtype=precision).to(dtype=precision)
+        state = load_file(str(Path(self.snapshot) / "model.safetensors"), device="cpu")
+        model.load_state_dict(state, strict=True)
+        del state
+        model.to(options["device"]).eval()
         # Upstream lazy getters otherwise resolve _name_or_path without revision.
         # Inject pinned local tokenizer/processor explicitly, retaining real APIs.
-        self.model.tokenizer = AutoTokenizer.from_pretrained(self.snapshot, code_revision=options["code_revision"],
+        model.tokenizer = AutoTokenizer.from_pretrained(self.snapshot, code_revision=options["code_revision"],
+                                                       local_files_only=True, trust_remote_code=True)
+        model.preprocess = AutoImageProcessor.from_pretrained(self.snapshot, code_revision=options["code_revision"],
                                                              local_files_only=True, trust_remote_code=True)
-        self.model.preprocess = AutoImageProcessor.from_pretrained(self.snapshot, code_revision=options["code_revision"],
-                                                                   local_files_only=True, trust_remote_code=True)
-        if not callable(getattr(self.model, "encode_image", None)) or not callable(getattr(self.model, "encode_text", None)):
+        if not callable(getattr(model, "encode_image", None)) or not callable(getattr(model, "encode_text", None)):
             raise ValueError("Pinned Jina model lacks encode_image/encode_text API")
+        self.model = model
         self.usage["load_seconds"] = time.monotonic() - started
 
     def handle(self, request):

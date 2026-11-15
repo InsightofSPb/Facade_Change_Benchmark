@@ -1,6 +1,7 @@
 """CPU contracts only. Fake workers/processors are not a real model smoke."""
 import copy
 import fnmatch
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -452,7 +453,7 @@ class JinaSnapshotTests(unittest.TestCase):
         self.modules = {
             "huggingface_hub": SimpleNamespace(snapshot_download=self.download),
             "transformers": SimpleNamespace(AutoModel=object),
-            "einops": SimpleNamespace(), "timm": SimpleNamespace(),
+            "einops": SimpleNamespace(), "timm": SimpleNamespace(), "requests": SimpleNamespace(),
         }
 
     def download(self, repository, *, revision, local_files_only, allow_patterns=None, ignore_patterns=None):
@@ -506,6 +507,81 @@ class JinaSnapshotTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "onnx/model.onnx"):
                 _snapshot("jinaai/jina-clip-v2", DEFAULTS["jina"]["revision"])
         self.assertEqual(self.calls[-1][1:], (None, None))
+
+
+@unittest.skipUnless(importlib.util.find_spec("transformers"), "requires optional Transformers runtime")
+class JinaLocalModuleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.sources = {
+            "modeling_lora.py": "from .modeling_xlm import Base\nclass Model(Base):\n    pass\n",
+            "modeling_xlm.py": "from .rotary import VALUE\nclass Base:\n    value = VALUE\n",
+            "rotary.py": "VALUE = 17\n",
+            "convert_weights.py": "import unrelated_conversion_dependency\n",
+            "config.json": json.dumps({"auto_map": {"AutoModel": "pinned/repo--modeling_lora.Model"}}),
+            "tokenizer.json": "{}", "tokenizer_config.json": "{}", "special_tokens_map.json": "{}",
+        }
+        for name, content in self.sources.items():
+            (self.root / name).write_text(content)
+        self.adapter = JinaAdapter("jina", {})
+        self.adapter.text_code = self.adapter.text_snapshot = self.root
+        self.adapter.snapshot = str(self.root)
+        self.addCleanup(self.adapter.close)
+
+    def test_recursive_local_imports_load_through_real_transformers(self):
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        bundle = self.adapter._prepare_text_bundle()
+        cls = get_class_from_dynamic_module("modeling_lora.Model", str(bundle), local_files_only=True)
+        self.assertEqual(cls().value, 17)
+        for name, content in self.sources.items():
+            self.assertEqual((self.root / name).read_text(), content)
+            if name != "config.json":
+                self.assertEqual((bundle / name).read_text(), content)
+        self.assertEqual(json.loads((bundle / "config.json").read_text())["auto_map"],
+                         {"AutoModel": "modeling_lora.Model"})
+
+    def test_missing_nested_source_is_rejected_before_loading(self):
+        (self.root / "rotary.py").unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "rotary.py"):
+            self.adapter._prepare_text_bundle()
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires optional Torch runtime")
+    def test_cpu_construction_and_strict_checkpoint_failure_leave_no_loaded_model(self):
+        import torch
+        from safetensors.torch import save_file
+
+        state = {"weight": torch.full((2, 3), 0.25), "bias": torch.ones(2)}
+
+        def construct(config, **kwargs):
+            self.assertEqual(kwargs["dtype"], torch.float32)
+            self.assertEqual(torch.linspace(0, 1, 2)[-1].item(), 1.0)
+            model = torch.nn.Linear(3, 2)
+            model.encode_text = model.encode_image = lambda *args, **kwargs: None
+            return model
+
+        config = SimpleNamespace(text_config=SimpleNamespace())
+        self.adapter.options["device"] = "cpu"
+        self.adapter.checked = True
+        self.adapter._begin()
+        with (
+            patch.object(self.adapter, "_prepare_text_bundle", return_value=self.root),
+            patch("transformers.AutoConfig.from_pretrained", return_value=config),
+            patch("transformers.AutoModel.from_config", side_effect=construct),
+            patch("transformers.AutoModel.from_pretrained", side_effect=AssertionError("meta loading is unsafe")),
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=object()),
+            patch("transformers.AutoImageProcessor.from_pretrained", return_value=object()),
+        ):
+            save_file({"weight": state["weight"]}, self.root / "model.safetensors")
+            with self.assertRaisesRegex(RuntimeError, "Missing key"):
+                self.adapter._load()
+            self.assertIsNone(self.adapter.model)
+            save_file(state, self.root / "model.safetensors")
+            self.adapter._load()
+            for name, value in self.adapter.model.state_dict().items():
+                self.assertTrue(torch.equal(value, state[name]))
 
 
 if __name__ == "__main__":
