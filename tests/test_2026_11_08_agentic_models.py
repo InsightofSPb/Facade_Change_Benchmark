@@ -1,5 +1,6 @@
 """CPU contracts only. Fake workers/processors are not a real model smoke."""
 import copy
+import fnmatch
 import io
 import json
 from pathlib import Path
@@ -14,8 +15,8 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from facade_change.agentic.models import ModelPool, WorkerError, _Worker
-from facade_change.agentic.model_worker import Adapter, DinoAdapter, JinaAdapter, QwenAdapter, SAM3Adapter, serve
+from facade_change.agentic.models import DEFAULTS, ModelPool, WorkerError, _Worker
+from facade_change.agentic.model_worker import Adapter, DinoAdapter, JinaAdapter, QwenAdapter, SAM3Adapter, _snapshot, serve
 
 
 class FakeWorker:
@@ -425,6 +426,86 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertIn("Unsupported Qwen request", response["error"]["message"])
             finally:
                 worker.close()
+
+
+class JinaSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        options = DEFAULTS["jina"]
+        self.repositories = {
+            "jinaai/jina-clip-v2": (options["revision"], [
+                "config.json", "model.safetensors", "tokenizer.json", "preprocessor_config.json"]),
+            "jinaai/jina-clip-implementation": (options["code_revision"], [
+                "configuration_clip.py", "modeling_clip.py"]),
+            "jinaai/jina-embeddings-v3": (options["text_config_revision"], ["config.json"]),
+            "jinaai/xlm-roberta-flash-implementation": (options["text_code_revision"], [
+                "configuration_xlm_roberta.py", "modeling_xlm_roberta.py"]),
+        }
+        self.calls = []
+        for repository, (_, files) in self.repositories.items():
+            folder = self.root / repository.split("/")[-1]
+            folder.mkdir()
+            for filename in files:
+                (folder / filename).write_text("{}" if filename.endswith(".json") else "fixture")
+        self.modules = {
+            "huggingface_hub": SimpleNamespace(snapshot_download=self.download),
+            "transformers": SimpleNamespace(AutoModel=object),
+            "einops": SimpleNamespace(), "timm": SimpleNamespace(),
+        }
+
+    def download(self, repository, *, revision, local_files_only, allow_patterns=None, ignore_patterns=None):
+        expected_revision, cached_files = self.repositories[repository]
+        self.assertEqual(revision, expected_revision)
+        self.assertTrue(local_files_only)
+        self.calls.append((repository, allow_patterns, ignore_patterns))
+        # The cached Hub tree knows these files exist remotely, but this runtime
+        # deliberately has no ONNX, alternate weights or documentation downloaded.
+        remote_files = cached_files + ["README.md", ".gitattributes", "onnx/model.onnx", "pytorch_model.bin"]
+        requested = [name for name in remote_files
+                     if (allow_patterns is None or any(fnmatch.fnmatch(name, p) for p in allow_patterns))
+                     and not any(fnmatch.fnmatch(name, p) for p in ignore_patterns or [])]
+        folder = self.root / repository.split("/")[-1]
+        missing = [name for name in requested if not (folder / name).is_file()]
+        if missing:
+            raise FileNotFoundError("Incomplete requested snapshot: " + ", ".join(missing))
+        return str(folder)
+
+    def check(self):
+        with patch.dict(sys.modules, self.modules):
+            adapter = JinaAdapter("jina", {})
+            adapter._check()
+            return adapter
+
+    def test_prepared_four_snapshot_subset_is_sufficient_and_hashed(self):
+        adapter = self.check()
+        self.assertTrue(adapter.checked)
+        self.assertEqual(len(self.calls), 4)
+        resources = {Path(row["path"]) for row in adapter.provenance["resources"]}
+        for repository, (_, files) in self.repositories.items():
+            for filename in files:
+                self.assertIn(self.root / repository.split("/")[-1] / filename, resources)
+        self.assertFalse(adapter.provenance["downloads"])
+
+    def test_missing_required_file_in_each_snapshot_is_still_rejected(self):
+        for repository, (_, files) in self.repositories.items():
+            for filename in files:
+                path = self.root / repository.split("/")[-1] / filename
+                original = path.read_bytes()
+                with self.subTest(repository=repository, filename=filename):
+                    path.unlink()
+                    try:
+                        with self.assertRaisesRegex(FileNotFoundError, "Incomplete requested snapshot"):
+                            self.check()
+                    finally:
+                        path.write_bytes(original)
+
+    def test_unfiltered_snapshot_contract_is_unchanged(self):
+        with patch.dict(sys.modules, self.modules):
+            with self.assertRaisesRegex(FileNotFoundError, "onnx/model.onnx"):
+                _snapshot("jinaai/jina-clip-v2", DEFAULTS["jina"]["revision"])
+        self.assertEqual(self.calls[-1][1:], (None, None))
 
 
 if __name__ == "__main__":

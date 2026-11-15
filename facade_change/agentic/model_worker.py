@@ -82,11 +82,13 @@ def _package_resources():
     return resources
 
 
-def _snapshot(model_id, revision):
+def _snapshot(model_id, revision, *, allow_patterns=None):
     from huggingface_hub import snapshot_download
     if not isinstance(revision, str) or len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
         raise ValueError("A full immutable model revision is required")
-    root = Path(snapshot_download(model_id, revision=revision, local_files_only=True)).resolve()
+    root = Path(snapshot_download(model_id, revision=revision, local_files_only=True,
+                                  allow_patterns=allow_patterns,
+                                  ignore_patterns=["*/*"] if allow_patterns else None)).resolve()
     weights = sorted(root.glob("*.safetensors")) + sorted(root.glob("pytorch_model*.bin"))
     if not weights:
         raise FileNotFoundError(f"No local model weights in pinned snapshot: {root}")
@@ -477,20 +479,24 @@ class JinaAdapter(Adapter):
         from transformers import AutoModel
         from huggingface_hub import snapshot_download
         import einops, timm  # noqa: F401 -- preflight dependencies, no install side effects
-        self.snapshot, resources = _snapshot(options["model_id"], options["revision"])
+        # Match the prepared PyTorch subset. Hub 1.33 validates every requested
+        # cached file; an unfiltered snapshot also requires unused ONNX/BIN copies.
+        self.snapshot, resources = _snapshot(options["model_id"], options["revision"],
+            allow_patterns=["model.safetensors", "*.json", "*.py", "*.txt", "*.model", "*.tiktoken", "*.jinja"])
         code_revision = options["code_revision"]
         if not isinstance(code_revision, str) or len(code_revision) != 40:
             raise ValueError("Jina remote implementation needs a full pinned code_revision")
         code = Path(snapshot_download("jinaai/jina-clip-implementation", revision=code_revision,
-                                      local_files_only=True)).resolve()
+                                      local_files_only=True, allow_patterns=["*.py"], ignore_patterns=["*/*"])).resolve()
         source_files = sorted(code.glob("*.py"))
         if not source_files:
             raise FileNotFoundError(f"Jina remote implementation is absent from local cache: {code}")
         resources.extend(_resource(p) for p in source_files)
         self.text_snapshot = Path(snapshot_download("jinaai/jina-embeddings-v3",
-                                      revision=options["text_config_revision"], local_files_only=True)).resolve()
+            revision=options["text_config_revision"], local_files_only=True, allow_patterns=["config.json"])).resolve()
         self.text_code = Path(snapshot_download("jinaai/xlm-roberta-flash-implementation",
-                                      revision=options["text_code_revision"], local_files_only=True)).resolve()
+            revision=options["text_code_revision"], local_files_only=True,
+            allow_patterns=["*.py"], ignore_patterns=["*/*"])).resolve()
         resources.append(_resource(self.text_snapshot / "config.json"))
         text_sources = sorted(self.text_code.glob("*.py"))
         if not text_sources:
