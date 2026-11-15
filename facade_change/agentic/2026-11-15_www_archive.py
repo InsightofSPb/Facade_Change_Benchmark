@@ -320,7 +320,15 @@ class ArchiveSearch:
             raise ValueError("Incompatible or synthetic archive index")
         if self.index["jina_options"] != config["models"].get("jina"):
             raise ValueError("Archive/query Jina configuration differs; rebuild the index")
-        if not all(_resources_valid(r) for r in self.index["resource_contracts"]):
+        # Deduplicate only this load; keep the saved per-embedding contracts intact.
+        resources = {}
+        for contract in self.index["resource_contracts"]:
+            for row in contract:
+                resolved = str(Path(row["path"]).resolve())
+                if resolved in resources and resources[resolved]["sha256"] != row["sha256"]:
+                    raise ValueError(f"Conflicting Jina resource hashes for resolved file: {resolved}")
+                resources[resolved] = {**row, "path": resolved}
+        if not _resources_valid(resources.values()):
             raise ValueError("Jina cached resources are missing or changed")
         if self.index["entries"] and not synthetic:
             if not self.index["resource_contracts"] or not all(self.index["resource_contracts"]):

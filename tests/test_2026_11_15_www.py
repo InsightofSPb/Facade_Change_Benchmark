@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from facade_change.history_features import Fingerprints
-from facade_change.io import read_json, write_json
+from facade_change.io import read_json, sha256, write_json
+from facade_change.agentic import models
 
 demo = importlib.import_module("facade_change.agentic.2026-11-15_www_demo")
 runner = importlib.import_module("facade_change.agentic.2026-11-15_www_runner")
@@ -90,6 +92,59 @@ class WWWRunnerTest(unittest.TestCase):
 
     def test_no_synthetic_index_in_production(self):
         with self.assertRaisesRegex(ValueError, "synthetic"):
+            archive.ArchiveSearch(self.index, self.config, Fingerprints())
+
+    def resource_index(self):
+        weights, tokenizer = self.root / "weights.bin", self.root / "tokenizer.json"
+        weights.write_bytes(b"synthetic-weights-A")
+        tokenizer.write_bytes(b"synthetic-tokenizer")
+        alias = self.root / "weights-alias.bin"
+        alias.symlink_to(weights)
+        value = read_json(self.index)
+        value["entries"] = [copy.deepcopy(value["entries"][i % len(value["entries"])]) for i in range(77)]
+        value["resource_contracts"] = [[{"path": str(weights if i % 2 else alias), "sha256": sha256(weights)},
+                                       {"path": str(tokenizer), "sha256": sha256(tokenizer)}] for i in range(77)]
+        write_json(self.index, value)
+        return value, weights, tokenizer
+
+    def test_archive_load_hashes_repeated_resolved_resources_once_per_load(self):
+        original, weights, tokenizer = self.resource_index()
+        index_sha = sha256(self.index)
+        with patch.object(models, "_timed_sha256", wraps=models._timed_sha256) as reads:
+            search = archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+            self.assertCountEqual([Path(call.args[0]) for call in reads.call_args_list], [weights, tokenizer])
+            self.assertEqual(search.index["resource_contracts"], original["resource_contracts"])
+            self.assertEqual(len(search.index["entries"]), 77)
+            archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+            self.assertEqual(reads.call_count, 4)  # No approval survives into the next load.
+        self.assertEqual(sha256(self.index), index_sha)
+
+    def test_archive_load_rejects_conflicting_hashes_for_symlink_alias(self):
+        value, weights, _ = self.resource_index()
+        value["resource_contracts"][-1][0]["sha256"] = "0" * 64
+        write_json(self.index, value)
+        with patch.object(models, "_timed_sha256", wraps=models._timed_sha256) as reads:
+            with self.assertRaisesRegex(ValueError, "Conflicting Jina resource hashes") as error:
+                archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+            self.assertIn(str(weights), str(error.exception))
+            reads.assert_not_called()
+
+    def test_archive_load_rejects_modified_or_missing_repeated_resource(self):
+        _, weights, _ = self.resource_index()
+        archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+        weights.write_bytes(b"synthetic-weights-B")  # Same size, different actual bytes.
+        with self.assertRaisesRegex(ValueError, "resources are missing or changed"):
+            archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+        weights.unlink()
+        with self.assertRaisesRegex(ValueError, "resources are missing or changed"):
+            archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+
+    def test_archive_dedup_preserves_required_resources_for_each_real_embedding(self):
+        value, _, _ = self.resource_index()
+        value["synthetic_fixture"] = False
+        value["resource_contracts"][-1] = []
+        write_json(self.index, value)
+        with self.assertRaisesRegex(ValueError, "real Jina index requires recorded model resources"):
             archive.ArchiveSearch(self.index, self.config, Fingerprints())
 
     def test_no_backdating_and_month_precision(self):
