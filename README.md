@@ -22,6 +22,11 @@ CPU-пример проверяет SIFT/SSIM/LZMA, историю и отчёт
 [`2026-11-10: facade questions`](docs/2026-11-10-facade-questions.md).
 Вход `python -m facade_change.agentic qa --help`; сквозной CPU-пример — `qa demo`.
 
+Три режима WWW QA, импорт публичного архива, расширение review и структурная оценка:
+[`2026-11-15: WWW QA и точные WSL-команды`](docs/2026-11-15-www-qa.md).
+Вход `python -m facade_change.agentic www --help`; `www demo` — только CPU fixture,
+без реальных моделей. Приватные метки читаются только при curation/offline scoring.
+
 **Подготовка данных → обучение при необходимости → бенчмаркинг → галерея.**
 
 Единый вход: `python -m facade_change workflow STAGE TASK ...`.

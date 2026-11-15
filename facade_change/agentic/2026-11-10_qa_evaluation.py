@@ -68,7 +68,7 @@ def _prediction_case(row, case, root, fingerprints, ranking):
     if status not in {"completed", "abstained", "error", "failed", "missing"}:
         raise ValueError("Unknown prediction status")
     if ((status == "abstained" and (decision not in {"insufficient_data", "incomparable"} or regions))
-            or (status == "completed" and decision not in {"change", "no_change", "earliest_presence"})
+            or (status == "completed" and decision not in ({"supported"} if case["task"] == "archival_qa" else {"change", "no_change", "earliest_presence"}))
             or (status == "completed" and regions and decision != "change")):
         raise ValueError("Inconsistent status/decision/regions")
     row.update(status=status, ranking_source=ranking, regions=[], supplied_prediction_count=len(regions))
@@ -294,25 +294,21 @@ def _aggregate(questions, labels, predictions, thresholds):
             "area_availability": dict(Counter(e["area_status"] for e in events.values())), "events": list(events.values())}
 
 
-def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.25, .5)):
-    if not thresholds or len(set(thresholds)) != len(thresholds) or any(
-            isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or not 0 < t <= 1 for t in thresholds):
-        raise ValueError("IoU thresholds must be distinct finite numbers in (0, 1]")
+def approved_cohort(questions_path, answers_path, fingerprints):
+    """Shared immutable review-chain validation for localization and WWW primary metrics."""
     qa = importlib.import_module(".2026-11-10_questions", __package__)
-    fingerprints = Fingerprints()
     _verify_recorded_artifacts(Path(questions_path).resolve().parent, fingerprints.files)
     _verify_recorded_artifacts(Path(answers_path).resolve().parent, fingerprints.files)
     public = qa.validate_public(_file(questions_path, fingerprints))
     private = _file(answers_path, fingerprints)
-    saved = _file(predictions_path, fingerprints)
     model_sha = sha256(questions_path)
     if private.get("kind") != "facade_qa_answers" or private.get("access") != qa.PRIVATE:
         raise ValueError("Only approved private QA answers can be scored")
     review_source = private["review_source"]
     _verify_recorded_artifacts(Path(review_source["path"]).resolve().parent, fingerprints.files)
     reviewed = _file(review_source["path"], fingerprints, review_source["sha256"])
-    if private.get("model_manifest_sha256") != model_sha or saved.get("model_manifest_sha256") != model_sha:
-        raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
+    if private.get("model_manifest_sha256") != model_sha:
+        raise ValueError("Answers must bind the identical fixed model-question cohort")
     questions = {r["question_id"]: r for r in public["questions"]}
     if len(private["cases"]) != len(questions) or {r["question_id"] for r in private["cases"]} != set(questions):
         raise ValueError("Private answers must cover the exact approved cohort once")
@@ -341,6 +337,21 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
         if qa._checked_label(original, label, fingerprints) != label:
             raise ValueError("Reviewed labels disagree with their fixed reference support/mask provenance")
         labels[row["question_id"]] = label
+    return public, labels
+
+
+def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.25, .5)):
+    if not thresholds or len(set(thresholds)) != len(thresholds) or any(
+            isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or not 0 < t <= 1 for t in thresholds):
+        raise ValueError("IoU thresholds must be distinct finite numbers in (0, 1]")
+    qa = importlib.import_module(".2026-11-10_questions", __package__)
+    fingerprints = Fingerprints()
+    public, labels = approved_cohort(questions_path, answers_path, fingerprints)
+    model_sha = sha256(questions_path)
+    saved = _file(predictions_path, fingerprints)
+    if saved.get("model_manifest_sha256") != model_sha:
+        raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
+    questions = {r["question_id"]: r for r in public["questions"]}
     predictions = _predictions(saved, questions, Path(predictions_path).resolve().parent, fingerprints)
     protocol = {"k": list(K_VALUES), "iou_thresholds": list(thresholds), "matching": "deterministic_maximum_cardinality_one_to_one",
         "rank_policy": "top K per question from saved non-GT ranking; no padding of single-box outputs",

@@ -6,6 +6,8 @@ import importlib
 import json
 from pathlib import Path
 
+from PIL import Image
+
 from ..io import read_json, sha256, write_json
 from .config import defaults
 from .runner import complete_run, new_run
@@ -58,6 +60,28 @@ def fixture(root):
     root = Path(root)
     root.mkdir(parents=True)
     histories, annotations, _ = importlib.import_module(".2026-11-10_qa_demo", __package__).fixture(root / "inputs")
+    # Distinct synthetic buildings need distinct original-frame bytes for the inventory leakage audit.
+    # Change only a pixel outside every supplied crop while constructing this new fixture.
+    history, targets = read_json(histories / "manifest.json"), read_json(annotations)
+    paths = sorted({r["original_image_path"] for t in history["tracks"] for r in t["observations"]})
+    for index, path in enumerate(paths, 1):
+        with Image.open(path) as source:
+            image = source.copy()
+        image.putpixel((19, 19), (index, 0, 0))
+        image.save(path)
+    for track in history["tracks"]:
+        track["anchor_sha256"] = sha256(track["observations"][0]["original_image_path"])
+        for row in track["observations"]:
+            row["image_sha256"] = sha256(row["original_image_path"])
+            targets["observations"][row["observation_id"]]["image_sha256"] = row["image_sha256"]
+    write_json(histories / "manifest.json", history)
+    write_json(histories / history["report"] / "manifest.json", history)
+    write_json(histories / history["report"] / "run.json", {"status": "completed", "synthetic_fixture": True,
+                                                            "manifest_sha256": sha256(histories / "manifest.json")})
+    targets["input_sha256"] = {str(histories / "manifest.json"): sha256(histories / "manifest.json")}
+    write_json(annotations, targets)
+    write_json(annotations.parent / "run.json", {"status": "completed", "synthetic_fixture": True,
+                                                 "artifact_sha256": {"index.json": sha256(annotations)}})
     qa.generate(histories, root / "candidates", annotation_targets=annotations, knowledge_cutoff="2026-11-15",
                 task_mode="retrospective", available_at="observation_date")
     rows = read_json(root / "candidates/candidates.json")["candidates"]

@@ -52,6 +52,8 @@ class WWWRunnerTest(unittest.TestCase):
         self.run_fixture("resume", resume_from=self.root / "run")
         self.run_fixture("resume-again", resume_from=self.root / "resume")
         self.assertTrue(all(r["costs"]["model_calls"] == 0 for r in read_json(self.root / "resume/results.json")["results"]))
+        resumed_costs = [read_json(p) for p in (self.root / "resume/questions").glob("*/*/costs.json")]
+        self.assertTrue(all(r["model_calls"] == 0 and r["source_costs"]["model_calls"] > 0 for r in resumed_costs))
         self.config["budgets"]["max_output_tokens"] += 1
         with self.assertRaisesRegex(ValueError, "Resume .*changed"):
             self.run_fixture("bad-resume", resume_from=self.root / "run")
@@ -96,6 +98,9 @@ class WWWRunnerTest(unittest.TestCase):
         row.update(availability_basis="collection_time", available_at="2010")
         with self.assertRaisesRegex(ValueError, "never backdate"):
             archive.validate_package(value, self.package.parent, Fingerprints())
+        row.update(availability_basis="documented_publication", collected_at="2026-11-16T10:00:00+03:00")
+        with self.assertRaisesRegex(ValueError, "new consistent"):
+            archive.validate_package(value, self.package.parent, Fingerprints())
         self.assertLess(archive._date("2010-02", "month"), archive._date("2010-03", "month"))
 
     def test_runtime_failure_is_error_without_answer_retry(self):
@@ -108,6 +113,19 @@ class WWWRunnerTest(unittest.TestCase):
         self.assertEqual(affected["status"], "error")
         self.assertIn("fixture GPU unavailable", affected["error"])
         self.assertEqual(affected["costs"]["qwen_requests"], 1)
+
+    def test_model_cannot_exceed_two_adaptive_rounds(self):
+        class RepeatedSearch(demo.SyntheticPool):
+            def call(self, role, payload):
+                result = super().call(role, payload)
+                if role == "qwen":
+                    result["text"] = json.dumps({"type": "retrieve", "query": "Synthetic question-specific query", "observation_id": None})
+                return result
+        self.run_fixture(pool_factory=RepeatedSearch, conditions=("bounded_agentic_retrieval",))
+        rows = read_json(self.root / "run/results.json")["results"]
+        self.assertTrue(all(r["costs"]["retrieval_rounds"] == 2 for r in rows))
+        self.assertTrue(all(r["status"] == "error" and "round budget exhausted" in r["error"] for r in rows))
+        self.assertTrue(all(r["costs"]["qwen_requests"] == 4 for r in rows))
 
     def test_invalid_citations_and_json_keep_bounded_errors(self):
         class Invalid(demo.SyntheticPool):

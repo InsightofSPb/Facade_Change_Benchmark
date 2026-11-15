@@ -358,7 +358,7 @@ def _condition(question, condition, prepared, local, common, support_record, sea
                 raise RuntimeError("QA time budget exhausted before retrieval")
             result = ({"status": "no_matches", "matches": [], "reason": "explicit_empty_archive_plumbing_check"} if search is None else
                 search.search(question, query, local[observation_id]["image_path"] if observation_id else None, pool,
-                              arguments["limit"], exposed=evidence, on_call=account))
+                              arguments["limit"], exposed=evidence, on_call=account, deadline=started + budgets["max_seconds"]))
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
             tool = {"arguments": arguments, "error": str(exc), "status": "error"}
             tools.append(tool)
@@ -457,17 +457,26 @@ def _condition(question, condition, prepared, local, common, support_record, sea
     return result
 
 
-def _overlay(out, box, record, index):
+def _overlay(out, box, record, index, *, reviewed=False):
     with Image.open(record["image_path"]) as image:
         rgb = image.convert("RGB")
     canvas = Image.new("RGB", (rgb.width, rgb.height + 40), "white")
     canvas.paste(rgb, (0, 0))
     draw = ImageDraw.Draw(canvas)
     draw.rectangle(box["bbox_xyxy"], outline="red", width=2)
-    draw.text((3, rgb.height + 3), "MODEL OUTPUT / " + str(box["bbox_xyxy"]), fill="black")
-    path = out / f"2026-11-15-model-box-{index:02d}.png"
+    draw.text((3, rgb.height + 3), ("PRIVATE REVIEWED / " if reviewed else "MODEL OUTPUT / ") + str(box["bbox_xyxy"]), fill="black")
+    path = out / (f"2026-11-15-{'reviewed' if reviewed else 'model'}-box-{index:02d}.png")
     canvas.save(path)
     return path
+
+
+def execution_contract(path, config, archive_sha, conditions, protocol, budgets, synthetic=False):
+    source_files = [Path(__file__), Path(archive.__file__), Path(qa.__file__)] + [Path(__file__).with_name(name + ".py")
+                    for name in ("models", "model_worker", "reasoning", "coordinates", "store", "retrieval", "config")]
+    return {"schema_version": 1, "questions_sha256": sha256(path), "archive_index_sha256": archive_sha,
+        "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
+        "prompt_sha256": digest(SYSTEM), "implementation_sha256": {p.name: sha256(p) for p in source_files},
+        "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS)}
 
 
 def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=False, conditions=CONDITIONS,
@@ -487,12 +496,9 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
     if search:
         for question in public["questions"]:
             search.eligible(question)
-    source_files = [Path(__file__), Path(archive.__file__), Path(qa.__file__)] + [Path(__file__).with_name(name + ".py")
-                    for name in ("models", "model_worker", "reasoning", "coordinates", "store", "retrieval", "config")]
-    contract = {"schema_version": 1, "questions_sha256": sha256(path), "archive_index_sha256": search.sha256 if search else None,
-        "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
-        "prompt_sha256": digest(SYSTEM), "implementation_sha256": {p.name: sha256(p) for p in source_files},
-        "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS)}
+            if set(search.records) & {r["observation_id"] for r in question["observations"]}:
+                raise ValueError("Archive/local evidence ID collision; fix the public source IDs before inference")
+    contract = execution_contract(path, config, search.sha256 if search else None, conditions, protocol, budgets, synthetic)
     if resume_from:
         old = Path(resume_from).expanduser().resolve()
         if read_json(old / "run.json").get("status") not in {"completed", "completed_with_errors", "failed", "interrupted"}:
@@ -539,6 +545,8 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
                         result = {**cached, "source_costs": source_costs, "costs": {"model_calls": 0, "input_tokens": 0,
                             "output_tokens": 0, "images": 0, "elapsed_seconds": 0., "cache_hits": 1},
                             "resumed_from": {"path": str(prior / "result.json"), "sha256": sha256(prior / "result.json")}}
+                        write_json(destination / "costs.json", {**result["costs"], "source_costs": source_costs,
+                            "resumed_from": result["resumed_from"]})
                         write_json(destination / "result.json", result)
                     else:
                         result = _condition(question, condition, prepared, local, common, support_record, search, pool, config,
@@ -584,7 +592,7 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
         complete_run(journal, summary["status"], summary=summary)
         return summary
     except BaseException as exc:
-        complete_run(journal, "failed", error=str(exc))
+        complete_run(journal, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", error=str(exc))
         raise
     finally:
         journal.close()

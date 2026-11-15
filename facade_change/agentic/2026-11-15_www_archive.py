@@ -6,6 +6,7 @@ from datetime import datetime
 import calendar
 from pathlib import Path
 import shutil
+import time
 from urllib.parse import urlparse
 
 import numpy as np
@@ -100,6 +101,8 @@ def validate_package(document, root, fingerprints):
         publication = _date(record["publication_date"], "publication_date", optional=True)
         known = _date(record["first_known_available_at"], "first_known_available_at", optional=True)
         _timestamp(record["collected_at"], "collected_at")
+        if temporal_value(record["collected_at"]) > cutoff:
+            raise ValueError("Evidence collected after the freeze needs a new consistent question/corpus cutoff")
         available = _date(record["available_at"], "available_at")
         basis = record["availability_basis"]
         anchor = {"documented_publication": publication, "documented_archive_snapshot": known,
@@ -293,7 +296,7 @@ class ArchiveSearch:
                 allowed.append(row["evidence_id"])
         return allowed, excluded
 
-    def search(self, question, query, image_path, pool, limit, exposed=(), on_call=None):
+    def search(self, question, query, image_path, pool, limit, exposed=(), on_call=None, deadline=None):
         allowed, excluded = self.eligible(question)
         if not allowed:
             return {"status": "no_matches", "matches": [], "calls": [], "excluded": excluded}
@@ -302,6 +305,11 @@ class ArchiveSearch:
             requests.append({"op": "embed", "image_paths": [str(image_path)]})
         vectors, calls = [], []
         for request in requests:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("QA time budget exhausted before Jina request")
+                request["timeout_seconds"] = remaining
             response = pool.call("jina", request)
             if on_call:
                 on_call("jina", request, response)

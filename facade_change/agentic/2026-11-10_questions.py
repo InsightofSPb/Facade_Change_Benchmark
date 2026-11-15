@@ -29,7 +29,7 @@ VERSION = 1
 PRIVATE = "private_evaluation"
 PROTOCOL = "supplied_region_qa"
 ARCHIVAL = {"potentially_useful", "verified_useful", "unavailable", "unknown"}
-ASSESSMENTS = {"confirmed_change", "confirmed_stability", "insufficient_evidence", "earliest_presence"}
+ASSESSMENTS = {"confirmed_change", "confirmed_stability", "insufficient_evidence", "earliest_presence", "archival_fact"}
 PUBLIC_KEYS = {"question_id", "question", "task", "building_id", "view_id", "region_id", "split",
                "protocol", "task_mode", "knowledge_cutoff", "task_dates", "frame", "observations"}
 OBS_KEYS = {"observation_id", "date", "available_at", "date_status", "rgb_path", "rgb_sha256",
@@ -268,8 +268,9 @@ def _checked_label(case, label, fingerprints):
         raise ValueError("Approved cases need an explicit reviewed assessment")
     result = copy.deepcopy(label)
     assessment = result["assessment"]
-    allowed = ({"earliest_presence", "insufficient_evidence"} if case["task"] == "earliest_evidence"
-               else {"confirmed_change", "confirmed_stability", "insufficient_evidence"})
+    allowed = ({"earliest_presence", "insufficient_evidence"} if case["task"] == "earliest_evidence" else
+               {"archival_fact", "insufficient_evidence"} if case["task"] == "archival_qa" else
+               {"confirmed_change", "confirmed_stability", "insufficient_evidence"})
     if assessment not in allowed:
         raise ValueError("Earliest presence is not a temporal-change label")
     if result.get("observability") not in {"visible", "partly_visible", "occluded", "missing_coverage", "poor_quality", "other", "unknown"}:
@@ -290,6 +291,34 @@ def _checked_label(case, label, fingerprints):
         observation = next((r for r in case["observations"] if r["observation_id"] == result.get("earliest_observation_id")), None)
         if observation is None or result.get("present_by") != observation["date"] or result.get("onset") != "unknown":
             raise ValueError("Earliest presence needs a permitted dated observation; onset must remain unknown")
+        equivalents = result.get("equivalent_observation_ids", [])
+        permitted = {r["observation_id"] for r in case["observations"] if r["date"] == result["present_by"]}
+        if not isinstance(equivalents, list) or any(not isinstance(v, str) or v not in permitted for v in equivalents):
+            raise ValueError("Reviewed equivalent earliest observations must preserve the same date precision")
+    if "archival_stratum" in result and type(result["archival_stratum"]) is not bool:
+        raise ValueError("Predeclared archival_stratum must be an explicit boolean")
+    support_ids = result.get("supporting_evidence_ids", [])
+    if not isinstance(support_ids, list) or any(not isinstance(v, str) or not v for v in support_ids) or len(set(support_ids)) != len(support_ids):
+        raise ValueError("Reviewed support IDs must be distinct nonempty strings")
+    if "known_support_exhaustive" in result and type(result["known_support_exhaustive"]) is not bool:
+        raise ValueError("Record known-support completeness explicitly")
+    if assessment == "archival_fact":
+        alternatives = result.get("acceptable_structured_answers")
+        if not support_ids or not isinstance(alternatives, list) or not alternatives:
+            raise ValueError("Archival QA needs reviewed supporting IDs and explicit acceptable structured answers")
+        date_parser = importlib.import_module(".2026-11-15_www_archive", __package__)._date
+        for answer in alternatives:
+            if (not isinstance(answer, dict) or set(answer) != {"decision", "observation_ids", "date_interval"}
+                    or answer["decision"] != "supported" or not isinstance(answer["observation_ids"], list)
+                    or any(not isinstance(v, str) or not v for v in answer["observation_ids"])):
+                raise ValueError("Invalid task-specific reviewed archival answer")
+            interval = answer["date_interval"]
+            if interval is not None:
+                if (not isinstance(interval, dict) or set(interval) != {"start", "end", "precision", "uncertain"}
+                        or interval["precision"] not in {"year", "month", "day", "interval"} or type(interval["uncertain"]) is not bool
+                        or date_parser(interval["start"], "start") > date_parser(interval["end"], "end")
+                        or date_parser(interval["end"], "end") > temporal_value(case["knowledge_cutoff"])):
+                    raise ValueError("Reviewed archival date precision/interval must be explicit and available by cutoff")
     events = result.setdefault("events", [])
     if not isinstance(events, list) or (assessment == "confirmed_change" and not events):
         raise ValueError("Confirmed localized changes require reviewed event identities and boxes")
@@ -462,8 +491,8 @@ def export(review_path, out):
                            "review": decision, "reviewed_labels": label})
         public = validate_public({"schema_version": VERSION, "kind": "facade_qa_questions", "protocol": PROTOCOL,
             "questions": questions, "retrieval_contract": {"encoder": "jina-clip-v2", "units": ["dated_observation", "archival_record"],
-                "comparison_variants": ["photos_only", "multimodal_retrieval", "graph_retrieval", "bounded_agentic_retrieval"],
-                "implemented_systems": [], "cutoff_field": "knowledge_cutoff"}})
+                "comparison_variants": ["photos_only", "fixed_retrieval", "bounded_agentic_retrieval"],
+                "implemented_systems": ["www"], "cutoff_field": "knowledge_cutoff"}})
         write_json(journal.out / "questions.json", public)
         private = _private("facade_qa_answers", model_manifest_sha256=sha256(journal.out / "questions.json"),
             review_source={"path": str(Path(review_path).resolve()), "sha256": sha256(review_path)}, cases=labels)
