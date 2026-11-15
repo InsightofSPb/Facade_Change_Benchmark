@@ -298,7 +298,9 @@ def validate_answer(value, question, evidence, preparation, common, support_reco
         raise ValueError(f"Citations must name distinct evidence actually exposed in this condition: {list(evidence)}")
     observations = {r["observation_id"]: r for r in evidence.values() if r.get("image_path") and r.get("observation_id")}
     if not set(observation_ids) <= set(observations):
-        raise ValueError("Observation IDs must refer to photos actually shown")
+        unknown = sorted(set(observation_ids) - set(observations))
+        raise ValueError(f"Observation IDs must refer to photos actually shown: unknown={unknown}; "
+                         f"allowed={list(observations)}. Text-only records cannot supply an observation_id")
     abstained = decision in {"insufficient_data", "incomparable"}
     if abstained and not limitations:
         raise ValueError("An abstention needs its specific evidence limitation")
@@ -389,7 +391,8 @@ def _expose_archive(search, match, remaining_images):
     metadata = {key: row[key] for key in ("evidence_id", "record_type", "building_id", "view_id", "identity_status",
         "source_page_url", "media_url", "observation_date", "publication_date", "available_at", "availability_basis",
         "date_source", "rights", "source_warnings", "parent_evidence_id", "access_status")}
-    metadata.update(source_excerpt=excerpt, image_exposed=bool(shown), coordinate_system="observation_native" if shown else None)
+    metadata.update(source_excerpt=excerpt, observation_id=record["observation_id"],
+                    image_exposed=bool(shown), coordinate_system="observation_native" if shown else None)
     blocks = [{"type": "text", "text": json.dumps(metadata, ensure_ascii=False)}]
     if shown:
         asset = shown[0]
@@ -490,7 +493,8 @@ def _condition(question, condition, prepared, local, common, support_record, sea
         tools.append(tool)
         write_json(out / f"retrieval-{rounds:02d}.json", tool)
         messages.append({"role": "user", "content": [{"type": "text", "text": json.dumps({"retrieval_status": result["status"],
-            "returned_evidence_ids": [r["evidence_id"] for r in result["matches"]]}, ensure_ascii=False)}, *blocks]})
+            "returned_evidence_ids": [r["evidence_id"] for r in result["matches"]],
+            "response_contract": response_contract(question, evidence, prepared)}, ensure_ascii=False)}, *blocks]})
         journal.event("agent_tool_returned", case_id=question["question_id"], mode=condition, name="archive_search", status=result["status"])
         persist()
 

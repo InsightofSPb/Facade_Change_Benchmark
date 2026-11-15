@@ -94,6 +94,73 @@ class WWWRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "synthetic"):
             archive.ArchiveSearch(self.index, self.config, Fingerprints())
 
+    def test_archive_metadata_names_only_actually_shown_observations(self):
+        search = archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+        identifier = next(iter(search.records))
+        question = read_json(self.questions)["questions"][1]
+        for remaining in (0, 1):
+            with self.subTest(remaining_images=remaining):
+                record, blocks = runner._expose_archive(search, {"evidence_id": identifier}, remaining)
+                metadata = json.loads(blocks[0]["text"])
+                self.assertEqual(metadata["observation_id"], identifier if remaining else None)
+                self.assertEqual(metadata["image_exposed"], bool(remaining))
+                self.assertEqual(sum(b["type"] == "image" for b in blocks), remaining)
+                contract = runner.response_contract(question, {identifier: record}, {"compared_observations": []})
+                self.assertEqual(contract["exposed_citation_ids"], [identifier])
+                self.assertEqual(set(contract["shown_photo_capture_intervals"]), {identifier} if remaining else set())
+
+    def test_retrieved_contract_exposes_exact_dates_before_answering_in_both_modes(self):
+        public = read_json(self.questions)
+        question = next(q for q in public["questions"] if q["task"] == "earliest_evidence")
+        write_json(self.questions, {**public, "questions": [question]})
+        package = read_json(self.package)
+        row = package["records"][0]
+        row.update(building_id=question["building_id"], view_id=question["view_id"])
+
+        class ArchiveAnswer(demo.SyntheticPool):
+            def call(self, role, payload):
+                response = super().call(role, payload)
+                if role != "qwen":
+                    return response
+                value = json.loads(response["text"])
+                if value["type"] == "final":
+                    tool = next(m for m in reversed(payload["messages"])
+                                if '"retrieval_status"' in m["content"][0].get("text", ""))
+                    contract = json.loads(tool["content"][0]["text"])["response_contract"]
+                    photo = json.loads(tool["content"][1]["text"])
+                    identifier = photo["observation_id"]
+                    value.update(citations=[identifier], observation_ids=[identifier], date_interval={
+                        **contract["shown_photo_capture_intervals"][identifier], "uncertain": False})
+                    response["text"] = json.dumps(value)
+                return response
+
+        for precision, start, end in (("day", "2008-09-28", "2008-09-28"),
+                                      ("month", "2008-09", "2008-09"),
+                                      ("interval", "2007", "2008")):
+            with self.subTest(precision=precision):
+                row["observation_date"].update(start=start, end=end, precision=precision)
+                write_json(self.package, package)
+                archive.import_archive(self.package, self.root / (precision + "-archive"))
+                archive.index_archive(self.root / (precision + "-archive/corpus.json"), self.config,
+                                      self.root / (precision + "-index"), pool_factory=demo.SyntheticPool, synthetic=True)
+                result = runner.run(self.questions, self.config, self.root / precision,
+                    archive_index=self.root / (precision + "-index/index.json"),
+                    conditions=runner.CONDITIONS[1:], pool_factory=ArchiveAnswer, synthetic=True)
+                self.assertEqual(result["outcome_counts"], {"completed": 2, "abstained": 0, "error": 0})
+                for answer in read_json(self.root / precision / "results.json")["results"]:
+                    self.assertEqual(answer["answer"]["date_interval"], {
+                        "start": start, "end": end, "precision": precision, "uncertain": False})
+                    folder = self.root / precision / "questions" / question["question_id"] / answer["condition"]
+                    exposed = read_json(folder / "exposure.json")["evidence"]
+                    prepared = {"compared_observations": []}
+                    bad = copy.deepcopy(answer["answer"])
+                    del bad["status"]
+                    bad["date_interval"].update(start="2008", end="2008", precision="year")
+                    original = copy.deepcopy(bad)
+                    with self.assertRaisesRegex(ValueError, "documented date precision"):
+                        runner.validate_answer(bad, question, exposed, prepared, None, None, runner.PROTOCOL)
+                    self.assertEqual(bad, original)
+
     def resource_index(self):
         weights, tokenizer = self.root / "weights.bin", self.root / "tokenizer.json"
         weights.write_bytes(b"synthetic-weights-A")
