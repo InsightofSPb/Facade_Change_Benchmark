@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image
 
 from facade_change.agentic.models import DEFAULTS, ModelPool, WorkerError, _Worker
-from facade_change.agentic.model_worker import Adapter, DinoAdapter, JinaAdapter, QwenAdapter, SAM3Adapter, _snapshot, serve
+from facade_change.agentic.model_worker import Adapter, DinoAdapter, JinaAdapter, QwenAdapter, SAM3Adapter, _image, _snapshot, serve
 
 
 class FakeWorker:
@@ -356,6 +356,46 @@ class AdapterContractTests(unittest.TestCase):
         self.assertFalse(adapter.processor.kwargs["enable_thinking"])
         self.assertEqual(result["input_tokens"], 10)
         self.assertFalse(result["model_loaded"])
+
+    def test_grayscale_archive_inputs_reach_qwen_and_jina_without_source_changes(self):
+        from facade_change.io import load_rgb, sha256
+
+        gray = np.arange(15, dtype=np.uint8).reshape(3, 5)
+        exif = Image.Exif()
+        exif[274] = 6
+        Image.fromarray(gray).save(self.image, exif=exif)
+        original_hash = sha256(self.image)
+        expected = np.repeat(gray[..., None], 3, axis=2)
+        with self.assertRaisesRegex(ValueError, "RGB/RGBA"):
+            load_rgb(self.image)
+        with self.assertRaisesRegex(ValueError, "RGB/RGBA"):
+            _image(self.image, 100)
+        qwen = self.qwen()
+        measured = qwen.handle(self.request())
+        image = qwen.processor.messages[0]["content"][1]["image"]
+        self.assertEqual(image.size, (5, 3))
+        np.testing.assert_array_equal(np.array(image), expected)
+        self.assertIn("model_input_conversion", measured["processing"]["images"][0])
+        jina = self.jina()
+
+        def encode(images, **kwargs):
+            self.assertEqual(images[0].mode, "RGB")
+            np.testing.assert_array_equal(np.array(images[0]), expected)
+            return np.ones((1, kwargs["truncate_dim"]), np.float32)
+
+        jina.model.encode_image = encode
+        result = jina.handle({"op": "embed", "image_paths": [str(self.image)]})
+        self.assertEqual(result["image_inputs"][0]["sha256"], original_hash)
+        self.assertIn("model_input_conversion", result["image_inputs"][0])
+        self.assertEqual(sha256(self.image), original_hash)
+
+    def test_grayscale_support_keeps_pixel_limits_and_rejects_high_bit_depth(self):
+        Image.fromarray(np.zeros((3, 5), dtype=np.uint8)).save(self.image)
+        with self.assertRaisesRegex(ValueError, "exceeds.*max_image_pixels"):
+            _image(self.image, 14, allow_grayscale=True)
+        Image.fromarray(np.zeros((3, 5), dtype=np.uint16)).save(self.image)
+        with self.assertRaisesRegex(ValueError, "8-bit"):
+            _image(self.image, 100, allow_grayscale=True)
 
     def test_limits_reject_without_silent_truncation_or_resize(self):
         adapter = self.qwen(max_input_tokens=9)

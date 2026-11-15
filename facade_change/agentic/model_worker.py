@@ -104,14 +104,25 @@ def _snapshot(model_id, revision, *, allow_patterns=None):
     return str(root), [_resource(path) for path in files]
 
 
-def _image(path, maximum):
+def _image(path, maximum, *, allow_grayscale=False):
     with Image.open(path) as header:
         w, h = header.size
-    if h * w > _integer(maximum, "max_image_pixels"):
-        raise ValueError(f"Image {w}x{h} exceeds configured max_image_pixels; no implicit downscale")
-    rgb, opacity = load_rgb(path)
-    return Image.fromarray(rgb), {"path": str(Path(path).resolve()), "sha256": sha256(path),
-                                  "shape_hw": [h, w], "fully_opaque": bool(opacity.all())}
+        if h * w > _integer(maximum, "max_image_pixels"):
+            raise ValueError(f"Image {w}x{h} exceeds configured max_image_pixels; no implicit downscale")
+        gray = np.array(header) if allow_grayscale and header.mode == "L" else None
+    if gray is None:
+        rgb, opacity = load_rgb(path)
+    else:
+        # Archive photographs may be 8-bit luminance. Repeat the stored samples
+        # only for model input; retain native grid, source bytes and source hash.
+        if gray.dtype != np.uint8:
+            raise ValueError(f"Expected uint8 grayscale model input: {path}")
+        rgb, opacity = np.repeat(gray[..., None], 3, axis=2), np.ones(gray.shape, bool)
+    info = {"path": str(Path(path).resolve()), "sha256": sha256(path),
+            "shape_hw": [h, w], "fully_opaque": bool(opacity.all())}
+    if gray is not None:
+        info["model_input_conversion"] = "L_to_RGB_repeat_channels; native_grid; no_EXIF_transpose"
+    return Image.fromarray(rgb), info
 
 
 def _cuda_state(device):
@@ -269,7 +280,7 @@ class QwenAdapter(Adapter):
                 if block.get("type") == "text" and set(block) <= {"type", "text"} and isinstance(block.get("text"), str):
                     content.append({"type": "text", "text": block["text"]})
                 elif block.get("type") == "image" and set(block) <= {"type", "path", "evidence_id"}:
-                    image, info = _image(block["path"], self.options["max_image_pixels"])
+                    image, info = _image(block["path"], self.options["max_image_pixels"], allow_grayscale=True)
                     images.append(info)
                     if len(images) > maximum_images:
                         raise ValueError("Message images exceed configured/request max_images")
@@ -613,7 +624,9 @@ class JinaAdapter(Adapter):
             raise ValueError("Embedding batch exceeds configured limit")
         if text_mode and any(len(value) > self.options["max_text_chars"] for value in values):
             raise ValueError("Text exceeds max_text_chars; no silent truncation")
-        inputs = values if text_mode else [_image(path, self.options["max_image_pixels"])[0] for path in values]
+        decoded = [] if text_mode else [
+            _image(path, self.options["max_image_pixels"], allow_grayscale=True) for path in values]
+        inputs = values if text_mode else [image for image, _ in decoded]
         task = request.get("task")
         if task not in {None, "retrieval.query"}:
             raise ValueError("Jina supports no task or retrieval.query in this adapter")
@@ -653,6 +666,7 @@ class JinaAdapter(Adapter):
             raise ValueError("Invalid Jina embedding dimensions/values")
         return {"vectors": embeddings.tolist(), "space": self.provenance["space"],
                 "modality": "text" if text_mode else "image", "task": task,
+                **({"image_inputs": [info for _, info in decoded]} if decoded else {}),
                 **({"text_processing": processing} if processing is not None else {})}
 
     def close(self):
