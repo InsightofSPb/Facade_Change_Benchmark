@@ -220,6 +220,7 @@ def parser():
     comparison.add_argument("--labels", help="Explicit offline temporal-region labels; never forwarded to inference")
     comparison.add_argument("--out", required=True)
     tasks.add_parser("qa", help="Generate, curate, export and evaluate facade questions (CPU/offline)")
+    tasks.add_parser("www", help="Run supplied-region QA with a frozen public archive")
     return cli
 
 
@@ -339,6 +340,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["qa"]:
         return importlib.import_module(".2026-11-10_questions", __package__).main(argv[1:])
+    if argv[:1] == ["www"]:
+        return importlib.import_module(".2026-11-15_www", __package__).main(argv[1:])
     arguments = parser().parse_args(argv)
     progress = None
     try:
