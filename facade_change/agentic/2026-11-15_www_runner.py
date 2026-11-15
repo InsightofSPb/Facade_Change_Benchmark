@@ -271,8 +271,7 @@ def validate_answer(value, question, evidence, preparation, common, support_reco
 def _expose_archive(search, match, remaining_images):
     row = copy.deepcopy(search.records[match["evidence_id"]])
     excerpt, truncation = archive.source_excerpt(row, search.index["text_chars"])
-    images = sorted((a for a in row["assets"] if a["media_type"].startswith("image/")),
-                    key=lambda a: (a["page_index"] or 0, a["path"]))
+    images = archive.image_assets(row)
     shown = images[:1] if remaining_images > 0 else []
     record = {**row, "origin": "archive", "observation_id": row["evidence_id"] if shown else None,
               "record_sha256": digest(row), "image_path": None, "text_selection": truncation,

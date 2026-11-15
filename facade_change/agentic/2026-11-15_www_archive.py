@@ -91,10 +91,14 @@ def validate_package(document, root, fingerprints):
         if not isinstance(date, dict) or set(date) != {"start", "end", "precision", "basis"}:
             raise ValueError("Observation date needs start/end/precision/basis, with explicit nulls for unknown")
         start, end = (_date(date[key], "observation_date." + key, optional=True) for key in ("start", "end"))
-        if date["precision"] not in {"day", "month", "year", "interval", "unknown"}:
+        mixed_document = date["precision"] == "mixed_document"
+        if mixed_document and (record["record_type"] != "document" or record["parent_evidence_id"] is not None
+                               or start is not None or end is not None):
+            raise ValueError("mixed_document is only an undated parent document, never a dated photograph")
+        if date["precision"] not in {"day", "month", "year", "interval", "unknown", "mixed_document"}:
             raise ValueError("Unknown observation date precision")
         if ((start is None) != (end is None) or (start is not None and start > end)
-                or (date["precision"] == "unknown") != (start is None)):
+                or (date["precision"] in {"unknown", "mixed_document"}) != (start is None)):
             raise ValueError("Inconsistent capture-date interval; unknown must remain unknown")
         if start is not None and (not date["basis"] or not record["date_source"]):
             raise ValueError("Capture dates require their source basis and locator")
@@ -154,6 +158,10 @@ def import_archive(package_path, out):
     journal = new_run(out, {"package_sha256": sha256(path)}, "www_archive_import")
     try:
         (journal.out / "assets").mkdir()
+        # Retain exact source bytes (including legacy precision) as well as its recorded hash.
+        shutil.copyfile(path, journal.out / "source_package.json")
+        if sha256(journal.out / "source_package.json") != fingerprints.files[str(path)]:
+            raise ValueError("Original archive package changed during import")
         public = copy.deepcopy(package)
         for record in public["records"]:
             for asset in record["assets"]:
@@ -178,6 +186,60 @@ def import_archive(package_path, out):
         raise
     finally:
         journal.close()
+
+
+def image_assets(record):
+    """The existing deterministic display order; one evidence ID exposes its first image."""
+    return sorted((a for a in record["assets"] if a["media_type"].startswith("image/")),
+                  key=lambda a: (a["page_index"] or 0, a["path"]))
+
+
+def reviewed_earliest(case, label, fingerprints):
+    """Validate a PRIVATE human match to a dated image in the frozen PUBLIC corpus.
+
+    No retrieval, inference, automatic support approval or coordinate registration.
+    The corpus hash also binds source/date basis, PDF lineage and all asset bytes.
+    """
+    binding = label["earliest_archive"]
+    keys = {"corpus_path", "corpus_sha256", "record_sha256", "asset_sha256",
+            "building_id", "view_id", "region_id", "match_basis"}
+    if not isinstance(binding, dict) or set(binding) != keys:
+        raise ValueError("earliest_archive needs the exact private corpus/record/asset and reviewed identity binding")
+    for key in ("corpus_sha256", "record_sha256", "asset_sha256"):
+        value = binding[key]
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError("earliest_archive requires actual SHA-256 values: " + key)
+    if not isinstance(binding["corpus_path"], str) or not Path(binding["corpus_path"]).is_absolute():
+        raise ValueError("earliest_archive.corpus_path must be the explicit absolute frozen corpus path")
+    path = Path(binding["corpus_path"])
+    fingerprints.add(path, binding["corpus_sha256"])
+    corpus = validate_package(read_json(path), path.parent, fingerprints)
+    if case["task_mode"] != "retrospective" or case["knowledge_cutoff"] != corpus["knowledge_cutoff"]:
+        raise ValueError("Reviewed archive earliest requires the same retrospective question/corpus freeze")
+    record = next((r for r in corpus["records"] if r["evidence_id"] == label.get("earliest_observation_id")), None)
+    if record is None:
+        raise ValueError("Reviewed earliest observation ID does not exist in the frozen archive")
+    if digest(record) != binding["record_sha256"]:
+        raise ValueError("Reviewed earliest archive record hash mismatch")
+    if (record["identity_status"] != "verified" or record["building_id"] != case["building_id"]
+            or record["view_id"] not in {None, case["view_id"]}
+            or any(binding[k] != case[k] for k in ("building_id", "view_id", "region_id"))):
+        raise ValueError("Reviewed archive image has incompatible or unverified building/view/region identity")
+    if not isinstance(binding["match_basis"], str) or not binding["match_basis"].strip():
+        raise ValueError("Record the human-reviewed visual match to this target region; identity is not automatic support")
+    date = record["observation_date"]
+    if record["record_type"] not in {"image", "image_in_document"} or date["precision"] not in {"year", "month", "day", "interval"} or date["start"] is None or date["end"] is None:
+        raise ValueError("A dated earliest target must be a photograph with a documented capture interval; publication is not capture")
+    assets = image_assets(record)
+    if not assets or assets[0]["sha256"] != binding["asset_sha256"]:
+        raise ValueError("Reviewed earliest asset must be the actual image exposed for this evidence ID")
+    support = label.get("supporting_evidence_ids")
+    if label.get("archival_status") != "verified_useful" or not isinstance(support, list) or record["evidence_id"] not in support:
+        raise ValueError("Archive earliest needs explicit human-reviewed supporting_evidence_ids and archival_status=verified_useful")
+    interval = {k: date[k] for k in ("start", "end", "precision")}
+    if label.get("present_by_interval") != interval or label.get("present_by") is not None:
+        raise ValueError("Archive present_by_interval must preserve the exact capture interval/precision; do not substitute a scalar present_by")
+    return interval
 
 
 def source_excerpt(record, maximum):

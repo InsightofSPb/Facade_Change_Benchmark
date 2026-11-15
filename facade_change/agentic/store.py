@@ -29,7 +29,7 @@ FORBIDDEN = {"gt", "ground_truth", "groundtruth", "annotations", "annotation",
              "packed", "labels", "targets", "target_mask", "gt_mask", "gt_path",
              "provisional_answer", "reference_answer", "generation_reasons", "private_notes",
              "reviewed_labels", "underlying_state", "annotation_evidence", "annotation_previews",
-             "candidate_type", "supporting_evidence_ids", "reviewed_question"}
+             "candidate_type", "supporting_evidence_ids", "reviewed_question", "earliest_archive", "present_by_interval"}
 GEOMETRY_FIELDS = {"source_to_crop", "crop_to_source", "source_to_reference",
     "reference_to_crop", "native_shape", "crop_shape", "bbox_xyxy", "bbox_xywh",
     "coordinate_system", "source_to_anchor", "crop_to_anchor", "anchor_to_crop",

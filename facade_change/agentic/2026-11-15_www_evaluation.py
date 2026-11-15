@@ -23,6 +23,13 @@ curation = importlib.import_module(".2026-11-15_www_curation", __package__)
 ratio = evaluation.ratio
 
 
+def _reference_corpus(labels, corpus_sha256):
+    for label in labels.values():
+        binding = label.get("earliest_archive")
+        if binding is not None and binding["corpus_sha256"] != corpus_sha256:
+            raise ValueError("Reviewed archive earliest target and the frozen retrieval corpus hashes differ (or archive is missing)")
+
+
 def plan(questions_path, answers_path, inventory_path, config, out, *, archive_index=None,
          allow_empty_archive=False, protocol=None, synthetic=False):
     """Freeze reviewed stratum/cohort membership before any model outcomes exist."""
@@ -41,6 +48,8 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
     archive = runner.archive.ArchiveSearch(archive_index, config, fingerprints, synthetic=synthetic) if archive_index else None
     if archive is None and not allow_empty_archive:
         raise ValueError("Explicit empty-archive plumbing flag required; no scientific retrieval comparison")
+    corpus_sha = archive.index["corpus_sha256"] if archive else None
+    _reference_corpus(labels, corpus_sha)
     members = []
     for question in public["questions"]:
         view = views.get((question["building_id"], question["view_id"]), {})
@@ -60,7 +69,7 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
     try:
         payload = qa._private("www_cohort_plan", created_at=datetime.now(timezone.utc).isoformat(),
             questions_sha256=sha256(questions_path), answers_sha256=sha256(answers_path), inventory_sha256=sha256(inventory_path),
-            execution_contract=contract, cases=members, input_sha256=fingerprints.files)
+            execution_contract=contract, archive_corpus_sha256=corpus_sha, cases=members, input_sha256=fingerprints.files)
         write_json(journal.out / "plan.private.json", payload)
         fingerprints.verify()
         summary = {"status": "completed", "questions": len(members), "cohorts": dict(Counter(r["cohort"] for r in members)),
@@ -90,8 +99,7 @@ def structured_correct(question, label, result):
         ids = answer.get("observation_ids", [])
         interval = answer.get("date_interval") or {}
         return (decision == "earliest_presence" and len(ids) == 1 and ids[0] in allowed
-                and interval.get("start") == interval.get("end") == label["present_by"]
-                and interval.get("precision") == ("year" if len(label["present_by"]) == 4 else "day"))
+                and {k: interval.get(k) for k in ("start", "end", "precision")} == qa.earliest_interval(label))
     actual = {k: answer.get(k) for k in ("decision", "observation_ids", "date_interval")}
     return actual in label.get("acceptable_structured_answers", [])
 
@@ -168,6 +176,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
         raise ValueError("Evaluation questions/labels/model/corpus/protocol differ from the predeclared plan")
     if temporal_value(plan_doc["created_at"]) > temporal_value(record["started_utc"]):
         raise ValueError("Cohort/archival stratum was not frozen before model outcomes")
+    _reference_corpus(labels, plan_doc.get("archive_corpus_sha256"))
     members = {r["question_id"]: r for r in plan_doc["cases"]}
     questions = {r["question_id"]: r for r in public["questions"]}
     if len(members) != len(plan_doc["cases"]) or set(members) != set(questions):

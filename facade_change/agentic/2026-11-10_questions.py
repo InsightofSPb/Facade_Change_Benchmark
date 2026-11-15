@@ -263,6 +263,14 @@ def generate(histories, out, *, annotation_targets=None, knowledge_cutoff, task_
         journal.close()
 
 
+def earliest_interval(label):
+    """Reviewed capture-date precision, preserving the legacy local scalar contract."""
+    if label.get("earliest_archive") is not None:
+        return label["present_by_interval"]
+    date = label["present_by"]
+    return {"start": date, "end": date, "precision": "year" if len(date) == 4 else "day"}
+
+
 def _checked_label(case, label, fingerprints):
     if not isinstance(label, dict) or label.get("assessment") not in ASSESSMENTS:
         raise ValueError("Approved cases need an explicit reviewed assessment")
@@ -288,13 +296,28 @@ def _checked_label(case, label, fingerprints):
     if result.get("archival_status") == "verified_useful" and not result.get("supporting_evidence_ids"):
         raise ValueError("Verified archival usefulness needs private supporting evidence IDs")
     if assessment == "earliest_presence":
-        observation = next((r for r in case["observations"] if r["observation_id"] == result.get("earliest_observation_id")), None)
-        if observation is None or result.get("present_by") != observation["date"] or result.get("onset") != "unknown":
+        if result.get("onset") != "unknown" or not isinstance(result.get("earliest_observation_id"), str):
             raise ValueError("Earliest presence needs a permitted dated observation; onset must remain unknown")
+        if "earliest_archive" in result:
+            if result.get("earliest_observation_id") in {r["observation_id"] for r in case["observations"]}:
+                raise ValueError("Archive/local evidence ID collision in the reviewed earliest target")
+            archive = importlib.import_module(".2026-11-15_www_archive", __package__)
+            expected_interval = archive.reviewed_earliest(case, result, fingerprints)
+        else:
+            observation = next((r for r in case["observations"] if r["observation_id"] == result.get("earliest_observation_id")), None)
+            if observation is None or result.get("present_by") != observation["date"]:
+                raise ValueError("Earliest presence needs a permitted dated observation; onset must remain unknown")
+            expected_interval = earliest_interval(result)
+            if "present_by_interval" in result and result["present_by_interval"] != expected_interval:
+                raise ValueError("Local earliest interval differs from its permitted observation date")
         equivalents = result.get("equivalent_observation_ids", [])
-        permitted = {r["observation_id"] for r in case["observations"] if r["date"] == result["present_by"]}
+        permitted = {r["observation_id"] for r in case["observations"]
+                     if earliest_interval({"present_by": r["date"]}) == expected_interval}
+        permitted.add(result["earliest_observation_id"])
         if not isinstance(equivalents, list) or any(not isinstance(v, str) or v not in permitted for v in equivalents):
             raise ValueError("Reviewed equivalent earliest observations must preserve the same date precision")
+    elif "earliest_archive" in result or "present_by_interval" in result:
+        raise ValueError("An archive earliest binding belongs only to an earliest_presence label")
     if "archival_stratum" in result and type(result["archival_stratum"]) is not bool:
         raise ValueError("Predeclared archival_stratum must be an explicit boolean")
     support_ids = result.get("supporting_evidence_ids", [])
