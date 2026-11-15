@@ -7,6 +7,7 @@ import importlib
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 import time
 
@@ -50,10 +51,22 @@ archival_qa: ответь на сформулированный архивный
 "date_interval":null или {"start":"дата","end":"дата","precision":"year|month|day|interval","uncertain":true},
 "boxes":[],"limitations":[]}. У earliest_presence ровно один observation_id и его датированный интервал.
 У change/no_change интервал ограничен требуемыми датами и цитируются обе локальные фотографии.
-boxes необязательны: не оценивай координаты, если не можешь. Каждая рамка содержит evidence_id,
+earliest_presence: start/end/precision копируются точно из даты выбранного показанного фото.
+Год YYYY передаётся как start=YYYY, end=YYYY, precision=year, без разворачивания в дни года.
+Архивные month/day/interval сохраняются точно как в observation_date. Неизвестная дата съёмки не задаёт dated earliest.
+temporal_change: start/end — требуемые даты сравнения; precision всегда interval, даже если обе даты — годы.
+Для change uncertain обязательно true: фактический момент возникновения внутри интервала неизвестен.
+Для no_change uncertain — явно заданный boolean. Для earliest_presence uncertain — явный boolean об
+определённости датированного свидетельства; false не утверждает известный момент возникновения повреждения.
+Все поля date_interval, включая uncertain, обязательны, если интервал не null. Следуй public response_contract.
+boxes необязательны: отсутствие означает []; явное null недопустимо. Не оценивай координаты, если не можешь.
+Каждая рамка содержит evidence_id,
 coordinate_system, bbox_xyxy=[left,top,right,bottom]: четыре конечных числа, right>left, bottom>top,
-в пределах показанного изображения. Локальные кропы: region_crop_pixels; архив: observation_native.
+в абсолютных пикселях показанного RGB: 0<=left<right<=width, 0<=top<bottom<=height.
+Это не нормированные доли 0..1 и не шкала 0..1000; дробные числа тоже означают пиксели, а не доли размера.
+Локальные кропы: region_crop_pixels; архив: observation_native. shape задаёт [height,width].
 Нельзя переносить native-координаты на crop без проверенного преобразования.
+Допустимость геометрии и общей поддержки не подтверждает точность локализации.
 Если разрешён поиск, вместо финала можно вернуть {"type":"retrieve","query":"вопрос к архиву",
 "observation_id":null или "ID показанной локальной фотографии"}. Других действий нет.
 Учитывай показанные остатки бюджета. Текстовые совпадения и корректные citation IDs не доказывают истинность вывода.
@@ -164,8 +177,9 @@ def _text(text):
 def _photo_blocks(evidence):
     blocks = []
     for record in evidence.values():
-        blocks.extend([{"type": "text", "text": json.dumps({key: record[key] for key in (
-            "evidence_id", "observation_id", "date", "coordinate_system", "region_id")}, ensure_ascii=False)},
+        metadata = {key: record[key] for key in ("evidence_id", "observation_id", "date", "coordinate_system", "region_id")}
+        metadata["shape"] = record["frame"]["shape"]
+        blocks.extend([{"type": "text", "text": json.dumps(metadata, ensure_ascii=False)},
             {"type": "image", "path": record["image_path"], "evidence_id": record["evidence_id"]}])
     return blocks
 
@@ -176,9 +190,99 @@ def _strings(value, name, limit=20):
     return value
 
 
-def validate_answer(value, question, evidence, preparation, common, support_record, protocol):
-    if not isinstance(value, dict) or set(value) != ANSWER_KEYS or value["type"] != "final":
-        raise ValueError("Return the exact task-specific final JSON schema")
+def parse_reply(raw, normalizations=None):
+    """One bounded object; only outer wrappers and omitted optional boxes may change.
+
+    Also accepts saved parsed objects for offline validation. Never edits its input.
+    Callers persist the original worker text and this cosmetic audit separately.
+    """
+    changes = normalizations if normalizations is not None else []
+    if isinstance(raw, str):
+        if len(raw) > 100_000:
+            raise ValueError("Qwen did not return bounded text")
+        text = raw.strip()
+        if text != raw:
+            changes.append("removed_outer_whitespace")
+        fence = re.match(r"```(?:json)?[ \t]*\r?\n", text)
+        if fence:
+            if not text.endswith("```"):
+                raise ValueError("Incomplete JSON code fence; no truncated content is accepted")
+            text = text[fence.end():-3].strip()
+            changes.append("removed_single_json_fence")
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate JSON field: " + key)
+                result[key] = value
+            return result
+
+        def constant(value):
+            raise ValueError("Non-finite JSON number: " + value)
+
+        def finite(value):
+            number = float(value)
+            if not math.isfinite(number):
+                constant(value)
+            return number
+
+        value, end = json.JSONDecoder(object_pairs_hook=unique, parse_constant=constant, parse_float=finite).raw_decode(text)
+        tail = text[end:]
+        if tail.strip():
+            if not fence or any(c not in " \t\r\n`" for c in tail):
+                raise ValueError("Expected one JSON object only; trailing prose or multiple answers are not permitted")
+            changes.append("removed_trailing_backticks_inside_fence")
+    else:
+        value = raw
+    if not isinstance(value, dict):
+        raise ValueError("Expected one JSON object")
+    value = copy.deepcopy(value)
+    if value.get("type") == "final" and "boxes" not in value:
+        value["boxes"] = []
+        changes.append("defaulted_omitted_optional_boxes")
+    return value
+
+
+def _photo_interval(record):
+    return ({"start": record["date"], "end": record["date"], "precision": "year" if len(record["date"]) == 4 else "day"}
+            if record["origin"] == "local_photo" else {k: record["observation_date"][k] for k in ("start", "end", "precision")})
+
+
+def response_contract(question, evidence, preparation):
+    """Public protocol scaffold, never a reference answer or a selected earliest photo."""
+    decisions = {"earliest_evidence": ["earliest_presence"], "temporal_change": ["change", "no_change"],
+                 "archival_qa": ["supported"]}[question["task"]]
+    scaffold = {"type": "final", "decision": decisions + ["insufficient_data", "incomparable"],
+        "answer_text": "краткий русский ответ", "citations": "список показанных evidence_id",
+        "observation_ids": "список показанных photo observation_id", "boxes": [], "limitations": []}
+    if question["task"] == "temporal_change":
+        dates = sorted(set(question["task_dates"]), key=temporal_value)
+        scaffold["date_interval"] = {"start": dates[0], "end": dates[-1], "precision": "interval",
+                                     "uncertain": "true для change; явный boolean для no_change"}
+    else:
+        scaffold["date_interval"] = {"start": "дата из источника", "end": "дата из источника",
+                                     "precision": "year|month|day|interval из источника", "uncertain": "явный boolean"}
+    return {"field_scaffold_not_an_answer": scaffold, "exposed_citation_ids": list(evidence),
+        "shown_photo_capture_intervals": {r["observation_id"]: _photo_interval(r) for r in evidence.values()
+                                          if r.get("image_path") and r.get("observation_id")},
+        "required_temporal_citations": preparation["compared_observations"] if question["task"] == "temporal_change" else [],
+        "abstention": "insufficient_data/incomparable требуют конкретных limitations; date_interval может быть null"}
+
+
+def _fields(value, expected, name):
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object with fields {sorted(expected)}")
+    missing, extra = expected - set(value), set(value) - expected
+    if missing or extra:
+        raise ValueError(f"{name}: missing fields={sorted(missing)}; unexpected fields={sorted(extra)}")
+
+
+def validate_answer(value, question, evidence, preparation, common, support_record, protocol, *, normalizations=None):
+    value = parse_reply(value, normalizations)
+    _fields(value, ANSWER_KEYS, "final")
+    if value["type"] != "final":
+        raise ValueError('final.type must be "final"')
     reject_forbidden(value)
     decision = value["decision"]
     task_decisions = {"earliest_evidence": {"earliest_presence"}, "temporal_change": {"change", "no_change"},
@@ -191,7 +295,7 @@ def validate_answer(value, question, evidence, preparation, common, support_reco
     observation_ids = _strings(value["observation_ids"], "observation_ids")
     limitations = _strings(value["limitations"], "limitations")
     if len(set(citations)) != len(citations) or not set(citations) <= set(evidence):
-        raise ValueError("Citations must name distinct evidence actually exposed in this condition")
+        raise ValueError(f"Citations must name distinct evidence actually exposed in this condition: {list(evidence)}")
     observations = {r["observation_id"]: r for r in evidence.values() if r.get("image_path") and r.get("observation_id")}
     if not set(observation_ids) <= set(observations):
         raise ValueError("Observation IDs must refer to photos actually shown")
@@ -202,10 +306,11 @@ def validate_answer(value, question, evidence, preparation, common, support_reco
         raise ValueError("A substantive answer needs exposed citations")
     interval = value["date_interval"]
     if interval is not None:
-        if not isinstance(interval, dict) or set(interval) != {"start", "end", "precision", "uncertain"}:
-            raise ValueError("Use a dated interval with explicit precision and uncertainty")
+        _fields(interval, {"start", "end", "precision", "uncertain"}, "date_interval")
+        if type(interval["uncertain"]) is not bool:
+            raise ValueError("date_interval.uncertain must be an explicit boolean, not a string or number")
         start, end = archive._date(interval["start"], "answer.start"), archive._date(interval["end"], "answer.end")
-        if start > end or end > temporal_value(question["knowledge_cutoff"]) or type(interval["uncertain"]) is not bool:
+        if start > end or end > temporal_value(question["knowledge_cutoff"]):
             raise ValueError("Invalid/future answer interval")
         if interval["precision"] not in {"year", "month", "day", "interval"}:
             raise ValueError("Explicit supported date precision required")
@@ -213,20 +318,25 @@ def validate_answer(value, question, evidence, preparation, common, support_reco
         if len(observation_ids) != 1 or observation_ids[0] not in citations:
             raise ValueError("Earliest presence identifies and cites one exposed dated photograph")
         record = observations[observation_ids[0]]
-        expected = ({"start": record["date"], "end": record["date"], "precision": "year" if len(record["date"]) == 4 else "day"}
-                    if record["origin"] == "local_photo" else {k: record["observation_date"][k] for k in ("start", "end", "precision")})
+        expected = _photo_interval(record)
         if interval is None or not expected["start"] or any(interval[k] != v for k, v in expected.items()):
-            raise ValueError("Present-by interval must preserve the chosen photo's documented date precision; no invented onset")
+            raise ValueError(f"Present-by interval must preserve the chosen photo's documented date precision: "
+                             f"observation_id={observation_ids[0]}, expected={json.dumps(expected)}; received={json.dumps(interval)}. "
+                             "Unknown capture dates cannot establish dated earliest; use canonical source dates, not expanded year endpoints")
     if decision in {"change", "no_change"}:
         if not set(preparation["compared_observations"]) <= set(citations) or not common.any():
             raise ValueError("Temporal verdict needs both local dates and actual common geometric support")
         dates = sorted(set(question["task_dates"]), key=temporal_value)
-        if interval is None or [interval["start"], interval["end"]] != [dates[0], dates[-1]] or interval["precision"] != "interval":
-            raise ValueError("Temporal answer interval must retain the required observation dates")
-        if decision == "change" and not interval["uncertain"]:
-            raise ValueError("An observed difference does not establish its exact onset within the interval")
+        expected = {"start": dates[0], "end": dates[-1], "precision": "interval"}
+        if decision == "change":
+            expected["uncertain"] = True
+        mismatches = [f"{k}: expected {json.dumps(v)}, received {json.dumps((interval or {}).get(k))}"
+                      for k, v in expected.items() if interval is None or interval.get(k) != v]
+        if mismatches:
+            raise ValueError("Temporal date_interval: " + "; ".join(mismatches) +
+                             ". precision describes the comparison interval; change cannot establish exact onset")
     if not isinstance(value["boxes"], list) or len(value["boxes"]) > protocol["max_event_boxes"]:
-        raise ValueError("Too many event boxes")
+        raise ValueError(f"boxes must be a list with at most {protocol['max_event_boxes']} entries; omit it or use [] if unknown, never null")
     boxes = []
     for box in value["boxes"]:
         if not isinstance(box, dict) or set(box) - {"evidence_id", "bbox_xyxy", "coordinate_system", "region_id", "observation_id", "anchor_sha256"}:
@@ -283,6 +393,8 @@ def _expose_archive(search, match, remaining_images):
     blocks = [{"type": "text", "text": json.dumps(metadata, ensure_ascii=False)}]
     if shown:
         asset = shown[0]
+        metadata["shape"] = [asset["height"], asset["width"]]
+        blocks[0]["text"] = json.dumps(metadata, ensure_ascii=False)
         path = str(archive._inside(search.root, asset["path"]))
         record.update(image_path=path, image_sha256=asset["sha256"], shape=[asset["height"], asset["width"]])
         blocks.append({"type": "image", "path": path, "evidence_id": row["evidence_id"]})
@@ -298,7 +410,8 @@ def _condition(question, condition, prepared, local, common, support_record, sea
     initial = {key: question[key] for key in ("question_id", "task", "question", "building_id", "view_id", "region_id",
                "task_dates", "task_mode", "knowledge_cutoff")}
     initial.update(common_pixels=prepared["common_pixels"], reference_pixels=prepared["reference_pixels"],
-                   source_pixels=prepared["source_pixels"], region_shape=question["frame"]["shape"])
+                   source_pixels=prepared["source_pixels"], region_shape=question["frame"]["shape"],
+                   response_contract=response_contract(question, local, prepared))
     messages = [{"role": "system", "content": [{"type": "text", "text": SYSTEM}]},
                 {"role": "user", "content": [{"type": "text", "text": json.dumps(initial, ensure_ascii=False)}, *_photo_blocks(local)]}]
     costs = {key: 0 for key in ("model_calls", "input_tokens", "output_tokens", "images", "cache_hits", "model_loads",
@@ -428,8 +541,11 @@ def _condition(question, condition, prepared, local, common, support_record, sea
                 raise ValueError("Qwen did not return bounded text")
             messages.append({"role": "assistant", "content": [{"type": "text", "text": raw}]})
             persist()
+            parsing = {"source_call": costs["calls"][-1]["artifact"], "source_call_sha256": costs["calls"][-1]["sha256"],
+                       "normalizations": [], "parsed": None, "validation_error": None}
             try:
-                value = json.loads(raw)
+                value = parse_reply(raw, parsing["normalizations"])
+                parsing["parsed"] = value
                 if isinstance(value, dict) and value.get("type") == "final":
                     answer = validate_answer(value, question, evidence, prepared, common, support_record, protocol)
                     write_json(out / "final_raw.json", value)
@@ -439,12 +555,17 @@ def _condition(question, condition, prepared, local, common, support_record, sea
                 else:
                     raise ValueError("Expected a task-specific final answer or permitted retrieve action")
             except (ValueError, TypeError, KeyError) as exc:
+                parsing["validation_error"] = str(exc)
                 invalid += 1
                 journal.event("agent_validation_error", case_id=question["question_id"], mode=condition,
-                              error=str(exc), generation=response.get("generation"))
+                              error=str(exc), generation=response.get("generation"), normalizations=parsing["normalizations"])
                 if invalid > budgets["max_invalid_replies"]:
                     raise RuntimeError("invalid_reply_limit: " + str(exc)) from exc
-                messages.append(_text("Ответ не прошёл проверку: " + str(exc) + ". Верни допустимый JSON; не дополняй оборванный JSON догадками."))
+                messages.append(_text("Ответ не прошёл проверку: " + str(exc) +
+                    ". Заново сформулируй ответ по показанным свидетельствам и этому публичному контракту. "
+                    "Не дополняй оборванный JSON догадками. " + json.dumps(response_contract(question, evidence, prepared), ensure_ascii=False)))
+            finally:
+                write_json(out / f"reply-{costs['qwen_requests']:03d}.json", parsing)
     except (OSError, ValueError, RuntimeError, TypeError, KeyError) as exc:
         result = {"status": "error", "decision": None, "answer": None, "error": f"{type(exc).__name__}: {exc}"}
     persist()
@@ -475,7 +596,7 @@ def execution_contract(path, config, archive_sha, conditions, protocol, budgets,
     return {"schema_version": 1, "questions_sha256": sha256(path), "archive_index_sha256": archive_sha,
         "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
         "prompt_sha256": digest(SYSTEM), "implementation_sha256": {p.name: sha256(p) for p in source_files},
-        "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS)}
+        "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []}}
 
 
 def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=False, conditions=CONDITIONS,

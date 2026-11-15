@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import stat
 import subprocess
 import sys
 import threading
@@ -65,7 +66,7 @@ def positive_number(value, name):
     return float(value)
 
 
-def _timed_sha256(path, deadline=None):
+def _timed_sha256(path, deadline=None, stats=None):
     checksum = hashlib.sha256()
     with Path(path).open("rb") as stream:
         while True:
@@ -74,6 +75,8 @@ def _timed_sha256(path, deadline=None):
             block = stream.read(1024 * 1024)
             if not block:
                 return checksum.hexdigest()
+            if stats is not None:
+                stats["bytes_hashed"] += len(block)
             checksum.update(block)
 
 
@@ -104,12 +107,75 @@ def _identity_files(value, deadline=None):
     return found
 
 
-def _resources_valid(resources, deadline=None):
-    for row in resources:
-        path = Path(row["path"])
-        if not path.is_file() or _timed_sha256(path, deadline) != row["sha256"]:
-            return False
-    return True
+def _resources_valid(resources, deadline=None, stats=None):
+    """Full verification remains mandatory for persisted responses and resume."""
+    started = time.monotonic()
+    try:
+        for row in resources:
+            path = Path(row["path"])
+            if not path.is_file():
+                return False
+            if stats is not None:
+                stats["files_hashed"] += 1
+            if _timed_sha256(path, deadline, stats) != row["sha256"]:
+                return False
+        return True
+    finally:
+        if stats is not None:
+            stats["seconds"] += time.monotonic() - started
+
+
+class _ResourceVerifier:
+    """One pool's resource digests; never used to skip hashing model-visible inputs.
+
+    Approval binds the resolved file identity and nanosecond metadata. A change
+    during hashing fails closed and cannot seed the cache. Nothing is persisted.
+    """
+    def __init__(self):
+        self._verified = {}
+        self._pid = os.getpid()
+
+    @staticmethod
+    def _signature(path):
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Model resource is not a regular file: {path}")
+        return (str(resolved), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def sha256(self, path, deadline, stats):
+        started = time.monotonic()
+        path = Path(path).expanduser().absolute()
+        try:
+            if self._pid != os.getpid():
+                self._verified.clear()  # Also forbid inheriting approval across fork.
+                self._pid = os.getpid()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WorkerError("timeout", "Deadline exceeded while verifying model resources")
+            signature = self._signature(path)
+            cached = self._verified.get(str(path))
+            if cached is not None and cached[0] == signature:
+                stats["stat_cache_hits"] += 1
+                return cached[1]
+            self._verified.pop(str(path), None)
+            stats["files_hashed"] += 1
+            checksum = _timed_sha256(signature[0], deadline, stats)
+            if self._signature(path) != signature:
+                raise WorkerError("resource_changed", f"Model resource changed during verification: {path}")
+            self._verified[str(path)] = (signature, checksum)
+            return checksum
+        finally:
+            stats["seconds"] += time.monotonic() - started
+
+    def valid(self, resources, deadline, stats):
+        for row in resources:
+            try:
+                checksum = self.sha256(row["path"], deadline, stats)
+            except FileNotFoundError:
+                return False
+            if checksum != row["sha256"]:
+                return False
+        return True
 
 
 class WorkerError(RuntimeError):
@@ -224,6 +290,8 @@ class ModelPool:
         self.progress = None
         self._pool_id = uuid.uuid4().hex
         self._lock = threading.Lock()
+        self._resource_verifier = _ResourceVerifier()
+        self._resource_checks = None
 
     def _event(self, **values):
         """Persist model/lifecycle events; an optional parent observer is diagnostic."""
@@ -256,7 +324,7 @@ class ModelPool:
         resources = {}
         for name in ("checkpoint_path",):
             if options.get(name) and Path(options[name]).is_file():
-                resources[name] = _timed_sha256(options[name], deadline)
+                resources[name] = self._resource_verifier.sha256(options[name], deadline, self._resource_checks)
         semantic = {k: v for k, v in payload.items() if k not in {"out", "timeout_seconds"}}
         source_hashes = {p.name: _timed_sha256(p, deadline) for p in (Path(__file__), Path(__file__).with_name("model_worker.py"))}
         return digest({"schema": 1, "role": role, "options": options, "request": semantic,
@@ -272,7 +340,7 @@ class ModelPool:
         result = entry["response"]
         if not _resources_valid(result.get("artifacts", []), deadline):
             return None
-        if not _resources_valid(result.get("provenance", {}).get("resources", []), deadline):
+        if not _resources_valid(result.get("provenance", {}).get("resources", []), deadline, self._resource_checks):
             return None
         return copy.deepcopy(result)
 
@@ -302,7 +370,7 @@ class ModelPool:
                 self._release(current, "gpu_handoff")
         if role in self.workers and (
                 self._worker_options.get(role) != digest(self.models[role])
-                or not _resources_valid(self.workers[role].provenance.get("resources", []), deadline)):
+                or not self._resource_verifier.valid(self.workers[role].provenance.get("resources", []), deadline, self._resource_checks)):
             self._release(role, "model_configuration_or_resources_changed")
         if role not in self.workers:
             self.workers[role] = _Worker(role, self.models[role], self.log_dir, deadline)
@@ -333,11 +401,13 @@ class ModelPool:
                 "retries", "worker_starts", "incomplete", "unobserved_worker_cost") if key in usage}
             self._call_event(event="pool_model_returned", role=role, op=operation,
                              status=detail.get("status"), error=detail.get("error"), usage=measured,
+                             resource_validation=usage.get("resource_validation"),
                              elapsed_seconds=time.monotonic() - started)
             return result
 
     def _call(self, role, payload):
         started = time.monotonic()
+        self._resource_checks = {"seconds": 0., "bytes_hashed": 0, "files_hashed": 0, "stat_cache_hits": 0}
         if role not in self.models:
             return {"status": "error", "error": {"code": "not_configured", "message": f"Model role is not configured: {role}"},
                     "usage": {"elapsed_seconds": 0., "model_loads": 0, "cache_hits": 0,
@@ -361,6 +431,7 @@ class ModelPool:
                 return {**cached, "cache_key": key, "cache_hit": True, "source_usage": original,
                         "usage": {**totals, "cache_hits": 1, "peak_allocated_bytes": 0,
                                   "peak_reserved_bytes": 0, "min_free_bytes": None,
+                                  "resource_validation": self._resource_checks,
                                   "elapsed_seconds": time.monotonic() - started}}
             for attempt in range(2):
                 worker, created = self._activate(role, deadline)
@@ -382,6 +453,10 @@ class ModelPool:
                 attempts.append({"attempt": attempt + 1, "status": reply.get("status"),
                                  "error": reply.get("error"), "usage": usage,
                                  "provenance": reply.get("provenance", {})})
+                # New provenance (including lazily loaded weights) gets a full first
+                # verification; warm calls check identity/metadata before and after use.
+                if not self._resource_verifier.valid(worker.provenance.get("resources", []), deadline, self._resource_checks):
+                    raise WorkerError("resource_changed", "Worker model resource hashes no longer match provenance")
                 if reply.get("status") != "error" or reply.get("error", {}).get("code") != "out_of_memory":
                     break
                 # Drop only application-owned processes. A second failure is terminal.
@@ -392,6 +467,7 @@ class ModelPool:
                 totals["retries"] += 1
             result = {**reply, "cache_key": key, "cache_hit": False,
                       "usage": {**totals, "elapsed_seconds": time.monotonic() - started,
+                                "resource_validation": self._resource_checks,
                                 "min_free_bytes": minimum_free, "attempts": attempts}}
             if result.get("status") in {"ok", "empty"} and payload.get("op") != "check":
                 self._store(key, result)
@@ -403,6 +479,7 @@ class ModelPool:
             return {"status": "error", "error": {"code": getattr(exc, "code", "validation_error"), "message": str(exc)},
                     "cache_key": key, "cache_hit": False,
                     "usage": {**totals, "elapsed_seconds": time.monotonic() - started, "attempts": attempts,
+                              "resource_validation": self._resource_checks,
                               "min_free_bytes": minimum_free,
                               "incomplete": isinstance(exc, WorkerError),
                               "unobserved_worker_cost": isinstance(exc, WorkerError)}}
