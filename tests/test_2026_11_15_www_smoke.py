@@ -14,6 +14,55 @@ runner = demo.runner
 
 
 class TransportTests(unittest.TestCase):
+    def test_action_envelopes_preserve_query_reason_and_input(self):
+        # Same envelope shapes as the real probe; these strings are synthetic.
+        actions = [
+            {"stage": "choose_action", "action": "retrieve", "query": "building_id:fixture date:2008-2009"},
+            {"stage": "choose_action", "action": "retrieve", "query": "building_id=fixture region_id=synthetic"},
+            {"stage": "choose_action", "action": "answer", "reason": "Достаточно показанных фото"},
+            {"action": "abstain", "reason": "Синтетическая окклюзия"},
+            {"type": "retrieve", "query": "  Preserve spacing  ", "observation_id": "shown-id", "reason": "Check source"},
+            {"type": "answer"},
+        ]
+        for original in actions:
+            with self.subTest(original=original):
+                before = copy.deepcopy(original)
+                changes = []
+                parsed = runner.parse_reply(json.dumps(original, ensure_ascii=False), changes)
+                normalized = runner.normalize_action(parsed, changes)
+                expected = {k: v for k, v in original.items() if k not in {"stage", "action"}}
+                expected["type"] = original.get("type", original.get("action"))
+                if expected["type"] == "retrieve":
+                    expected.setdefault("observation_id", None)
+                self.assertEqual(normalized, expected)
+                self.assertEqual(original, before)
+                self.assertEqual(parsed, original)
+                if "action" in original:
+                    self.assertIn("action_key_to_type", changes)
+
+    def test_ambiguous_or_semantically_incomplete_actions_are_not_repaired(self):
+        invalid = [
+            {"type": "answer", "action": "retrieve"},
+            {"type": "answer", "action": "answer"},
+            {"stage": "answer", "action": "retrieve", "query": "x"},
+            {"action": "retrieve"},
+            {"action": "retrieve", "query": ""},
+            {"action": "retrieve", "query": 12},
+            {"action": "retrieve", "query": "x", "observation_id": []},
+            {"action": "retrieve", "query": "x", "observation_ids": []},
+            {"action": "answer", "reason": None},
+            {"action": "abstain"},
+            {"action": "abstain", "reason": " "},
+            {"action": "answer", "citations": ["invented"]},
+            {"action": "unsupported"},
+            {"action": ["retrieve", "answer"]},
+            {"retrieve": {"query": "x"}, "answer": {}},
+            {"action": "final", "decision": "supported"},
+        ]
+        for original in invalid:
+            with self.subTest(original=original), self.assertRaises(ValueError):
+                runner.normalize_action(original)
+
     def test_plain_fence_and_observed_punctuation_preserve_object(self):
         value = {"type": "final", "answer_text": "Русский ответ с ` и {} внутри строки", "boxes": []}
         raw = json.dumps(value, ensure_ascii=False)

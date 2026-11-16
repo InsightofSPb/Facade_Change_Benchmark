@@ -14,6 +14,30 @@
 шаблон final в начальном запросе и после retrieval мог подталкивать модель
 к немедленному ответу; это гипотеза о причине поведения, не доказанный механизм.
 
+### Уточнение по реальному probe-002
+
+Владелец передал шесть исходных ответов Qwen: по две попытки на вопрос.
+Для обоих архивных вопросов модель явно выбрала `action=retrieve`, для
+локального контроля — `action=answer`. Вызовов поиска всё равно не произошло:
+обработчик ожидал `type`, а модель вернула `stage/action`, опустила необязательный
+`observation_id` и добавила пояснение `reason` к локальному выбору. Это ошибка
+совместимости обработчика с фактическим JSON, а не свидетельство отказа искать.
+
+Исправление принимает обе однозначные формы, сохраняет исходный parsed JSON
+и отдельно записывает `normalized_action` с журналом преобразований. Только
+отсутствующий необязательный `observation_id` получает null; действие, запрос
+и пояснение не переписываются. Пояснение выбора не становится свидетельством
+или GT. Конфликт `type`/`action`, неверный stage, неизвестное действие, лишние
+аргументы и отсутствующий query по-прежнему отклоняются с конкретной ошибкой.
+
+Prompt revision остаётся v2: наблюдаемый выбор действий уже соответствует этим
+трём диагностическим вопросам. Меняется только формат разбора:
+`action_transport_revision=2026-11-16-action-envelope-v1`. Implementation hash
+меняется; старые runs и их статусы сохраняются, resume из них не используется.
+В поиске query передаётся Jina как текст без переписывания; строки `date:` и
+`building_id=` не вводят дополнительные жёсткие фильтры поверх действующей
+проверки identity/availability.
+
 ## Изменение протокола
 
 Revision: `2026-11-16-explicit-archive-actions-v2`.
@@ -60,8 +84,8 @@ set -o pipefail &&
   --config /home/sasha/Facade_Change_Benchmark/configs/2026-11-15-www-archive-20mp-001.local.json \
   --archive-index /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-archive-index-v31-001/index.json \
   --conditions bounded_agentic_retrieval \
-  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-tool-probe-3-002 \
-  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-tool-probe-3-002.console.log
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-tool-probe-3-003 \
+  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-tool-probe-3-003.console.log
 ```
 
 Для двух архивных вопросов проверяем, выбрал ли настоящий Qwen `retrieve`,
@@ -89,3 +113,18 @@ CLI `www demo` прошёл: 8 completed, 1 ожидаемый abstained, 0 erro
 Прежняя проверка demo на 9 completed скорректирована под эту обоснованную
 недостаточность данных. `git diff --check` и `bash -n` для WSL-команды прошли.
 GPU, настоящий Qwen и реальный повтор трёх вопросов в Cloud не запускались.
+
+### Проверки исправления формата probe-002
+
+Все шесть переданных владельцем JSON проверены офлайн: четыре retrieve и два
+answer (две попытки на вопрос). Выбранное действие, query и reason сохранены;
+это проверка разбора, а не шесть выполненных вызовов поиска.
+
+Прошли 47 CPU-тестов из `test_2026_11_15_www*.py`, включая сквозной dispatch
+для stage/action и отказ от retrieval для локального выбора с reason.
+Последний тест отдельно повторён после перевода его fixture на этот формат.
+Прежние guards на бюджеты, неизвестные IDs, архивные ссылки, даты, координаты,
+resume и ошибки сохранены. CLI demo: 8 completed, 1 ожидаемый abstained,
+0 errors, `models_executed=false`. `git diff --check` и синтаксис команды WSL
+проверены. Фактический поиск Jina и последующие ответы Qwen на этих трёх реальных
+вопросах требуют нового WSL-запуска; старый `probe-002` остаётся с тремя errors.

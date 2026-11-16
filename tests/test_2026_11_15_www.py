@@ -77,7 +77,14 @@ class WWWRunnerTest(unittest.TestCase):
                 control = json.loads(scripted["messages"][-1]["content"][0]["text"])
                 control["allowed_action"] = "decide" if control["stage"] == "choose_action" else "final"
                 scripted["messages"][-1]["content"][0]["text"] = json.dumps(control)
-                return super().call(role, scripted)
+                response = super().call(role, scripted)
+                if control["stage"] == "choose_action":
+                    value = json.loads(response["text"])
+                    value["action"] = value.pop("type")
+                    value["stage"] = "choose_action"
+                    value.setdefault("reason", "Synthetic local sufficiency; not factual evidence")
+                    response["text"] = json.dumps(value)
+                return response
         modes = (runner.CONDITIONS[0], runner.CONDITIONS[2])
         result = self.run_fixture(pool_factory=LocalOnly, conditions=modes)
         self.assertEqual(result["outcome_counts"], {"completed": 4, "abstained": 2, "error": 0})
@@ -142,6 +149,38 @@ class WWWRunnerTest(unittest.TestCase):
         answer["citations"] = [identifier]
         self.assertEqual(runner.validate_answer(answer, question, evidence, prepared, common, support,
                                                runner.PROTOCOL)["status"], "completed")
+
+    def test_stage_action_envelope_dispatches_and_keeps_raw_choice(self):
+        class EnvelopePool(demo.SyntheticPool):
+            def call(self, role, payload):
+                response = super().call(role, payload)
+                if role != "qwen":
+                    return response
+                value = json.loads(response["text"])
+                if value["type"] == "final":
+                    return response
+                value["action"] = value.pop("type")
+                value["stage"] = "choose_action"
+                value["reason"] = "Synthetic reasoning, not an evidence record"
+                value.pop("observation_id", None)
+                response["text"] = json.dumps(value)
+                return response
+
+        result = self.run_fixture(pool_factory=EnvelopePool, conditions=("bounded_agentic_retrieval",))
+        self.assertEqual(result["outcome_counts"], {"completed": 3, "abstained": 0, "error": 0})
+        for row in read_json(self.root / "run/results.json")["results"]:
+            folder = self.root / "run/questions" / row["question_id"] / row["condition"]
+            reply = read_json(folder / "reply-001.json")
+            self.assertEqual(reply["parsed"]["action"], "retrieve")
+            self.assertNotIn("type", reply["parsed"])
+            self.assertEqual(reply["normalized_action"]["type"], "retrieve")
+            self.assertEqual(reply["normalized_action"]["reason"], reply["parsed"]["reason"])
+            self.assertIn("action_key_to_type", reply["normalizations"])
+            tool = read_json(folder / "retrieval-01.json")
+            self.assertEqual(tool["arguments"]["query"], reply["parsed"]["query"])
+            self.assertIsNone(tool["arguments"]["observation_id"])
+            self.assertEqual(row["costs"]["retrieval_rounds"], 1)
+            self.assertEqual(row["costs"]["qwen_requests"], 3)
 
     def test_unsupported_archive_answer_choice_can_retry_with_real_tool_dispatch(self):
         public = read_json(self.questions)

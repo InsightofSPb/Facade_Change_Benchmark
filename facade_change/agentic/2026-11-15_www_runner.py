@@ -292,6 +292,43 @@ def _fields(value, expected, name):
         raise ValueError(f"{name}: missing fields={sorted(missing)}; unexpected fields={sorted(extra)}")
 
 
+def normalize_action(value, normalizations=None):
+    """Accept explicit type or stage/action envelopes without changing the decision or query."""
+    value = copy.deepcopy(value)
+    changes = normalizations if normalizations is not None else []
+    if not isinstance(value, dict):
+        raise ValueError("choose_action must be one JSON object")
+    if "stage" in value:
+        if value["stage"] != "choose_action":
+            raise ValueError(f"Action stage must be choose_action; received={value['stage']!r}")
+        del value["stage"]
+        changes.append("removed_explicit_choose_action_stage")
+    if "action" in value:
+        if "type" in value:
+            raise ValueError("Use one action discriminator, type or action, not both")
+        value["type"] = value.pop("action")
+        changes.append("action_key_to_type")
+    action = value.get("type")
+    if not isinstance(action, str) or action not in {"retrieve", "answer", "abstain"}:
+        raise ValueError(f"Expected retrieve, answer or abstain; received type={action!r}, fields={sorted(value)}")
+    required = {"type", "query"} if action == "retrieve" else {"type", "reason"} if action == "abstain" else {"type"}
+    optional = {"reason", "observation_id"} if action == "retrieve" else {"reason"}
+    _fields(value, required | (set(value) & optional), "choose_action")
+    if "reason" in value:
+        reason = value["reason"]
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            raise ValueError("Action reason must be a concise, nonempty string")
+    if action == "retrieve":
+        if not isinstance(value["query"], str) or not value["query"].strip():
+            raise ValueError("retrieve.query must be a nonempty string")
+        if "observation_id" not in value:
+            value["observation_id"] = None
+            changes.append("defaulted_optional_query_observation_id")
+        if value["observation_id"] is not None and not isinstance(value["observation_id"], str):
+            raise ValueError("retrieve.observation_id must be a shown local ID or null")
+    return value
+
+
 def validate_answer(value, question, evidence, preparation, common, support_record, protocol, *, normalizations=None):
     value = parse_reply(value, normalizations)
     _fields(value, ANSWER_KEYS, "final")
@@ -597,10 +634,13 @@ def _condition(question, condition, prepared, local, common, support_record, sea
             messages.append({"role": "assistant", "content": [{"type": "text", "text": raw}]})
             persist()
             parsing = {"stage": stage, "source_call": costs["calls"][-1]["artifact"], "source_call_sha256": costs["calls"][-1]["sha256"],
-                       "normalizations": [], "parsed": None, "validation_error": None}
+                       "normalizations": [], "parsed": None, "normalized_action": None, "validation_error": None}
             try:
                 value = parse_reply(raw, parsing["normalizations"])
                 parsing["parsed"] = value
+                if stage == "choose_action" and value.get("type") != "final":
+                    value = normalize_action(value, parsing["normalizations"])
+                    parsing["normalized_action"] = value
                 if isinstance(value, dict) and value.get("type") == "final":
                     if stage != "answer":
                         raise ValueError("Choose an action first: retrieve, answer or abstain; final is not permitted at choose_action")
@@ -609,26 +649,24 @@ def _condition(question, condition, prepared, local, common, support_record, sea
                     answer = validate_answer(value, question, evidence, prepared, common, support_record, protocol)
                     write_json(out / "final_raw.json", value)
                     result = {"status": answer["status"], "decision": answer["decision"], "answer": answer}
-                elif isinstance(value, dict) and set(value) == {"type", "query", "observation_id"} and value["type"] == "retrieve":
+                elif value.get("type") == "retrieve":
                     if stage != "choose_action" or allowance["allowed_action"] != "retrieve_or_decide":
                         raise ValueError("Adaptive retrieval round budget exhausted or retrieval not permitted in this stage")
-                    journal.event("agent_action_selected", case_id=question["question_id"], mode=condition, action="retrieve")
+                    journal.event("agent_action_selected", case_id=question["question_id"], mode=condition,
+                                  action="retrieve", reason=value.get("reason"))
                     retrieve(value["query"], value["observation_id"])
                 elif stage == "choose_action" and value.get("type") in {"answer", "abstain"}:
                     action = value["type"]
-                    _fields(value, {"type", "reason"} if action == "abstain" else {"type"}, "action")
                     if action == "answer" and question["task"] == "archival_qa" and not any(r["origin"] == "archive" for r in evidence.values()):
                         raise ValueError("No archive evidence has been exposed for archival_qa: choose retrieve or an honest abstain")
                     if action == "abstain":
-                        reason = value["reason"]
-                        if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
-                            raise ValueError("abstain.reason must be a concise, nonempty evidence limitation")
-                        abstention_reason = reason
+                        abstention_reason = value["reason"]
                     journal.event("agent_action_selected", case_id=question["question_id"], mode=condition,
-                                  action=action, reason=abstention_reason)
+                                  action=action, reason=value.get("reason"))
                     stage = "answer"
                 else:
-                    raise ValueError("Expected one action from the current stage's public contract")
+                    raise ValueError(f"Expected one action for stage={stage}; received type={value.get('type')!r}, "
+                                     f"fields={sorted(value)}")
             except (ValueError, TypeError, KeyError) as exc:
                 parsing["validation_error"] = str(exc)
                 invalid += 1
@@ -672,6 +710,7 @@ def execution_contract(path, config, archive_sha, conditions, protocol, budgets,
         "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
         "prompt_revision": PROMPT_REVISION, "prompt_sha256": digest(SYSTEM),
         "agentic_action_protocol": "model-selected retrieve/answer/abstain, then separate final; all calls charged to unchanged budgets",
+        "action_transport_revision": "2026-11-16-action-envelope-v1",
         "implementation_sha256": {p.name: sha256(p) for p in source_files},
         "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []},
         **({"identity_source": identity_source} if identity_source else {})}
