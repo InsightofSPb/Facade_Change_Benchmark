@@ -109,6 +109,63 @@ class WWWRunnerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_fixture()
 
+    def test_later_archive_does_not_replace_local_task_in_any_condition(self):
+        public = read_json(self.questions)
+        question = public["questions"][1]
+        write_json(self.questions, {**public, "questions": [question]})
+        package = read_json(self.package)
+        record = package["records"][0]
+        record["observation_date"].update(start="2024", end="2024")
+        record.update(publication_date="2024", available_at="2024")
+        write_json(self.package, package)
+        archive.import_archive(self.package, self.root / "later-archive")
+        archive.index_archive(self.root / "later-archive/corpus.json", self.config, self.root / "later-index",
+                              pool_factory=demo.SyntheticPool, synthetic=True)
+        self.index = self.root / "later-index/index.json"
+        self.assertNotIn("2024", question["task_dates"])
+        summary = self.run_fixture()
+        self.assertEqual(summary["outcome_counts"], {"completed": 3, "abstained": 0, "error": 0})
+        scopes = []
+        for row in read_json(self.root / "run/results.json")["results"]:
+            folder = self.root / "run/questions" / row["question_id"] / row["condition"]
+            calls = [read_json(p) for p in sorted((folder / "calls").glob("*-qwen.json"))]
+            controls = [json.loads(c["request"]["messages"][-1]["content"][0]["text"]) for c in calls]
+            initial = json.loads(calls[0]["request"]["messages"][1]["content"][0]["text"])
+            scope = initial["task_scope"]
+            scopes.append(scope)
+            self.assertEqual(scope["task"], question["task"])
+            self.assertEqual(scope["question"], question["question"])
+            self.assertEqual(scope["task_dates"], question["task_dates"])
+            self.assertEqual(set(scope["local_observation_ids"]), {o["observation_id"] for o in question["observations"]})
+            self.assertTrue(all(c["task_scope"] == scope for c in controls))
+            self.assertTrue(all("required_decisions" not in c for c in controls))
+            self.assertTrue(set(row["answer"]["citations"]) <= set(scope["local_observation_ids"]))
+            if row["condition"] != "photos_only":
+                self.assertIn("fixture-archive-b1", controls[-1]["archive_state"]["exposed_archive_evidence_ids"])
+                self.assertEqual(row["costs"]["retrieval_rounds"], 1)
+        self.assertTrue(all(scope == scopes[0] for scope in scopes))
+
+    def test_local_uncertainty_can_still_abstain_after_retrieval(self):
+        reason = "Синтетический пример: локальная область закрыта лесами; сравнение недостаточно"
+
+        class UncertainLocal(demo.SyntheticPool):
+            def call(self, role, payload):
+                response = super().call(role, payload)
+                if role == "qwen":
+                    control = json.loads(payload["messages"][-1]["content"][0]["text"])
+                    if control["stage"] == "choose_action" and control["archive_state"]["searches_performed"]:
+                        response["text"] = json.dumps({"type": "abstain", "reason": reason})
+                return response
+
+        public = read_json(self.questions)
+        write_json(self.questions, {**public, "questions": [public["questions"][1]]})
+        summary = self.run_fixture(pool_factory=UncertainLocal, conditions=("bounded_agentic_retrieval",))
+        self.assertEqual(summary["outcome_counts"], {"completed": 0, "abstained": 1, "error": 0})
+        row = read_json(self.root / "run/results.json")["results"][0]
+        self.assertEqual(row["answer"]["decision"], "insufficient_data")
+        self.assertEqual(row["answer"]["limitations"], [reason])
+        self.assertEqual(row["costs"]["retrieval_rounds"], 1)
+
     def test_action_selection_has_no_final_scaffold_and_preserves_archive_state(self):
         self.run_fixture(conditions=("bounded_agentic_retrieval",))
         states = set()
