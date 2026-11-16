@@ -264,6 +264,71 @@ class WWWRunnerTest(unittest.TestCase):
         self.assertIn("No archive evidence", first["validation_error"])
         self.assertEqual(row["answer"]["citations"], ["fixture-archive-b1"])
 
+    def test_stage_only_draft_preserves_content_and_rejects_conflicting_discriminators(self):
+        draft = {"type": "archival_qa", "answer": {"source": "connected archive",
+                 "documented_shoot_date": "2009", "evidence_id": "local-fixture-photo"}}
+        value = {"stage": "answer", "response_contract": draft}
+        original = copy.deepcopy(value)
+        changes = []
+        normalized = runner.normalize_action(value, changes)
+        self.assertEqual(normalized, {"type": "answer", "response_contract": draft})
+        self.assertEqual(value, original)
+        self.assertIn("answer_stage_draft_to_answer_choice", changes)
+        for conflicting in (
+            {**value, "action": "retrieve", "query": "fixture query"},
+            {**value, "type": "archival_qa"},
+            {**value, "action": "answer", "type": "retrieve"},
+            {**value, "response": draft},
+            {"stage": "answer", "response_contract": None},
+            {"response_contract": draft},
+        ):
+            with self.subTest(reply=conflicting), self.assertRaises(ValueError):
+                runner.normalize_action(conflicting)
+
+    def test_stage_only_archive_draft_requires_model_selected_retrieval(self):
+        public = read_json(self.questions)
+        question = public["questions"][2]
+        write_json(self.questions, {**public, "questions": [question]})
+        self.config["budgets"]["max_model_calls"] = 5
+        draft = {"stage": "answer", "response_contract": {"type": "archival_qa", "answer": {
+            "source": "connected archive", "documented_shoot_date": "2009",
+            "evidence_id": question["observations"][0]["observation_id"]}}}
+
+        for corrected in (False, True):
+            class DraftPool(demo.SyntheticPool):
+                sent_draft = False
+
+                def call(self, role, payload):
+                    response = super().call(role, payload)
+                    if role == "qwen" and (not self.sent_draft or not corrected):
+                        self.sent_draft = True
+                        response["text"] = json.dumps(draft)
+                    return response
+
+            with self.subTest(model_corrects_reply=corrected):
+                name = "corrected-draft" if corrected else "repeated-draft"
+                summary = self.run_fixture(name, pool_factory=DraftPool, conditions=("bounded_agentic_retrieval",))
+                self.assertEqual(summary["outcome_counts"], {
+                    "completed": int(corrected), "abstained": 0, "error": int(not corrected)})
+                row = read_json(self.root / name / "results.json")["results"][0]
+                self.assertEqual(row["costs"]["qwen_requests"], 4 if corrected else 2)
+                self.assertEqual(row["costs"]["retrieval_rounds"], int(corrected))
+                folder = self.root / name / "questions" / question["question_id"] / row["condition"]
+                first = read_json(folder / "reply-001.json")
+                self.assertEqual(first["parsed"], draft)
+                self.assertEqual(first["normalized_action"]["response_contract"], draft["response_contract"])
+                self.assertIsNone(first["normalized_final"])
+                self.assertIn("local_photo IDs are not archive sources", first["validation_error"])
+                call = read_json(folder / "calls/000-qwen.json")
+                photos = [json.loads(b["text"]) for b in call["request"]["messages"][1]["content"][1:]
+                          if b["type"] == "text"]
+                self.assertTrue(all(p["origin"] == "local_photo" for p in photos))
+                if corrected:
+                    self.assertEqual(row["answer"]["citations"], ["fixture-archive-b1"])
+                else:
+                    self.assertIsNone(row["answer"])
+                    self.assertFalse(list(folder.glob("retrieval-*.json")))
+
     def test_incomplete_final_cannot_bypass_answer_validation(self):
         class PrematureFinal(demo.SyntheticPool):
             def call(self, role, payload):
@@ -409,6 +474,7 @@ class WWWRunnerTest(unittest.TestCase):
             with self.subTest(remaining_images=remaining):
                 record, blocks = runner._expose_archive(search, {"evidence_id": identifier}, remaining)
                 metadata = json.loads(blocks[0]["text"])
+                self.assertEqual(metadata["origin"], "archive")
                 self.assertEqual(metadata["observation_id"], identifier if remaining else None)
                 self.assertEqual(metadata["image_exposed"], bool(remaining))
                 self.assertEqual(sum(b["type"] == "image" for b in blocks), remaining)
@@ -605,6 +671,75 @@ class WWWRunnerTest(unittest.TestCase):
         answer["citations"] = ["not-exposed"]
         with self.assertRaisesRegex(ValueError, "actually exposed"):
             runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+
+    def test_box_shape_is_checked_against_its_photo_without_rescaling(self):
+        question = read_json(self.questions)["questions"][1]
+        folder = self.root / "prepared"
+        folder.mkdir()
+        prepared, evidence, common, support = runner._prepare(question, folder, Fingerprints(), runner.PROTOCOL)
+        local_ids = list(evidence)
+        search = archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+        archive_id = next(iter(search.records))
+        record, _ = runner._expose_archive(search, {"evidence_id": archive_id}, 1)
+        evidence[archive_id] = record
+        for identifier, coordinate, shape in (
+            (local_ids[-1], "region_crop_pixels", question["frame"]["shape"]),
+            (archive_id, "observation_native", record["shape"]),
+        ):
+            with self.subTest(coordinate=coordinate):
+                answer = {"type": "final", "decision": "change", "answer_text": "Synthetic change.",
+                    "citations": local_ids + [archive_id], "observation_ids": local_ids,
+                    "date_interval": {"start": "2009", "end": "2015", "precision": "interval", "uncertain": True},
+                    "limitations": [], "boxes": [{"evidence_id": identifier, "coordinate_system": coordinate,
+                                                  "bbox_xyxy": [3, 1, 6, 4], "shape": list(shape)}]}
+                original = copy.deepcopy(answer)
+                result = runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+                self.assertEqual(result["boxes"][0]["shape"], shape)
+                self.assertEqual(result["boxes"][0]["bbox_xyxy"], [3, 1, 6, 4])
+                self.assertEqual(answer, original)
+                for invalid in (None, [shape[0], shape[1] + 1], [float(shape[0]), shape[1]],
+                                [True, shape[1]], [shape[0]], {"height": shape[0], "width": shape[1]}):
+                    with self.subTest(shape=invalid), self.assertRaisesRegex(ValueError, "shape must match"):
+                        answer["boxes"][0]["shape"] = invalid
+                        runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+                answer["boxes"][0]["shape"] = list(shape)
+                answer["boxes"][0]["bbox_xyxy"] = [3, 1, shape[1] + 1, 4]
+                with self.assertRaises(ValueError):
+                    runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+                answer["boxes"][0]["bbox_xyxy"] = [3, 1, 6, 4]
+                answer["boxes"][0]["observation_id"] = "wrong-owner"
+                with self.assertRaisesRegex(ValueError, "owner"):
+                    runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+                del answer["boxes"][0]["observation_id"]
+                answer["boxes"][0]["invented_label"] = "not a supported field"
+                with self.assertRaisesRegex(ValueError, "Unexpected localization fields:.*invented_label"):
+                    runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+
+    def test_final_boxes_with_shape_survive_all_conditions_without_retry(self):
+        public = read_json(self.questions)
+        question = public["questions"][1]
+        write_json(self.questions, {**public, "questions": [question]})
+
+        class ShapePool(demo.SyntheticPool):
+            def call(self, role, payload):
+                response = super().call(role, payload)
+                if role == "qwen":
+                    value = json.loads(response["text"])
+                    for box in value.get("boxes", []):
+                        box["shape"] = question["frame"]["shape"]
+                    response["text"] = json.dumps(value)
+                return response
+
+        summary = self.run_fixture(pool_factory=ShapePool)
+        self.assertEqual(summary["outcome_counts"], {"completed": 3, "abstained": 0, "error": 0})
+        rows = read_json(self.root / "run/results.json")["results"]
+        for row, calls in zip(rows, (1, 1, 3)):
+            self.assertEqual(row["costs"]["qwen_requests"], calls)
+            self.assertEqual(row["answer"]["boxes"][0]["shape"], question["frame"]["shape"])
+            self.assertEqual(row["answer"]["boxes"][0]["bbox_xyxy"], [3, 1, 6, 4])
+            folder = self.root / "run/questions" / question["question_id"] / row["condition"]
+            self.assertEqual(read_json(folder / "final_raw.json")["boxes"][0]["shape"], question["frame"]["shape"])
+            self.assertTrue(all(read_json(p)["validation_error"] is None for p in folder.glob("reply-*.json")))
 
     def test_empty_archive_is_explicit_plumbing(self):
         with self.assertRaisesRegex(ValueError, "explicit plumbing"):
