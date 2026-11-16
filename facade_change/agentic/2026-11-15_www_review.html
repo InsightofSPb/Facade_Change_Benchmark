@@ -10,6 +10,7 @@ input[type=number]{width:75px}label{display:inline-block;margin:5px}button,selec
 <p>Текстовые решения из handoff уже сохранены. Проверьте привязку наблюдения и предлагаемые рамки. Общая геометрическая поддержка не оценивает точность локализации. Аннотации на одном снимке не являются временным GT.</p>
 <p>Идентификатор физического события задаёт рецензент; одинаковое событие в перекрывающихся кропах должно иметь один ID. Новый эпизод или другой временной интервал требует отдельного ID.</p>
 <label>Рецензент <input id="reviewer"></label><button id="export">Экспортировать только явно выбранные решения</button>
+<button id="export-correspondence">Сохранить отдельные черновики соответствия архиву</button>
 <p id="message" class="error" role="status"></p><main id="rows"></main>
 <script type="application/json" id="data">__REVIEW_DATA__</script><script>
 "use strict";
@@ -21,6 +22,7 @@ for(const item of data.items){
  const include=input(section,"Включить это решение в экспорт ","checkbox");
  const status=node("select",undefined,section);for(const v of ["candidate","approved","rejected"]){const o=node("option",v,status);o.value=v}
  node("p","Текущая revision: "+item.revision+"; прошлый статус: "+item.previous_status,section);
+ node("p","Физическое здание: "+(item.physical_building_id||item.building_id)+(item.identity_review_pending?"; identity review pending":"")+". Цель отбора: "+(item.provisional_review_target||"—")+" — не готовая метка ответа.",section);
  const wording=node("textarea",item.question,section);wording.className="wording";wording.setAttribute("aria-label","Редактируемый вопрос");
  if(item.human_text_judgment){const p=node("p",item.human_text_judgment.answer_ru+"\nУточнение: "+(item.human_text_judgment.clarification_verbatim||"—"),section);p.className="note"}
  const photos=node("div",undefined,section);photos.className="photos";const canvases=[],boxes=[];
@@ -32,16 +34,32 @@ for(const item of data.items){
   for(const [i,name] of ["left","top","right","bottom"].entries()){const e=input(row,name+" ","number",proposal.bbox_xyxy[i]);e.step="any";e.oninput=()=>{b.confirm.checked=false;draw()};b.coords.push(e)}
   b.event.oninput=()=>{b.confirm.checked=false;draw()};b.confirm.onchange=draw;boxes.push(b);node("small","region_crop_pixels / "+item.region_id+" / "+(proposal.label_provenance||"manual draft"),row);draw();}
  for(const p of item.proposed_boxes)addBox(p);const add=node("button","Добавить рамку",section);add.onclick=()=>addBox();
+ const archive=node("details",undefined,section);node("summary","Архивные источники для ручной проверки ("+(item.archive_evidence||[]).length+")",archive);
+ const archiveCanvases=[];
+ for(const source of item.archive_evidence||[]){const card=node("div",undefined,archive);node("h3",source.evidence_id+" / "+(source.title||""),card);
+  node("p","Допустимость retrieval: "+source.retrieval_eligible+"; соответствие области: не проверено",card);
+  const link=node("a","Страница источника",card);link.href=source.source_page_url;link.target="_blank";link.rel="noopener noreferrer";
+  node("pre",JSON.stringify({...source,image:source.image?{sha256:source.image.sha256,shape:source.image.shape,page_index:source.image.page_index}:null},null,2),card);
+  if(source.document){const pdf=node("a","Сохранённый PDF",card);pdf.href=source.document;pdf.target="_blank"}
+  if(source.image){const canvas=node("canvas",undefined,card),image=new Image();canvas.width=Math.min(640,source.image.shape[1]);canvas.height=Math.max(1,Math.round(canvas.width*source.image.shape[0]/source.image.shape[1]));
+   node("small","Уменьшенный просмотр; ввод координат в исходных native pixels "+source.image.shape[1]+"×"+source.image.shape[0],card);
+   archiveCanvases.push({canvas,image,source});image.onload=()=>drawArchive();}}
+ node("p","Черновики соответствия архивного снимка области. Только observation_native в пикселях указанного архивного RGB; это не change-event GT. Они экспортируются отдельным файлом и не попадают в label.events.",archive);
+ const correspondence=node("textarea",JSON.stringify((item.archive_evidence||[]).filter(s=>s.image).map(s=>({evidence_id:s.evidence_id,image_sha256:s.image.sha256,coordinate_system:"observation_native",bbox_xyxy:null,notes:""})),null,2),archive);
+ function drawArchive(){let values=[];try{values=JSON.parse(correspondence.value)}catch(e){}for(const {canvas,image,source} of archiveCanvases){if(!image.complete||!image.naturalWidth)continue;
+  const c=canvas.getContext("2d"),sx=canvas.width/source.image.shape[1],sy=canvas.height/source.image.shape[0];c.drawImage(image,0,0,canvas.width,canvas.height);for(const v of Array.isArray(values)?values:[]){const xy=v.bbox_xyxy;if(v.evidence_id===source.evidence_id&&Array.isArray(xy)&&xy.length===4&&xy.every(Number.isFinite)){c.strokeStyle="#3267b8";c.lineWidth=2;c.strokeRect(xy[0]*sx,xy[1]*sy,(xy[2]-xy[0])*sx,(xy[3]-xy[1])*sy)}}}}
+ archive.ontoggle=()=>{if(archive.open)for(const a of archiveCanvases){if(!a.image.getAttribute("src"))a.image.src=a.source.image.src}};
+ correspondence.oninput=drawArchive;
  node("p","Структурный ответ (редактируемый JSON). events заполняются только из отмеченных выше рамок. archival_stratum задаётся до запуска моделей; supporting_evidence_ids — проверенные источники, не результат retrieval.",section);
  const label=node("textarea",JSON.stringify(item.label,null,2),section);label.rows=16;
  const details=node("details",undefined,section);node("summary","Положительные факты исходных аннотаций (отдельная диагностика)",details);node("pre",JSON.stringify(item.positive_annotation_facts,null,2),details);
  const note=node("textarea",item.human_text_judgment?"Текстовое решение импортировано из handoff; здесь проверена структурная привязка/локализация.":"",section);note.setAttribute("aria-label","Рationale / private notes");
- editors.push({item,include,status,wording,label,note,boxes});
+ editors.push({item,include,status,wording,label,note,boxes,correspondence});
 }
 function decisions(reviewer){if(!reviewer.trim())throw Error("Укажите рецензента");const result=[];
  for(const e of editors){if(!e.include.checked)continue;if(!e.note.value.trim())throw Error(e.item.question_id+": нужен rationale");
   const d={question_id:e.item.question_id,expected_revision:e.item.revision,status:e.status.value,reviewer,private_notes:e.note.value,reviewed_question:e.wording.value};
-  if(d.status==="approved"){const label=JSON.parse(e.label.value);label.events=[];
+  if(d.status==="approved"){const label=JSON.parse(e.label.value);if("archive_correspondence" in label||"correspondence_boxes" in label)throw Error("Архивное соответствие экспортируется отдельно от метки ответа");label.events=[];
    for(const b of e.boxes){if(!b.confirm.checked)continue;const xy=b.coords.map(v=>Number(v.value));if(!b.event.value.trim()||!xy.every(Number.isFinite)||xy[0]<0||xy[1]<0||xy[2]<=xy[0]||xy[3]<=xy[1]||xy[2]>e.item.frame.shape[1]||xy[3]>e.item.frame.shape[0])throw Error(e.item.question_id+": недопустимая рамка/event_id");
     label.events.push({event_id:b.event.value.trim(),bbox_xyxy:xy,coordinate_system:"region_crop_pixels",region_id:e.item.region_id});}
    if(label.assessment==="confirmed_change"&&!label.events.length)throw Error(e.item.question_id+": для change нужны проверенные event_id и рамки");
@@ -50,4 +68,8 @@ function decisions(reviewer){if(!reviewer.trim())throw Error("Укажите р�
   result.push(d);
  }if(!result.length)throw Error("Явно выберите хотя бы одно решение");return {schema_version:1,access:"private_evaluation",kind:"facade_qa_review_decisions",candidate_sha256:data.candidate_sha256,decisions:result};}
 document.getElementById("export").onclick=()=>{try{const result=decisions(document.getElementById("reviewer").value);const blob=new Blob([JSON.stringify(result,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download="2026-11-15-www-decisions.private.json";a.click();URL.revokeObjectURL(url);document.getElementById("message").textContent="Экспортировано решений: "+result.decisions.length+". Примените через qa review; серверных изменений не выполнено."}catch(e){document.getElementById("message").textContent=e.message}};
+document.getElementById("export-correspondence").onclick=()=>{try{const cases=editors.map(e=>{const proposals=JSON.parse(e.correspondence.value);if(!Array.isArray(proposals))throw Error("Correspondence proposals must be a list");for(const p of proposals){const source=(e.item.archive_evidence||[]).find(s=>s.evidence_id===p.evidence_id&&s.image);if(!source||p.image_sha256!==source.image.sha256||p.coordinate_system!=="observation_native")throw Error("Архивная рамка принадлежит другому изображению/системе координат");const xy=p.bbox_xyxy;if(xy!==null&&(!Array.isArray(xy)||xy.length!==4||!xy.every(Number.isFinite)||xy[0]<0||xy[1]<0||xy[2]<=xy[0]||xy[3]<=xy[1]||xy[2]>source.image.shape[1]||xy[3]>source.image.shape[0]))throw Error("Неверная native-рамка соответствия архиву")}
+ return {question_id:e.item.question_id,region_id:e.item.region_id,status:"proposal_only",proposals}});
+ const result={kind:"www_archive_correspondence_proposals",access:"private_evaluation",candidate_sha256:data.candidate_sha256,archive_corpus_sha256:data.archive_corpus_sha256,identity_source:data.identity_source,reviewer:document.getElementById("reviewer").value,temporal_gold:false,cases};
+ const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:"application/json"})),a=document.createElement("a");a.href=url;a.download="2026-11-16-www-archive-correspondence.private.json";a.click();URL.revokeObjectURL(url);document.getElementById("message").textContent="Сохранены отдельные черновики; labels/events не изменены."}catch(e){document.getElementById("message").textContent=e.message}};
 </script></html>

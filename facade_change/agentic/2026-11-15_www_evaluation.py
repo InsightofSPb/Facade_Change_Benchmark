@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import secrets
 
+import numpy as np
+
 from ..history_features import Fingerprints, digest
 from ..io import read_json, sha256, write_json
 from ..visualization import write_static_gallery
@@ -21,21 +23,27 @@ evaluation = importlib.import_module(".2026-11-10_qa_evaluation", __package__)
 runner = importlib.import_module(".2026-11-15_www_runner", __package__)
 curation = importlib.import_module(".2026-11-15_www_curation", __package__)
 ratio = evaluation.ratio
+AGGREGATION = {"unit": "physical_building", "seed": 20261116, "replicates": 2000, "confidence_level": .95}
 
 
-def _reference_corpus(labels, corpus_sha256):
+def _reference_corpus(labels, corpus_sha256, identity_source=None):
     for label in labels.values():
         binding = label.get("earliest_archive")
         if binding is not None and binding["corpus_sha256"] != corpus_sha256:
             raise ValueError("Reviewed archive earliest target and the frozen retrieval corpus hashes differ (or archive is missing)")
+        if binding and binding.get("identity_source") is not None and binding["identity_source"] != identity_source:
+            raise ValueError("Reviewed archive earliest and execution use different frozen identities")
 
 
 def plan(questions_path, answers_path, inventory_path, config, out, *, archive_index=None,
-         allow_empty_archive=False, protocol=None, synthetic=False):
+         allow_empty_archive=False, protocol=None, synthetic=False, identity_map=None):
     """Freeze reviewed stratum/cohort membership before any model outcomes exist."""
     fingerprints = Fingerprints()
+    identities = runner.archive.identity.Identities(identity_map, fingerprints)
     public, labels = evaluation.approved_cohort(questions_path, answers_path, fingerprints)
     inv = qa.read_bound(inventory_path, fingerprints)
+    if inv.get("identity_source") != identities.source:
+        raise ValueError("Inventory and plan must use the same reviewed identity mapping")
     private = qa.read_bound(answers_path, fingerprints)
     review = qa.read_bound(private["review_source"]["path"], fingerprints, private["review_source"]["sha256"])
     originals = qa._load_candidates(review["candidates_path"], fingerprints)
@@ -45,11 +53,11 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
         raise ValueError("Approved questions and exposure inventory use different canonical history revisions")
     views = {(r["building_id"], r["view_id"]): r for r in inv["views"]}
     protocol, budgets = runner.protocol_config(config, protocol)
-    archive = runner.archive.ArchiveSearch(archive_index, config, fingerprints, synthetic=synthetic) if archive_index else None
+    archive = runner.archive.ArchiveSearch(archive_index, config, fingerprints, synthetic=synthetic, identities=identities) if archive_index else None
     if archive is None and not allow_empty_archive:
         raise ValueError("Explicit empty-archive plumbing flag required; no scientific retrieval comparison")
     corpus_sha = archive.index["corpus_sha256"] if archive else None
-    _reference_corpus(labels, corpus_sha)
+    _reference_corpus(labels, corpus_sha, identities.source)
     members = []
     for question in public["questions"]:
         view = views.get((question["building_id"], question["view_id"]), {})
@@ -59,17 +67,19 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
         if type(stratum) is not bool:
             raise ValueError("Set reviewed archival_stratum=true/false before running models; no outcome-based stratum selection")
         members.append({"question_id": question["question_id"], "building_id": question["building_id"],
+                        "physical_building_id": identities.physical(question["building_id"]),
                         "cohort": view["cohort"], "archival_stratum": stratum})
         if archive:
             archive.eligible(question)
     contract = runner.execution_contract(questions_path, config, archive.sha256 if archive else None,
-                                         runner.CONDITIONS, protocol, budgets, synthetic)
+                                         runner.CONDITIONS, protocol, budgets, synthetic, identities.source)
     journal = new_run(out, {"questions_sha256": sha256(questions_path), "answers_sha256": sha256(answers_path),
         "inventory_sha256": sha256(inventory_path), "execution_contract_sha256": digest(contract)}, "www_cohort_freeze")
     try:
         payload = qa._private("www_cohort_plan", created_at=datetime.now(timezone.utc).isoformat(),
             questions_sha256=sha256(questions_path), answers_sha256=sha256(answers_path), inventory_sha256=sha256(inventory_path),
-            execution_contract=contract, archive_corpus_sha256=corpus_sha, cases=members, input_sha256=fingerprints.files)
+            execution_contract=contract, archive_corpus_sha256=corpus_sha, cases=members,
+            aggregation_protocol=AGGREGATION, input_sha256=fingerprints.files)
         write_json(journal.out / "plan.private.json", payload)
         fingerprints.verify()
         summary = {"status": "completed", "questions": len(members), "cohorts": dict(Counter(r["cohort"] for r in members)),
@@ -104,11 +114,82 @@ def structured_correct(question, label, result):
     return actual in label.get("acceptable_structured_answers", [])
 
 
+def change_stability_counts(rows):
+    counts = np.zeros((2, 3), dtype=np.int64)  # TP, FP, FN for fixed change/stability labels.
+    eligible = [r for r in rows if r.get("assessment") in {"confirmed_change", "confirmed_stability"}]
+    for row in eligible:
+        truth = "change" if row["assessment"] == "confirmed_change" else "no_change"
+        predicted = row.get("decision") if row["status"] == "completed" else None
+        for i, name in enumerate(("change", "no_change")):
+            counts[i] += [truth == name and predicted == name, truth != name and predicted == name,
+                          truth == name and predicted != name]
+    return counts, len(eligible)
+
+
+def _macro_f1(counts):
+    denominator = 2*counts[..., 0] + counts[..., 1] + counts[..., 2]
+    return np.divide(2*counts[..., 0], denominator, out=np.zeros_like(denominator, dtype=float), where=denominator != 0).mean(axis=-1)
+
+
+def change_stability(rows):
+    counts, total = change_stability_counts(rows)
+    return {"questions": total, "macro_f1": float(_macro_f1(counts)) if total else None,
+        "classes": {name: {"tp": int(c[0]), "fp": int(c[1]), "fn": int(c[2])}
+                    for name, c in zip(("change", "no_change"), counts)},
+        "denominator": "all reviewed change/stability cases; errors, missing and abstentions count as missed true class",
+        "zero_division": 0, "insufficient_evidence_reference": "separate task, not stability"}
+
+
+def physical_id(row):
+    return row.get("physical_building_id", row["building_id"])
+
+
+def paired_intervals(rows, a, b, protocol=AGGREGATION):
+    left = {r["question_id"]: r for r in rows if r["condition"] == a}
+    right = {r["question_id"]: r for r in rows if r["condition"] == b}
+    if set(left) != set(right) or any((physical_id(left[k]), left[k]["assessment"]) !=
+                                     (physical_id(right[k]), right[k]["assessment"]) for k in left):
+        raise ValueError("Paired intervals require the same frozen questions, references and physical buildings")
+    buildings = sorted({physical_id(r) for r in left.values()})
+    differences, counts_a, counts_b = [], [], []
+    for building in buildings:
+        l = [r for r in left.values() if physical_id(r) == building]
+        r = [right[x["question_id"]] for x in l]
+        differences.append(sum(x["correct"] for x in r)/len(r) - sum(x["correct"] for x in l)/len(l))
+        counts_a.append(change_stability_counts(l)[0])
+        counts_b.append(change_stability_counts(r)[0])
+    binary_present = bool(change_stability_counts(list(left.values()))[1])
+    point_f1 = (float(_macro_f1(np.sum(counts_b, axis=0)) - _macro_f1(np.sum(counts_a, axis=0))) if binary_present else None)
+    result = {"contrast": b + " minus " + a, **protocol, "independent_buildings": len(buildings),
+        "method": "paired percentile cluster bootstrap; sample physical buildings with replacement, retaining all their questions for both conditions",
+        "building_macro_accuracy": {"difference": float(np.mean(differences)) if differences else None, "interval": None},
+        "change_stability_macro_f1": {"difference": point_f1, "interval": None}}
+    binary_indices = [i for i, c in enumerate(counts_a) if c.sum()]
+    result["change_stability_macro_f1"]["independent_buildings"] = len(binary_indices)
+    if len(binary_indices) < 2:
+        result["change_stability_macro_f1"]["unavailable_reason"] = "fewer_than_two_physical_buildings_with_change_stability_references"
+    if len(buildings) < 2:
+        result["unavailable_reason"] = "fewer_than_two_independent_physical_buildings"
+        return result
+    draws = np.random.default_rng(protocol["seed"]).integers(0, len(buildings), size=(protocol["replicates"], len(buildings)))
+    alpha = (1-protocol["confidence_level"])/2
+    result["building_macro_accuracy"]["interval"] = np.quantile(np.asarray(differences)[draws].mean(axis=1), [alpha, 1-alpha]).tolist()
+    if len(binary_indices) >= 2:
+        # This endpoint has its own fixed reference subset. Buildings with only
+        # earliest/insufficient references must not create empty, zero-F1 draws.
+        binary_draws = np.random.default_rng(protocol["seed"]).integers(0, len(binary_indices),
+            size=(protocol["replicates"], len(binary_indices)))
+        delta = (_macro_f1(np.asarray(counts_b)[binary_indices][binary_draws].sum(axis=1)) -
+                 _macro_f1(np.asarray(counts_a)[binary_indices][binary_draws].sum(axis=1)))
+        result["change_stability_macro_f1"]["interval"] = np.quantile(delta, [alpha, 1-alpha]).tolist()
+    return result
+
+
 def aggregate(rows):
     counts = Counter(r["status"] for r in rows)
     buildings = {}
-    for building in sorted({r["building_id"] for r in rows}):
-        members = [r for r in rows if r["building_id"] == building]
+    for building in sorted({physical_id(r) for r in rows}):
+        members = [r for r in rows if physical_id(r) == building]
         buildings[building] = {"questions": len(members), "structured_accuracy": ratio(sum(r["correct"] for r in members), len(members)),
             "response_coverage": ratio(sum(r["status"] in {"completed", "abstained"} for r in members), len(members))}
     supported = [r for r in rows if r["known_archive_support_count"]]
@@ -116,6 +197,7 @@ def aggregate(rows):
         "structured_accuracy": ratio(sum(r["correct"] for r in rows), len(rows)),
         "building_macro_accuracy": ratio(sum(r["structured_accuracy"] for r in buildings.values()), len(buildings)),
         "independent_buildings": len(buildings), "buildings": buildings, "outcome_counts": dict(counts),
+        "change_stability": change_stability(rows),
         "response_coverage": ratio(counts["completed"] + counts["abstained"], len(rows)),
         "decision_coverage": ratio(counts["completed"], len(rows)),
         "legitimate_abstentions": sum(r["legitimate_abstention"] for r in rows),
@@ -176,11 +258,16 @@ def score(questions_path, answers_path, run_path, plan_path, out):
         raise ValueError("Evaluation questions/labels/model/corpus/protocol differ from the predeclared plan")
     if temporal_value(plan_doc["created_at"]) > temporal_value(record["started_utc"]):
         raise ValueError("Cohort/archival stratum was not frozen before model outcomes")
-    _reference_corpus(labels, plan_doc.get("archive_corpus_sha256"))
+    identity_source = contract.get("identity_source")
+    identities = (runner.archive.identity.Identities(identity_source["path"], fingerprints, identity_source["sha256"])
+                  if identity_source else runner.archive.identity.Identities())
+    _reference_corpus(labels, plan_doc.get("archive_corpus_sha256"), identity_source)
     members = {r["question_id"]: r for r in plan_doc["cases"]}
     questions = {r["question_id"]: r for r in public["questions"]}
     if len(members) != len(plan_doc["cases"]) or set(members) != set(questions):
         raise ValueError("Plan must retain the exact fixed cohort")
+    if any(members[k].get("physical_building_id", q["building_id"]) != identities.physical(q["building_id"]) for k, q in questions.items()):
+        raise ValueError("Plan and score use different physical building identities")
     if (root / "results.json").is_file():
         payload = qa.read_bound(root / "results.json", fingerprints)
         if payload.get("questions_sha256") != sha256(questions_path) or payload.get("contract_sha256") != digest(contract):
@@ -243,6 +330,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                 gold_support = set(label.get("supporting_evidence_ids", [])) - set(local)
                 citations = answer.get("citations", [])
                 row = {"question_id": identifier, "building_id": question["building_id"], "family": question["task"],
+                    "physical_building_id": identities.physical(question["building_id"]), "decision": answer.get("decision"),
                     "assessment": label["assessment"], "condition": condition, **{k: members[identifier][k] for k in ("cohort", "archival_stratum")},
                     "status": result["status"], "correct": structured_correct(question, label, result), "error": result.get("error"),
                     "legitimate_abstention": label["assessment"] == "insufficient_evidence" and result["status"] == "abstained",
@@ -282,7 +370,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                     differences = {name: right[name]["structured_accuracy"] - left[name]["structured_accuracy"] for name in left}
                     paired[key].append({"contrast": b + " minus " + a, "buildings": differences,
                         "independent_buildings": len(differences), "mean_paired_difference": ratio(sum(differences.values()), len(differences)),
-                        "uncertainty": "not estimated; no significance claim"})
+                        "paired_confidence_intervals": paired_intervals(subset, a, b, plan_doc.get("aggregation_protocol", AGGREGATION))})
         localization, localization_strata = {}, {}
         for condition in runner.CONDITIONS:
             wrapped = []
@@ -297,7 +385,8 @@ def score(questions_path, answers_path, run_path, plan_path, out):
             wrapper = {"schema_version": 1, "kind": "facade_qa_predictions", "model_manifest_sha256": sha256(questions_path),
                 "ranking_source": {"kind": "saved_rank", "source": "saved model box order before private labels"}, "cases": wrapped}
             write_json(prediction, wrapper)
-            evaluation.evaluate(questions_path, answers_path, prediction, journal.out / ("localization-" + condition), thresholds=(.25, .5))
+            evaluation.evaluate(questions_path, answers_path, prediction, journal.out / ("localization-" + condition), thresholds=(.25, .5),
+                                identity_map=identity_source["path"] if identity_source else None)
             evaluated = read_json(journal.out / ("localization-" + condition) / "evaluation.json")
             # Preserve physical event matching and fixed-domain pixel diagnostics from qa evaluate.
             localization[condition] = [{**r, "physical_event_f1": ratio(2*r["matched"], r["eligible_events"] + r["available_predictions"])}
@@ -307,13 +396,17 @@ def score(questions_path, answers_path, run_path, plan_path, out):
             for cohort in ("development", "evaluation"):
                 for stratum in ("all", "archival"):
                     ids = [key for key in questions if members[key]["cohort"] == cohort and (stratum == "all" or members[key]["archival_stratum"])]
-                    values = evaluation._aggregate({k: questions[k] for k in ids}, {k: labels[k] for k in ids}, {k: checked[k] for k in ids}, (.25, .5))
+                    values = evaluation._aggregate({k: {**questions[k], "physical_building_id": identities.physical(questions[k]["building_id"])} for k in ids},
+                                                  {k: labels[k] for k in ids}, {k: checked[k] for k in ids}, (.25, .5))
                     localization_strata[condition][cohort + "/" + stratum] = [{**r, "physical_event_f1": ratio(2*r["matched"], r["eligible_events"] + r["available_predictions"])} for r in values["localization"]]
         annotation_report = annotation_diagnostics(answers_path, labels, fingerprints)
         annotation_report["synthetic_fixture"] = contract["synthetic_fixture"]
         report = qa._private("www_metrics", primary_endpoint="task-specific structured correctness; free-text semantics require human review",
             synthetic_fixture=contract["synthetic_fixture"],
             denominator="all predeclared question-condition rows including errors and missing", summaries=summaries,
+            aggregation_protocol=plan_doc.get("aggregation_protocol", AGGREGATION),
+            aggregation_protocol_source="frozen_plan" if "aggregation_protocol" in plan_doc else "fixed_code_defaults_for_legacy_plan",
+            identity_source=identities.source,
             paired_building_differences=paired, localization=localization, localization_by_cohort_and_stratum=localization_strata, cases=rows,
             citation_scope="ID exposure validity and known-support hit/recall; not entailment; other sources are not automatically irrelevant",
             archive_scope=(read_json(root / "summary.json").get("comparison_scope") if (root / "summary.json").is_file()
@@ -332,7 +425,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
         summary = {"status": "completed", "questions": len(questions), "conditions": list(runner.CONDITIONS),
             "cohort_condition_rows": len(rows), "report_path": str(journal.out / "gallery.html"),
             "synthetic_fixture": contract["synthetic_fixture"],
-            "metrics": str(journal.out / "metrics.private.json"), "statistical_unit": "building"}
+            "metrics": str(journal.out / "metrics.private.json"), "statistical_unit": "physical_building"}
         write_json(journal.out / "summary.json", summary)
         complete_run(journal, "completed", summary=summary)
         return summary

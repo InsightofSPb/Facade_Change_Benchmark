@@ -594,17 +594,18 @@ def _overlay(out, box, record, index, *, reviewed=False):
     return path
 
 
-def execution_contract(path, config, archive_sha, conditions, protocol, budgets, synthetic=False):
+def execution_contract(path, config, archive_sha, conditions, protocol, budgets, synthetic=False, identity_source=None):
     source_files = [Path(__file__), Path(archive.__file__), Path(qa.__file__)] + [Path(__file__).with_name(name + ".py")
-                    for name in ("models", "model_worker", "reasoning", "coordinates", "store", "retrieval", "config")]
+                    for name in ("models", "model_worker", "reasoning", "coordinates", "store", "retrieval", "config", "2026-11-16_www_identity")]
     return {"schema_version": 1, "questions_sha256": sha256(path), "archive_index_sha256": archive_sha,
         "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
         "prompt_sha256": digest(SYSTEM), "implementation_sha256": {p.name: sha256(p) for p in source_files},
-        "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []}}
+        "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []},
+        **({"identity_source": identity_source} if identity_source else {})}
 
 
 def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=False, conditions=CONDITIONS,
-        protocol=None, resume_from=None, pool_factory=None, synthetic=False, progress=None):
+        protocol=None, resume_from=None, pool_factory=None, synthetic=False, progress=None, identity_map=None):
     path = Path(questions_path).expanduser().resolve()
     public = public_questions(path)
     if not public["questions"] or not conditions or len(set(conditions)) != len(conditions) or set(conditions) - set(CONDITIONS):
@@ -614,7 +615,8 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
         raise ValueError("The pinned Qwen answer model is required")
     fingerprints = Fingerprints()
     fingerprints.add(path)
-    search = archive.ArchiveSearch(archive_index, config, fingerprints, synthetic=synthetic) if archive_index else None
+    identities = archive.identity.Identities(identity_map, fingerprints)
+    search = archive.ArchiveSearch(archive_index, config, fingerprints, synthetic=synthetic, identities=identities) if archive_index else None
     if search is None and not allow_empty_archive and any(c != "photos_only" for c in conditions):
         raise ValueError("Retrieval requires a frozen Jina archive index; use --allow-empty-archive only for an explicit plumbing check")
     if search:
@@ -622,7 +624,7 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
             search.eligible(question)
             if set(search.records) & {r["observation_id"] for r in question["observations"]}:
                 raise ValueError("Archive/local evidence ID collision; fix the public source IDs before inference")
-    contract = execution_contract(path, config, search.sha256 if search else None, conditions, protocol, budgets, synthetic)
+    contract = execution_contract(path, config, search.sha256 if search else None, conditions, protocol, budgets, synthetic, identities.source)
     if resume_from:
         old = Path(resume_from).expanduser().resolve()
         if read_json(old / "run.json").get("status") not in {"completed", "completed_with_errors", "failed", "interrupted"}:

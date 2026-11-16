@@ -161,7 +161,7 @@ class ArchiveReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "publication is not capture"):
             qa._checked_label(self.case, label, Fingerprints())
 
-    def freeze(self, corpus, record):
+    def freeze(self, corpus, record, identity_map=None):
         label = self.label(corpus, record)
         path = self.root / "decisions.private.json"
         write_json(path, qa._private("facade_qa_review_decisions", candidate_sha256=sha256(self.candidates), decisions=[{
@@ -175,10 +175,11 @@ class ArchiveReviewTest(unittest.TestCase):
         self.assertNotIn("earliest_archive", json.dumps(public))
         self.assertEqual(read_json(answers)["cases"][0]["reviewed_labels"], label)
         write_json(self.root / "audit.json", {"kind": "www_exposure_audit", "buildings": [{"building_id": self.case["building_id"], "cohort": "development"}]})
-        curation.inventory(self.root / "fixture/inputs/histories", self.root / "inventory", candidates_path=self.candidates, exposure_path=self.root / "audit.json")
+        curation.inventory(self.root / "fixture/inputs/histories", self.root / "inventory", candidates_path=self.candidates,
+                           exposure_path=self.root / "audit.json", identity_map=identity_map)
         archive.index_archive(corpus, self.config, self.root / "index", pool_factory=ExposedEarliestPool, synthetic=True)
         metrics.plan(questions, answers, self.root / "inventory/inventory.json", self.config, self.root / "plan",
-                     archive_index=self.root / "index/index.json", synthetic=True)
+                     archive_index=self.root / "index/index.json", synthetic=True, identity_map=identity_map)
         self.assertEqual(read_json(self.root / "plan/plan.private.json")["archive_corpus_sha256"], sha256(corpus))
         return questions, answers, label
 
@@ -251,6 +252,34 @@ class ArchiveReviewTest(unittest.TestCase):
                 reject_forbidden(value)
             with self.assertRaises(ValueError):
                 reject_forbidden(json.dumps(value))
+
+    def test_reviewed_identity_is_shared_by_archive_reference_retrieval_plan_and_score(self):
+        alias = self.case["building_id"] + "-alias"
+        _, corpus, record = self.make_archive(changes={"building_id": alias})
+        label = self.label(corpus, record)
+        with self.assertRaisesRegex(ValueError, "identity"):
+            qa._checked_label(self.case, label, Fingerprints())
+        identity_path = self.root / "reviewed-identity.json"
+        write_json(identity_path, {"schema_version": 1, "kind": "www_physical_identity_review", "groups": [{
+            "physical_building_id": self.case["building_id"], "building_ids": [self.case["building_id"], alias],
+            "decision": "same_building", "reviewer": "synthetic_human", "rationale": "Explicit synthetic alias review",
+            "sources": [{"path": str(corpus), "sha256": sha256(corpus)}]}]})
+        label["earliest_archive"]["identity_source"] = {"path": str(identity_path), "sha256": sha256(identity_path)}
+        with patch.object(self, "label", return_value=label):
+            questions, answers, _ = self.freeze(corpus, record, identity_map=identity_path)
+        with self.assertRaisesRegex(ValueError, "same reviewed identity"):
+            metrics.plan(questions, answers, self.root / "inventory/inventory.json", self.config, self.root / "bad-plan",
+                         archive_index=self.root / "index/index.json", synthetic=True)
+        result = runner.run(questions, self.config, self.root / "run", archive_index=self.root / "index/index.json",
+                            identity_map=identity_path, pool_factory=ExposedEarliestPool, synthetic=True)
+        self.assertEqual(result["outcome_counts"]["completed"], 3)
+        metrics.score(questions, answers, self.root / "run", self.root / "plan/plan.private.json", self.root / "score")
+        report = read_json(self.root / "score/metrics.private.json")
+        self.assertEqual(report["identity_source"], label["earliest_archive"]["identity_source"])
+        self.assertTrue(all(r["physical_building_id"] == self.case["building_id"] for r in report["cases"]))
+        self.assertEqual(report["summaries"]["development/all"]["fixed_retrieval"]["structured_accuracy"], 1.)
+        identities = archive.identity.Identities(identity_path, Fingerprints())
+        self.assertFalse(identities.compatible({**record, "view_id": "wrong-view"}, self.case))
 
 
 if __name__ == "__main__":

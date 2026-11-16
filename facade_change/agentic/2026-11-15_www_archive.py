@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime
 import calendar
+import importlib
 from pathlib import Path
 import shutil
 import time
@@ -18,6 +19,8 @@ from .models import JINA_REVISION, ModelPool, _resources_valid
 from .retrieval import _space, _vector
 from .runner import complete_run, new_run
 from .store import _id, reject_forbidden, temporal_value
+
+identity = importlib.import_module(".2026-11-16_www_identity", __package__)
 
 
 PACKAGE_KEYS = {"schema_version", "kind", "corpus_id", "created_at", "task_mode", "knowledge_cutoff", "records"}
@@ -203,7 +206,7 @@ def reviewed_earliest(case, label, fingerprints):
     binding = label["earliest_archive"]
     keys = {"corpus_path", "corpus_sha256", "record_sha256", "asset_sha256",
             "building_id", "view_id", "region_id", "match_basis"}
-    if not isinstance(binding, dict) or set(binding) != keys:
+    if not isinstance(binding, dict) or not keys <= set(binding) or set(binding) - keys - {"identity_source"}:
         raise ValueError("earliest_archive needs the exact private corpus/record/asset and reviewed identity binding")
     for key in ("corpus_sha256", "record_sha256", "asset_sha256"):
         value = binding[key]
@@ -221,8 +224,11 @@ def reviewed_earliest(case, label, fingerprints):
         raise ValueError("Reviewed earliest observation ID does not exist in the frozen archive")
     if digest(record) != binding["record_sha256"]:
         raise ValueError("Reviewed earliest archive record hash mismatch")
-    if (record["identity_status"] != "verified" or record["building_id"] != case["building_id"]
-            or record["view_id"] not in {None, case["view_id"]}
+    source = binding.get("identity_source")
+    if source is not None and (not isinstance(source, dict) or set(source) != {"path", "sha256"}):
+        raise ValueError("Archive identity binding requires its frozen path and SHA-256")
+    identities = identity.Identities(source["path"], fingerprints, source["sha256"]) if source else identity.Identities()
+    if (record["identity_status"] != "verified" or not identities.compatible(record, case)
             or any(binding[k] != case[k] for k in ("building_id", "view_id", "region_id"))):
         raise ValueError("Reviewed archive image has incompatible or unverified building/view/region identity")
     if not isinstance(binding["match_basis"], str) or not binding["match_basis"].strip():
@@ -311,7 +317,8 @@ def index_archive(corpus_path, config, out, *, text_chars=600, pool_factory=None
 
 class ArchiveSearch:
     """An adapter over saved Jina vectors; archive images keep their own frames."""
-    def __init__(self, index_path, config, fingerprints, *, synthetic=False):
+    def __init__(self, index_path, config, fingerprints, *, synthetic=False, identities=None):
+        self.identities = identities or identity.Identities()
         path = Path(index_path).expanduser().resolve()
         fingerprints.add(path)
         self.index = read_json(path)
@@ -354,7 +361,7 @@ class ArchiveSearch:
             reason = None
             if row["identity_status"] != "verified":
                 reason = "identity_not_verified; not corroboration"
-            elif row["building_id"] != question["building_id"] or row["view_id"] not in {None, question["view_id"]}:
+            elif not self.identities.compatible(row, question):
                 reason = "different_building_or_view"
             elif _date(row["available_at"], "available_at") > _date(question["knowledge_cutoff"], "knowledge_cutoff"):
                 reason = "after_knowledge_cutoff"

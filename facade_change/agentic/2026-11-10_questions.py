@@ -275,6 +275,8 @@ def _checked_label(case, label, fingerprints):
     if not isinstance(label, dict) or label.get("assessment") not in ASSESSMENTS:
         raise ValueError("Approved cases need an explicit reviewed assessment")
     result = copy.deepcopy(label)
+    if {"archive_correspondence", "correspondence_boxes"} & set(result):
+        raise ValueError("Archive correspondence proposals must remain separate from answer labels and temporal events")
     assessment = result["assessment"]
     allowed = ({"earliest_presence", "insufficient_evidence"} if case["task"] == "earliest_evidence" else
                {"archival_fact", "insufficient_evidence"} if case["task"] == "archival_qa" else

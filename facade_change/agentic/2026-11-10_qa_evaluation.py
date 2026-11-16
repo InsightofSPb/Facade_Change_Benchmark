@@ -163,7 +163,7 @@ def _events(questions, labels):
         case = questions[identifier]
         for event in label["events"]:
             name = event["event_id"]
-            identity = (case["building_id"], tuple(case["task_dates"]))
+            identity = (case.get("physical_building_id", case["building_id"]), tuple(case["task_dates"]))
             entry = events.setdefault(name, {"event_id": name, "identity": identity, "representations": [], "mask_area": None})
             if entry["identity"] != identity:
                 raise ValueError("Reviewed event ID spans buildings/temporal intervals; use distinct physical episode IDs")
@@ -340,7 +340,7 @@ def approved_cohort(questions_path, answers_path, fingerprints):
     return public, labels
 
 
-def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.25, .5)):
+def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.25, .5), *, identity_map=None):
     if not thresholds or len(set(thresholds)) != len(thresholds) or any(
             isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or not 0 < t <= 1 for t in thresholds):
         raise ValueError("IoU thresholds must be distinct finite numbers in (0, 1]")
@@ -352,6 +352,8 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
     if saved.get("model_manifest_sha256") != model_sha:
         raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
     questions = {r["question_id"]: r for r in public["questions"]}
+    identities = importlib.import_module(".2026-11-16_www_identity", __package__).Identities(identity_map, fingerprints)
+    questions = {k: {**r, "physical_building_id": identities.physical(r["building_id"])} for k, r in questions.items()}
     predictions = _predictions(saved, questions, Path(predictions_path).resolve().parent, fingerprints)
     protocol = {"k": list(K_VALUES), "iou_thresholds": list(thresholds), "matching": "deterministic_maximum_cardinality_one_to_one",
         "rank_policy": "top K per question from saved non-GT ranking; no padding of single-box outputs",
@@ -359,13 +361,14 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
         "threshold_status": "0.25 is an initial coarse-localization choice; 0.5 stricter diagnostic, neither universally validated",
         "area_denominator": "fixed earlier reference geometric support; never reduced using later visibility",
         "pixel_support_policy": "fixed reviewed reference domain; prediction must cover every required pixel",
-        "empty_positive_cohort": "recall undefined", "statistical_unit": "building", "protocol": qa.PROTOCOL}
+        "empty_positive_cohort": "recall undefined", "statistical_unit": "physical_building", "protocol": qa.PROTOCOL,
+        "identity_source": identities.source}
     journal = new_run(out, {"model_manifest_sha256": model_sha, "inputs": fingerprints.files, **protocol}, "facade_qa_offline_evaluation")
     try:
         pooled = _aggregate(questions, labels, predictions, thresholds)
         buildings = {}
-        for building in sorted({row["building_id"] for row in questions.values()}):
-            cohort = {key: value for key, value in questions.items() if value["building_id"] == building}
+        for building in sorted({row["physical_building_id"] for row in questions.values()}):
+            cohort = {key: value for key, value in questions.items() if value["physical_building_id"] == building}
             buildings[building] = _aggregate(cohort, {key: labels[key] for key in cohort}, {key: predictions[key] for key in cohort}, thresholds)
         macro = []
         for index, row in enumerate(pooled["localization"]):

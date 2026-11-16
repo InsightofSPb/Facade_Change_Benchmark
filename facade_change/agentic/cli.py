@@ -87,6 +87,9 @@ class TerminalProgress:
                 self._begin(f"начало; результаты: {values.get('out')}")
             elif event == "history_started":
                 self._begin("импорт истории и проверка сохранённых данных")
+            elif event == "review_stage":
+                self.case = self.mode = None
+                self._begin(values["stage"])
             elif event == "case_started":
                 self.mode = None
                 self._begin(f"подготовка случая {values.get('index', '?')}/{values.get('total', '?')}")

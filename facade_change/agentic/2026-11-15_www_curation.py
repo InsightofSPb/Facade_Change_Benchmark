@@ -4,9 +4,12 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import copy
 import csv
+from datetime import datetime, timezone
+import html
 import importlib
 import json
 from pathlib import Path
+import shutil
 import zipfile
 
 import numpy as np
@@ -22,6 +25,10 @@ from .store import temporal_value
 
 qa = importlib.import_module(".2026-11-10_questions", __package__)
 runner = importlib.import_module(".2026-11-15_www_runner", __package__)
+identity = runner.archive.identity
+REVIEW_TARGETS = {"earliest_evidence": 40, "visible_change": 30, "stability": 20, "insufficient_evidence": 10}
+REVIEW_FAMILIES = {"earliest_damage": "earliest_evidence", "possible_change": "visible_change",
+                  "stable_control": "stability", "uncertain_control": "insufficient_evidence"}
 
 
 def csv_rows(path, rows):
@@ -36,8 +43,15 @@ def csv_rows(path, rows):
             writer.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in row.items()})
 
 
-def inventory(histories, out, *, candidates_path=None, exposure_path=None, addresses_path=None):
+def inventory(histories, out, *, candidates_path=None, exposure_path=None, addresses_path=None,
+              identity_map=None, exposed_questions=()):
     root, fingerprints = Path(histories).resolve(), Fingerprints()
+    identities = identity.Identities(identity_map, fingerprints)
+    exposed = {}
+    for path in exposed_questions:
+        public = qa.validate_public(qa.read_bound(path, fingerprints))
+        for question in public["questions"]:
+            exposed.setdefault(question["building_id"], []).append({"path": str(Path(path).resolve()), "sha256": sha256(path)})
     document, manifest_sha = _history_document(root, fingerprints)
     candidates = qa._load_candidates(candidates_path, fingerprints) if candidates_path else None
     if candidates and any(r["source_provenance"]["history_manifest_sha256"] != manifest_sha for r in candidates["candidates"]):
@@ -76,7 +90,7 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
         for track in document["tracks"]:
             groups[(track["building_id"], track["view_id"], track["split"])].append(track)
             for observation in track["observations"]:
-                owners[observation["image_sha256"]].add((track["building_id"], track["split"]))
+                owners[observation["image_sha256"]].add((identities.physical(track["building_id"]), track["split"]))
         rows, sections = [], []
         for (building, view, split), tracks in sorted(groups.items(), key=lambda p: str(p[0])):
             observations = [r for t in tracks for r in t["observations"]]
@@ -104,13 +118,18 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
             if any(r["status"] != "verified_bytes" for r in refs):
                 reasons.append("some_original_frames_unavailable_for_identity_audit")
             audit = audits.get(building, {})
-            if split == "val" or audit.get("cohort") == "development":
+            aliases = sorted(name for name in set(audits) | set(exposed) if identities.physical(name) == identities.physical(building))
+            alias_exposure = [source for name in aliases for source in exposed.get(name, [])]
+            if split == "val" or audit.get("cohort") == "development" or exposed.get(building):
                 cohort, exposure_status = "development", "development_exposure"
             elif (split == "test" and audit.get("cohort") == "evaluation" and audit.get("prior_exposure") == "none_found"
                   and audit.get("reviewer") and audit.get("audit_sources") and exposure.get("protocol_sha256")):
                 cohort, exposure_status = "evaluation", "audited_before_frozen_protocol_run"
             else:
                 cohort, exposure_status = "unassigned", "training_exposure" if split == "train" else "earlier_exposure_not_audited"
+            original_cohort, original_exposure_status = cohort, exposure_status
+            if any(audits.get(name, {}).get("cohort") == "development" for name in aliases) or alias_exposure:
+                cohort, exposure_status = "development", "development_exposure"
             eligible = not reasons and cohort in {"development", "evaluation"}
             if cohort == "unassigned":
                 reasons.append(exposure_status)
@@ -133,11 +152,20 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
                 "reference_preview_original_sha256": original["sha256"] if original else None, "address_metadata": address_rows.get(building),
                 "address_status": "source_supplied" if building in address_rows else "unknown_not_inferred_from_id",
                 "cohort": cohort, "exposure_status": exposure_status, "exposure_audit": audit or None,
+                "original_cohort": original_cohort, "original_exposure_status": original_exposure_status,
+                "known_exposure_manifests": alias_exposure,
+                "reviewed_alias_exposure_audits": {name: audits[name] for name in aliases if name in audits},
                 "eligible": eligible, "exclusion_reasons": reasons}
             rows.append(row)
             sections.append({"title": str(building) + " / " + str(view), "caption": json.dumps(row, ensure_ascii=False),
                 "panels": [{"src": preview, "label": "Original-frame preview; full bytes referenced in inventory"}] if preview else []})
+        audited = {name for name, row in audits.items() if row.get("cohort") == "evaluation" and
+                   row.get("prior_exposure") == "none_found" and row.get("reviewer") and row.get("audit_sources") and exposure.get("protocol_sha256")}
+        identities.annotate_inventory(rows, audited_buildings=audited)
+        for section, row in zip(sections, rows):
+            section["caption"] = json.dumps(row, ensure_ascii=False)
         result = {"schema_version": 1, "kind": "www_history_inventory", "history_manifest_sha256": manifest_sha,
+            "identity_source": identities.source,
             "candidate_sha256": sha256(candidates_path) if candidates_path else None, "views": rows,
             "unexported_frames": [{"building_id": v["building_id"], "view_id": v["view_id"],
                 "image": f.get("image"), "status": f.get("status"), "reason": f.get("reason")}
@@ -152,6 +180,7 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
         counts = Counter(r["cohort"] for r in rows)
         summary = {"status": "completed", "tracks": len(document["tracks"]), "views": len(rows),
             "buildings": len({r["building_id"] for r in rows if r["building_id"]}), "views_by_cohort": dict(counts),
+            "physical_buildings": len({r["physical_building_id"] for r in rows if r["physical_building_id"]}),
             "eligible_views": sum(r["eligible"] for r in rows), "excluded_views": sum(not r["eligible"] for r in rows),
             "exclusion_reasons": dict(Counter(reason for r in rows for reason in r["exclusion_reasons"])),
             "report_path": str(journal.out / "gallery.html")}
@@ -165,31 +194,63 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
         journal.close()
 
 
-def select_batch(cases, inventory_document, *, size=100, per_building=12, seed="2026-11-15-www-v1", max_overlap=.5, cohort="development"):
+def same_event_candidate(a, b, max_overlap):
+    """Conservative spatiotemporal duplicate proposal, not proof of a physical event."""
+    if a["frame"]["anchor_sha256"] != b["frame"]["anchor_sha256"] or a["view_id"] != b["view_id"]:
+        return False
+    if a["task"] == b["task"] == "earliest_evidence":
+        same_dates = min(a["task_dates"]) == min(b["task_dates"])
+    else:
+        same_dates = sorted(a["task_dates"]) == sorted(b["task_dates"])
+    x, y = a["frame"]["anchor_bbox_xyxy"], b["frame"]["anchor_bbox_xyxy"]
+    intersection = max(0, min(x[2], y[2])-max(x[0], y[0])) * max(0, min(x[3], y[3])-max(x[1], y[1]))
+    smaller = min((x[2]-x[0])*(x[3]-x[1]), (y[2]-y[0])*(y[3]-y[1]))
+    return same_dates and smaller > 0 and intersection / smaller > max_overlap
+
+
+def select_batch(cases, inventory_document, *, size=100, per_building=12, seed="2026-11-15-www-v1", max_overlap=.5,
+                 cohort="development", targets=None, excluded_cases=()):
     if size < 1 or per_building < 1 or not 0 <= max_overlap <= 1 or cohort not in {"development", "evaluation"}:
         raise ValueError("Invalid frozen batch selection limits")
     views = {(r["building_id"], r["view_id"]): r for r in inventory_document["views"]}
+    if targets is not None and (set(targets) != set(REVIEW_TARGETS) or
+            any(type(v) is not int or v < 0 for v in targets.values()) or sum(targets.values()) != size):
+        raise ValueError("Review targets must be four nonnegative provisional counts summing to batch size")
+    def physical(row):
+        return views.get((row["building_id"], row["view_id"]), {}).get("physical_building_id", row["building_id"])
     buckets, excluded = defaultdict(list), []
     for case in cases:
         view = views.get((case["building_id"], case["view_id"]), {})
         if not view.get("eligible") or view.get("cohort") != cohort:
-            excluded.append({"question_id": case["question_id"], "reason": "view_not_eligible_for_requested_cohort"})
+            excluded.append({"question_id": case["question_id"], "reason": "view_not_eligible_for_requested_cohort",
+                             "details": view.get("exclusion_reasons", [])})
+        elif any(case["question_id"] == old["question_id"] or
+                 physical(case) == physical(old) and same_event_candidate(case, old, max_overlap) for old in excluded_cases):
+            excluded.append({"question_id": case["question_id"], "reason": "previously_exposed_question_or_overlapping_event"})
         else:
-            buckets[(case["building_id"], case["candidate_type"])].append(case)
+            family = REVIEW_FAMILIES.get(case["candidate_type"]) if targets is not None else case["candidate_type"]
+            if family is None:
+                excluded.append({"question_id": case["question_id"], "reason": "no_provisional_review_target"})
+            else:
+                buckets[(physical(case), family)].append(case)
     for rows in buckets.values():
         rows.sort(key=lambda r: (-len(set(r["task_dates"])), -(
             temporal_value(max(r["task_dates"])) - temporal_value(min(r["task_dates"]))), digest([seed, r["question_id"]])))
     order = sorted(buckets, key=lambda k: (digest([seed, k[0]]), k[1]))
-    selected, counts = [], Counter()
+    selected, counts, target_counts = [], Counter(), Counter()
     while len(selected) < size and any(buckets.values()):
         for key in order:
             if not buckets[key] or len(selected) >= size:
                 continue
             row = buckets[key].pop(0)
             reason = None
-            if counts[row["building_id"]] >= per_building:
+            if targets is not None and target_counts[key[1]] >= targets[key[1]]:
+                reason = "provisional_target_quota"
+            elif counts[physical(row)] >= per_building:
                 reason = "per_building_cap"
-            elif any(row["building_id"] == p["building_id"] and row["view_id"] == p["view_id"] and
+            elif targets is not None and any(physical(row) == physical(p) and same_event_candidate(row, p, max_overlap) for p in selected):
+                reason = "overlapping_same_interval_event_proposal"
+            elif targets is None and any(physical(row) == physical(p) and row["view_id"] == p["view_id"] and
                     row["frame"]["anchor_sha256"] == p["frame"]["anchor_sha256"] and
                     box_iou(row["frame"]["anchor_bbox_xyxy"], p["frame"]["anchor_bbox_xyxy"]) > max_overlap for p in selected):
                 reason = "overlapping_anchor_region"
@@ -197,28 +258,42 @@ def select_batch(cases, inventory_document, *, size=100, per_building=12, seed="
                 excluded.append({"question_id": row["question_id"], "reason": reason})
             else:
                 selected.append(row)
-                counts[row["building_id"]] += 1
+                counts[physical(row)] += 1
+                target_counts[key[1]] += 1
     excluded += [{"question_id": r["question_id"], "reason": "batch_size_cap"} for rows in buckets.values() for r in rows]
     return selected, excluded
 
 
-def batch(candidates_path, inventory_path, out, **options):
+def batch(candidates_path, inventory_path, out, *, exposed_questions=(), **options):
     fingerprints = Fingerprints()
     candidates = qa._load_candidates(candidates_path, fingerprints)
     inv = qa.read_bound(inventory_path, fingerprints)
     if inv.get("candidate_sha256") != sha256(candidates_path):
         raise ValueError("Batch inventory must count this exact candidate manifest")
-    selected, excluded = select_batch(candidates["candidates"], inv, **options)
+    old_cases = []
+    for path in exposed_questions:
+        old_cases.extend(qa.validate_public(qa.read_bound(path, fingerprints))["questions"])
+    selected, excluded = select_batch(candidates["candidates"], inv, excluded_cases=old_cases, **options)
     journal = new_run(out, {"candidate_sha256": sha256(candidates_path), "inventory_sha256": sha256(inventory_path), **options}, "www_batch")
     try:
         result = qa._private("www_question_selection", candidate_sha256=sha256(candidates_path),
             question_ids=[r["question_id"] for r in selected], excluded=excluded, policy={**options,
                 "order": "round robin building/family; most dates/span first; SHA256(seed,question_id) ties",
-                "physical_event_deduplication": "pending human event_id review; geometric overlap cap is not event deduplication"})
+                "physical_event_deduplication": "same-anchor/view/date overlap suppression; physical event_id still requires human review"},
+            identity_source=inv.get("identity_source"), selected_at=datetime.now(timezone.utc).isoformat(),
+            provisional_targets={r["question_id"]: REVIEW_FAMILIES.get(r["candidate_type"]) for r in selected}, input_sha256=fingerprints.files)
         write_json(journal.out / "selection.private.json", result)
         summary = {"status": "completed", "selected": len(selected), "buildings": len({r["building_id"] for r in selected}),
             "candidate_families": dict(Counter(r["candidate_type"] for r in selected)), "approved": 0,
             "excluded": dict(Counter(r["reason"] for r in excluded)), "target_is_not_guaranteed": True}
+        targets = options.get("targets")
+        counts = Counter(REVIEW_FAMILIES.get(r["candidate_type"]) for r in selected)
+        summary.update(requested=options.get("size", 100), shortfall=max(0, options.get("size", 100)-len(selected)),
+            physical_buildings=len({v.get("physical_building_id", v["building_id"]) for v in inv["views"]
+                                    if any(r["building_id"] == v["building_id"] and r["view_id"] == v["view_id"] for r in selected)}),
+            provisional_target_counts=dict(counts), target_shortfalls={k: max(0, v-counts[k]) for k, v in (targets or {}).items()},
+            target_semantics="review sampling targets only, never imposed answer labels")
+        summary["eligibility_reasons"] = dict(Counter(reason for row in excluded for reason in row.get("details", [])))
         write_json(journal.out / "summary.json", summary)
         fingerprints.verify()
         complete_run(journal, "completed", summary=summary)
@@ -401,9 +476,20 @@ def proposals(case, fingerprints, annotation_index=None):
             "caveat": "Unannotated is unknown; equal masks do not prove stability; differing masks do not prove temporal change."}
 
 
-def review_page(candidates_path, selection_path, out, *, handoff_path=None, previous=None):
+def review_page(candidates_path, selection_path, out, *, handoff_path=None, previous=None,
+                archive_corpus=None, identity_map=None, progress=None):
     fingerprints = Fingerprints()
     candidates, rows = selected_cases(candidates_path, selection_path, fingerprints)
+    selection = qa.read_bound(selection_path, fingerprints)
+    identities = identity.Identities(identity_map, fingerprints)
+    if selection.get("identity_source") is not None and selection["identity_source"] != identities.source:
+        raise ValueError("Review page and batch must retain the same identity mapping")
+    corpus = None
+    corpus_sha = None
+    if archive_corpus:
+        corpus_path = Path(archive_corpus).resolve()
+        corpus = runner.archive.validate_package(qa.read_bound(corpus_path, fingerprints), corpus_path.parent, fingerprints)
+        corpus_sha = sha256(corpus_path)
     handoff_doc = qa.read_bound(handoff_path, fingerprints) if handoff_path else {}
     if handoff_doc and handoff_doc.get("source_candidates_sha256") != sha256(candidates_path):
         raise ValueError("Text review must bind these exact candidates")
@@ -412,11 +498,14 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
     if prior and (prior.get("kind") != "facade_qa_review" or prior["candidate_sha256"] != sha256(candidates_path)):
         raise ValueError("Previous review belongs to another cohort")
     journal = new_run(out, {"candidate_sha256": sha256(candidates_path), "selection_sha256": sha256(selection_path),
-        "handoff_sha256": sha256(handoff_path) if handoff_path else None, "previous": str(previous) if previous else None}, "www_private_review_ui")
+        "handoff_sha256": sha256(handoff_path) if handoff_path else None, "previous": str(previous) if previous else None,
+        "archive_corpus_sha256": sha256(archive_corpus) if archive_corpus else None,
+        "identity_source": identities.source}, "www_private_review_ui", progress)
     try:
         (journal.out / "assets").mkdir()
         sources, items, sections = {}, [], []
-        for case in rows:
+        for number, case in enumerate(rows, 1):
+            journal.event("case_started", case_id=case["question_id"], index=number, total=len(rows))
             draft = proposals(case, fingerprints, candidates["source"].get("annotation_targets"))
             text = judgments.get(case["question_id"])
             state = prior.get("states", {}).get(case["question_id"], {})
@@ -439,13 +528,41 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
                 relative = _copy(journal.out, obs["rgb_path"], journal.out, sources)
                 images.append({"src": relative, "date": obs["date"], "observation_id": obs["observation_id"]})
                 panels.append({"src": relative, "label": obs["date"] + " / " + obs["observation_id"]})
+            archive_items = []
+            for record in (corpus or {}).get("records", []):
+                if record["building_id"] not in identities.candidate_members(case["building_id"]):
+                    continue
+                available = (corpus["knowledge_cutoff"] == case["knowledge_cutoff"] and
+                             runner.archive._date(record["available_at"], "available_at") <= temporal_value(case["knowledge_cutoff"]))
+                row = {k: copy.deepcopy(record[k]) for k in ("evidence_id", "record_type", "building_id", "view_id", "identity_status",
+                    "source_page_url", "media_url", "title", "publisher", "source_text", "observation_date", "publication_date",
+                    "available_at", "date_source", "parent_evidence_id", "source_warnings")}
+                row.update(corpus_sha256=corpus_sha, record_sha256=digest(record),
+                    retrieval_eligible=available and record["identity_status"] == "verified" and identities.compatible(record, case),
+                    correspondence_status="unreviewed; identity/date compatibility does not prove this target region is shown",
+                    image=None, document=None)
+                assets = runner.archive.image_assets(record)
+                if assets:
+                    asset = assets[0]
+                    path = runner.archive._inside(corpus_path.parent, asset["path"])
+                    row["image"] = {"src": _copy(journal.out, path, journal.out, sources), "sha256": asset["sha256"],
+                                    "shape": [asset["height"], asset["width"]], "page_index": asset["page_index"]}
+                pdf = next((a for a in record["assets"] if a["media_type"] == "application/pdf"), None)
+                if pdf:
+                    row["document"] = _copy(journal.out, runner.archive._inside(corpus_path.parent, pdf["path"]), journal.out, sources)
+                archive_items.append(row)
             item = {"question_id": case["question_id"], "question": state.get("reviewed_question", case["question"]),
                 "building_id": case["building_id"], "region_id": case["region_id"], "task": case["task"], "frame": case["frame"],
+                "physical_building_id": identities.physical(case["building_id"]), "identity_review_pending": identities.pending(case["building_id"]),
+                "provisional_review_target": selection.get("provisional_targets", {}).get(case["question_id"]),
+                "archive_evidence": archive_items,
                 "revision": state.get("revision", 0), "previous_status": state.get("status", "candidate"), "images": images,
                 "label": label, "human_text_judgment": text, **draft}
             items.append(item)
             sections.append({"title": case["question_id"], "caption": json.dumps(item, ensure_ascii=False), "panels": panels})
-        payload = qa._private("www_review_page", candidate_sha256=sha256(candidates_path), items=items)
+            journal.event("case_prepared", case_id=case["question_id"], status="completed")
+        payload = qa._private("www_review_page", candidate_sha256=sha256(candidates_path), items=items,
+            identity_source=identities.source, archive_corpus_sha256=sha256(archive_corpus) if archive_corpus else None)
         write_json(journal.out / "drafts.private.json", payload)
         # Existing static gallery remains available, with a small separate editor over the same copied RGB.
         write_static_gallery(journal.out, "PRIVATE — draft questions and RGB", sections,
@@ -459,6 +576,84 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
             "approved": 0, "annotation_facts": sum(len(r["positive_annotation_facts"]) for r in items),
             "automatic_proposals": sum(len(r["proposed_boxes"]) for r in items), "report_path": str(journal.out / "review.html")}
         write_json(journal.out / "summary.json", summary)
+        complete_run(journal, "completed", summary=summary)
+        return summary
+    except BaseException as exc:
+        complete_run(journal, "failed", error=str(exc))
+        raise
+    finally:
+        journal.close()
+
+
+def review_package(candidates_path, histories, archive_corpus, out, *, identity_map=None, exposure_path=None,
+                   exposed_questions=(), handoff_path=None, preserved_selection=None, previous=None,
+                   targets=None, per_building=12, seed="2026-11-16-www-review-v1", progress=None):
+    """CPU orchestration of the existing inventory/batch/editor; never reads model outcomes."""
+    targets = dict(REVIEW_TARGETS if targets is None else targets)
+    if bool(handoff_path) != bool(preserved_selection):
+        raise ValueError("Preserve the original human handoff together with its bound selection")
+    fingerprints = Fingerprints()
+    fingerprints.add(candidates_path)
+    fingerprints.add(archive_corpus)
+    journal = new_run(out, {"candidate_sha256": sha256(candidates_path), "archive_corpus_sha256": sha256(archive_corpus),
+        "targets": targets, "per_building": per_building, "seed": seed,
+        "selection_basis": "public inputs and annotation drafting families before new model outcomes"}, "www_review_package", progress)
+    try:
+        if identity_map:
+            identity.Identities(identity_map, fingerprints)
+            shutil.copyfile(identity_map, journal.out / "identity-review.json")
+        else:
+            write_json(journal.out / "identity-review.json", identity.template())
+        identity_path = journal.out / "identity-review.json"
+        exposed_paths = list(exposed_questions)
+        preserved = None
+        if handoff_path:
+            handoff_doc = qa.read_bound(handoff_path, fingerprints)
+            if handoff_doc.get("source_candidates_sha256") != sha256(candidates_path):
+                raise ValueError("Preserved human decisions must bind the exact original candidate bytes; do not rebase labels automatically")
+            saved_selection = qa.read_bound(preserved_selection, fingerprints)
+            handed_ids = [r["question_id"] for r in handoff_doc["cases"]]
+            if len(set(handed_ids)) != len(handed_ids) or set(saved_selection["question_ids"]) != set(handed_ids):
+                raise ValueError("Preserved selection must retain every original human decision, without adding cases")
+            shutil.copyfile(handoff_path, journal.out / "preserved-handoff.private.json")
+            # Existing decisions were already seen by people/models: retain them in a
+            # separate section, and exclude their questions/overlapping events from new selection.
+            public_candidates(candidates_path, preserved_selection, journal.out / "preserved-public")
+            exposed_paths.append(journal.out / "preserved-public/questions.json")
+        journal.event("review_stage", stage="инвентаризация identity, split и прежней экспозиции")
+        inventory(histories, journal.out / "inventory", candidates_path=candidates_path,
+            exposure_path=exposure_path, identity_map=identity_path, exposed_questions=exposed_paths)
+        journal.event("review_stage", stage="отбор новых вопросов по целевым квотам до просмотра ответов моделей")
+        selected = batch(candidates_path, journal.out / "inventory/inventory.json", journal.out / "batch",
+            size=sum(targets.values()), targets=targets, per_building=per_building, seed=seed, max_overlap=.5,
+            cohort="development", exposed_questions=exposed_paths)
+        journal.event("review_stage", stage="экспорт датированных RGB и архивных источников для приватного review")
+        reviewed = review_page(candidates_path, journal.out / "batch/selection.private.json", journal.out / "review",
+            archive_corpus=archive_corpus, identity_map=identity_path, progress=progress)
+        if handoff_path:
+            journal.event("review_stage", stage="сохранение прежних человеческих решений отдельным разделом")
+            preserved = review_page(candidates_path, preserved_selection, journal.out / "preserved-review",
+                handoff_path=handoff_path, previous=previous, archive_corpus=archive_corpus, identity_map=identity_path, progress=progress)
+        summary = {**selected, "approved": 0, "models_executed": False,
+            "review_path": reviewed["report_path"], "preserved_review": preserved,
+            "identity_review": str(identity_path), "report_path": str(journal.out / "index.html"),
+            "full_target_cohort_created": selected["selected"] == sum(targets.values()),
+            "preserved_cases_scope": "separate original review; not counted toward new provisional targets"}
+        write_json(journal.out / "summary.json", summary)
+        write_static_gallery(journal.out, "PRIVATE — new review selection and preserved human decisions", [], notes=[
+            json.dumps(summary, ensure_ascii=False),
+            "Open review/review.html for new questions; preserved-review/review.html retains the earlier judgments when supplied.",
+            "identity-review.json is a proposal: review a separate copy, then create a new inventory/selection with that reviewed map.",
+            "Archive correspondence proposals are separate from change-event GT. No labels are approved by this exporter."])
+        links = '<li><a href="review/review.html">Новые вопросы и архивные источники</a></li>'
+        if preserved:
+            links += '<li><a href="preserved-review/review.html">Сохранённые человеческие решения, включая уточнения</a></li>'
+        links += '<li><a href="inventory/gallery.html">Исходные IDs, split и exposure</a></li><li><a href="identity-review.json" download>Копия identity mapping для отдельного review</a></li>'
+        (journal.out / "index.html").write_text('<!doctype html><meta charset="utf-8"><title>PRIVATE WWW review</title>'
+            '<h1>Приватный review, без автоматических одобрений</h1><ul>' + links + '</ul>'
+            '<p>Квоты — цели просмотра. Недобор не заполняется повторяющимися событиями или неаудированными зданиями.</p>'
+            '<pre>' + html.escape(json.dumps(summary, ensure_ascii=False, indent=2)) + '</pre>', encoding="utf-8")
+        fingerprints.verify()
         complete_run(journal, "completed", summary=summary)
         return summary
     except BaseException as exc:
