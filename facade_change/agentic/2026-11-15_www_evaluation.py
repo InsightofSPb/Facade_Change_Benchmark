@@ -24,6 +24,8 @@ runner = importlib.import_module(".2026-11-15_www_runner", __package__)
 curation = importlib.import_module(".2026-11-15_www_curation", __package__)
 ratio = evaluation.ratio
 AGGREGATION = {"unit": "physical_building", "seed": 20261116, "replicates": 2000, "confidence_level": .95}
+PAIRED_CONTRASTS = (("photos_only", "fixed_retrieval"), ("fixed_retrieval", "bounded_agentic_retrieval"),
+                    ("photos_only", "bounded_agentic_retrieval"))  # B−A, C−B, C−A.
 
 
 def _reference_corpus(labels, corpus_sha256, identity_source=None):
@@ -365,7 +367,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                     summaries[key][condition] = {**aggregate(selected), "families": {
                         family: aggregate([r for r in selected if r["family"] == family]) for family in sorted({r["family"] for r in selected})}}
                 paired[key] = []
-                for a, b in zip(runner.CONDITIONS, runner.CONDITIONS[1:]):
+                for a, b in PAIRED_CONTRASTS:
                     left, right = summaries[key][a]["buildings"], summaries[key][b]["buildings"]
                     differences = {name: right[name]["structured_accuracy"] - left[name]["structured_accuracy"] for name in left}
                     paired[key].append({"contrast": b + " minus " + a, "buildings": differences,

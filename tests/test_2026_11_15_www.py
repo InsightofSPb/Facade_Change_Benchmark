@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from facade_change.history_features import Fingerprints
+from facade_change.history_features import Fingerprints, digest
 from facade_change.io import read_json, sha256, write_json
 from facade_change.agentic import models
 
@@ -56,9 +56,44 @@ class WWWRunnerTest(unittest.TestCase):
         self.assertTrue(all(r["costs"]["model_calls"] == 0 for r in read_json(self.root / "resume/results.json")["results"]))
         resumed_costs = [read_json(p) for p in (self.root / "resume/questions").glob("*/*/costs.json")]
         self.assertTrue(all(r["model_calls"] == 0 and r["source_costs"]["model_calls"] > 0 for r in resumed_costs))
+        contract = read_json(self.root / "run/contract.json")
+        self.assertEqual(contract["prompt_revision"], runner.PROMPT_REVISION)
+        self.assertEqual(contract["prompt_sha256"], digest(runner.SYSTEM))
+        with patch.object(runner, "SYSTEM", runner.SYSTEM + "\nChanged fixture instruction"), self.assertRaisesRegex(ValueError, "Resume .*changed"):
+            self.run_fixture("changed-prompt", resume_from=self.root / "run")
+        self.assertFalse((self.root / "changed-prompt").exists())
         self.config["budgets"]["max_output_tokens"] += 1
         with self.assertRaisesRegex(ValueError, "Resume .*changed"):
             self.run_fixture("bad-resume", resume_from=self.root / "run")
+
+    def test_agent_can_finish_locally_without_any_retrieval_dispatch(self):
+        class LocalOnly(demo.SyntheticPool):
+            def call(self, role, payload):
+                if role == "jina":
+                    raise AssertionError("A scripted local-only final must not dispatch retrieval")
+                # Script a final response regardless of the offered action. This
+                # does not test whether a real model follows the new instruction.
+                scripted = copy.deepcopy(payload)
+                control = json.loads(scripted["messages"][-1]["content"][0]["text"])
+                control["allowed_action"] = "final"
+                scripted["messages"][-1]["content"][0]["text"] = json.dumps(control)
+                return super().call(role, scripted)
+        modes = (runner.CONDITIONS[0], runner.CONDITIONS[2])
+        result = self.run_fixture(pool_factory=LocalOnly, conditions=modes)
+        self.assertEqual(result["outcome_counts"], {"completed": 6, "abstained": 0, "error": 0})
+        for row in read_json(self.root / "run/results.json")["results"]:
+            self.assertEqual(row["costs"]["retrieval_rounds"], 0)
+            self.assertEqual(row["costs"]["qwen_requests"], 1)
+            folder = self.root / "run/questions" / row["question_id"] / row["condition"]
+            exposed = read_json(folder / "exposure.json")
+            self.assertEqual(exposed["tools"], [])
+            self.assertTrue(all(r["origin"] == "local_photo" for r in exposed["evidence"].values()))
+        for question in read_json(self.questions)["questions"]:
+            messages = [read_json(self.root / "run/questions" / question["question_id"] / c / "messages.json") for c in modes]
+            self.assertEqual(messages[0][:2], messages[1][:2])  # Same factual instructions, question and RGB.
+            controls = [json.loads(m[2]["content"][0]["text"]) for m in messages]
+            self.assertEqual([c["allowed_action"] for c in controls], ["final", "retrieve_or_final"])
+            self.assertEqual([c["remaining_retrieval_rounds"] for c in controls], [0, 2])
 
     def test_private_or_unknown_fields_cannot_enter_public_manifest(self):
         value = read_json(self.questions)
@@ -248,6 +283,18 @@ class WWWRunnerTest(unittest.TestCase):
         self.assertTrue(all(r["costs"]["retrieval_rounds"] == 2 for r in rows))
         self.assertTrue(all(r["status"] == "error" and "round budget exhausted" in r["error"] for r in rows))
         self.assertTrue(all(r["costs"]["qwen_requests"] == 4 for r in rows))
+
+    def test_retrieval_does_not_grant_extra_model_or_token_budget(self):
+        for budget, limit, error in (("max_model_calls", 1, "model request budget"),
+                                     ("max_total_output_tokens", 60, "token/image budget")):
+            with self.subTest(budget=budget):
+                config = copy.deepcopy(self.config)
+                config["budgets"][budget] = limit
+                runner.run(self.questions, config, self.root / budget, archive_index=self.index,
+                    pool_factory=demo.SyntheticPool, synthetic=True, conditions=(runner.CONDITIONS[2],))
+                rows = read_json(self.root / budget / "results.json")["results"]
+                self.assertTrue(all(r["status"] == "error" and error in r["error"] for r in rows))
+                self.assertTrue(all(r["costs"]["retrieval_rounds"] == 1 and r["costs"]["qwen_requests"] == 1 for r in rows))
 
     def test_invalid_citations_and_json_keep_bounded_errors(self):
         class Invalid(demo.SyntheticPool):

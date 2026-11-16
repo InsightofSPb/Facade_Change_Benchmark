@@ -120,6 +120,15 @@ class ReviewAndMetricsTest(unittest.TestCase):
             self.assertEqual(summary["legitimate_abstentions"], 1)
             self.assertEqual(summary["known_support_recall"], 0. if condition == "photos_only" else 1.)
         self.assertEqual(len(result["cases"]), 15)
+        contrasts = {"fixed_retrieval minus photos_only", "bounded_agentic_retrieval minus fixed_retrieval",
+                     "bounded_agentic_retrieval minus photos_only"}
+        for comparisons in result["paired_building_differences"].values():
+            self.assertEqual({r["contrast"] for r in comparisons}, contrasts)
+        direct = next(r for r in result["paired_building_differences"]["development/all"]
+                      if r["contrast"] == "bounded_agentic_retrieval minus photos_only")
+        self.assertEqual(direct["mean_paired_difference"], 0.)
+        self.assertEqual(direct["paired_confidence_intervals"]["building_macro_accuracy"]["interval"], [0., 0.])
+        self.assertEqual(direct["paired_confidence_intervals"]["change_stability_macro_f1"]["interval"], [0., 0.])
         self.assertTrue(all("physical_event_f1" in r for r in result["localization"]["photos_only"]))
         self.assertEqual(result["localization_by_cohort_and_stratum"]["photos_only"]["evaluation/all"][0]["eligible_events"], 0)
         diagnostic = read_json(self.root / "score/annotation-diagnostics.private.json")
@@ -145,6 +154,13 @@ class ReviewAndMetricsTest(unittest.TestCase):
             summary = result["summaries"]["development/all"][condition]
             self.assertEqual(summary["questions"], 5)
             self.assertGreater(summary["outcome_counts"].get("missing", 0), 0)
+        direct = next(r for r in result["paired_building_differences"]["development/all"]
+                      if r["contrast"] == "bounded_agentic_retrieval minus photos_only")
+        all_conditions = result["summaries"]["development/all"]
+        expected = all_conditions["bounded_agentic_retrieval"]["building_macro_accuracy"] - all_conditions["photos_only"]["building_macro_accuracy"]
+        self.assertAlmostEqual(direct["mean_paired_difference"], expected)
+        self.assertEqual(direct["paired_confidence_intervals"], metrics.paired_intervals(
+            result["cases"], "photos_only", "bounded_agentic_retrieval"))
 
     def test_equivalent_observation_and_archival_answer_contract(self):
         row = next(r for r in self.rows if r["task"] == "earliest_evidence")

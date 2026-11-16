@@ -195,8 +195,64 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(result["change_stability_macro_f1"]["independent_buildings"], 1)
         self.assertIsNone(result["change_stability_macro_f1"]["interval"])
 
+    def test_c_minus_a_resamples_physical_aliases_with_missing_outputs(self):
+        rows = self.rows()
+        a, _, c = demo.runner.CONDITIONS
+        for row in rows:
+            if row["condition"] == c:
+                row.update(correct=False, status="missing", decision=None)
+        result = metrics.paired_intervals(rows, a, c)
+        self.assertEqual(result, metrics.paired_intervals(rows[::-1], a, c))
+        self.assertEqual(result["independent_buildings"], 2)  # Three original IDs, two physical buildings.
+        self.assertEqual(result["building_macro_accuracy"]["difference"], -.5)
+        self.assertEqual(result["building_macro_accuracy"]["interval"], [-.5, -.5])
+        self.assertAlmostEqual(result["change_stability_macro_f1"]["difference"], -5/6)
+        self.assertEqual(result["seed"], 20261116)
+
 
 class PackageTests(unittest.TestCase):
+    def test_new_manifest_and_archive_keep_original_review_separate_and_exclude_exposure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, package, _ = demo.fixture(root / "fixture")
+            candidates = root / "fixture/candidates/candidates.json"
+            original = read_json(candidates)
+            cases = original["candidates"][:2]
+            selection, handoff = root / "selection.private.json", root / "handoff.private.json"
+            write_json(selection, demo.qa._private("www_question_selection", candidate_sha256=sha256(candidates),
+                question_ids=[r["question_id"] for r in cases]))
+            judgments = [{"question_id": r["question_id"], "group": "visible_change", "answer_ru": "Original synthetic human text",
+                          "clarification_verbatim": "Original synthetic clarification"} for r in cases]
+            write_json(handoff, {"source_candidates_sha256": sha256(candidates), "cases": judgments})
+            frozen_bytes = {p: p.read_bytes() for p in (candidates, selection, handoff)}
+            curation.public_candidates(candidates, selection, root / "old-public")
+            curation.review_page(candidates, selection, root / "old-review", handoff_path=handoff)
+            histories = root / "fixture/inputs/histories"
+            demo.qa.generate(histories, root / "all-candidates", annotation_targets=original["source"]["annotation_targets"],
+                knowledge_cutoff="2026-11-16", task_mode="retrospective", available_at="2026-11-16", splits=("train", "val", "test"))
+            fresh = root / "all-candidates/candidates.json"
+            self.assertNotEqual(sha256(fresh), sha256(candidates))
+            updated_archive = read_json(package)
+            updated_archive.update(corpus_id="synthetic-v4", knowledge_cutoff="2026-11-16")
+            write_json(root / "fixture/v4.json", updated_archive)
+            demo.archive.import_archive(root / "fixture/v4.json", root / "archive-v4")
+            with self.assertRaisesRegex(ValueError, "exact original candidate bytes"):
+                curation.review_package(fresh, histories, root / "archive-v4/corpus.json", root / "wrong-handoff",
+                    handoff_path=handoff, preserved_selection=selection)
+            summary = curation.review_package(fresh, histories, root / "archive-v4/corpus.json", root / "fresh-review",
+                exposed_questions=[root / "old-public/questions.json"])
+            chosen = read_json(root / "fresh-review/batch/selection.private.json")
+            self.assertFalse(set(chosen["question_ids"]) & {r["question_id"] for r in cases})
+            self.assertGreaterEqual(summary["excluded"]["previously_exposed_question_or_overlapping_event"], 2)
+            self.assertGreater(summary["shortfall"], 0)
+            self.assertEqual(sum(summary["target_shortfalls"].values()), summary["shortfall"])
+            self.assertEqual(summary["approved"], 0)
+            self.assertIsNone(summary["preserved_review"])
+            inventory = read_json(root / "fresh-review/inventory/inventory.json")
+            self.assertTrue(any(not r["eligible"] and r["cohort"] == "unassigned" for r in inventory["views"]))
+            self.assertEqual(read_json(root / "old-review/drafts.private.json")["items"][0]["human_text_judgment"], judgments[0])
+            self.assertEqual({p: p.read_bytes() for p in frozen_bytes}, frozen_bytes)
+
     def test_absent_reviewed_alias_propagates_known_exposure_without_erasing_original(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
