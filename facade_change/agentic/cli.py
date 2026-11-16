@@ -78,13 +78,29 @@ class TerminalProgress:
             if self._thread is None:
                 self._thread = threading.Thread(target=self._heartbeat, name="agentic-progress", daemon=True)
                 self._thread.start()
-            if values.get("case_id"):
-                self.case = values["case_id"]
+            if values.get("case_id") or values.get("question_id"):
+                self.case = values.get("case_id", values.get("question_id"))
             if values.get("mode"):
                 self.mode = values["mode"]
+            if values.get("policy"):
+                self.mode = values["policy"]
             if event == "command_started":
                 self.task = values["task"]
                 self._begin(f"начало; результаты: {values.get('out')}")
+            elif event.startswith("inspection_"):
+                # A strict display allowlist: never render raw replies or private review fields.
+                label = event.removeprefix("inspection_")
+                stage = values.get("stage")
+                message = label + (" " + str(stage) if stage else "")
+                if values.get("count") is not None:
+                    message += " count=" + str(values["count"])
+                if label.endswith(("started", "requested")):
+                    self._begin(message)
+                    if label == "model_requested":
+                        self.pending_model = ("qwen", "generate", "agent")
+                else:
+                    self.stage = self.pending_model = None
+                    self._write(message + ": " + str(values.get("status", "")) + "; " + self._details(values))
             elif event == "history_started":
                 self._begin("импорт истории и проверка сохранённых данных")
             elif event == "case_started":

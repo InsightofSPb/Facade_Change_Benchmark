@@ -24,6 +24,11 @@ Bounded adaptive inspection inside supplied canonical regions:
 evaluate, and an explicitly stubbed CPU demo. The primary comparison is the
 fresh-judge result after agent selection versus a frozen deterministic schedule.
 
+Подготовка к реальному CVPR smoke: [инвентаризация, reuse review, full/smoke,
+проверка конфига и WSL-команды от 2026-11-16](docs/2026-11-16-cvpr-smoke-preparation.md).
+Новые CPU-команды: `inspection inventory`, `prepare`, `check-config`.
+Наличие кандидатов не означает наличие approved CVPR cohort.
+
 Кандидаты вопросов по готовым историям, ручной review и офлайн-оценка локализации:
 [`2026-11-10: facade questions`](docs/2026-11-10-facade-questions.md).
 Вход `python -m facade_change.agentic qa --help`; сквозной CPU-пример — `qa demo`.

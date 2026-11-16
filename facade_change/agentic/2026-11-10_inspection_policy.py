@@ -217,6 +217,8 @@ def run_policy(policy, question, case, service, pool, out, protocol, *, event=No
         write_json(out / (f"response-{budget.costs['model_requests']+1}.json"), response)
         trace("model_returned", stage=stage, status=response.get("status"), generation=response.get("generation"),
               processing=response.get("processing"), error=response.get("error"))
+        if response.get("usage", {}).get("retries"):
+            trace("model_retries", stage=stage, count=response["usage"]["retries"])
         budget.account(response, len(images), stage, time.monotonic()-started)
         if response.get("status") != "ok":
             raise RuntimeError("Model request failed: " + str(response.get("error")))
@@ -229,6 +231,22 @@ def run_policy(policy, question, case, service, pool, out, protocol, *, event=No
             raise BudgetLimit("time_budget_exhausted")
         reject_forbidden(text)
         return text
+
+    def validated_reply(text, stage, validator):
+        transport = importlib.import_module(".2026-11-16_inspection_reply", __package__)
+        audit = dict(raw_text=text, cosmetic_transformations=[], parsed_object=None,
+                     validation_error=None, stage=stage)
+        try:
+            value = transport.parse_reply(text, audit["cosmetic_transformations"])
+            audit["parsed_object"] = value
+            if stage == "judge" and value.get("localization") is not None:
+                transport.numeric_box(value["localization"])
+            return validator(value)
+        except (ValueError, TypeError, AttributeError) as exc:
+            audit["validation_error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            write_json(out / f"reply-{budget.costs['model_requests']}.json", audit)
 
     def invalid(messages, error):
         budget.costs["invalid_replies"] += 1
@@ -296,13 +314,17 @@ def run_policy(policy, question, case, service, pool, out, protocol, *, event=No
                     termination = "budget_limited: " + str(exc)
                     break
                 try:
-                    choice = json.loads(text)
-                    if choice == {"type": "stop"}:
+                    def select(choice):
+                        if choice == {"type": "stop"}:
+                            return None
+                        if (set(choice) != {"type", "name", "arguments"}
+                                or choice["type"] != "tool" or choice["name"] != "inspect_region"):
+                            raise ValueError("Expected stop or inspect_region, with no planner prose/verdict")
+                        return act(choice["arguments"])
+                    evidence = validated_reply(text, "planner", select)
+                    if evidence is None:
+                        trace("selector_stop")
                         break
-                    if (not isinstance(choice, dict) or set(choice) != {"type", "name", "arguments"}
-                            or choice["type"] != "tool" or choice["name"] != "inspect_region"):
-                        raise ValueError("Expected stop or inspect_region, with no planner prose/verdict")
-                    evidence = act(choice["arguments"])
                     pending_invalid_reply = False
                     planner_messages.append(dict(role="user", content=_content(evidence, "inspect_region", case)))
                 except BudgetLimit as exc:
@@ -323,13 +345,14 @@ def run_policy(policy, question, case, service, pool, out, protocol, *, event=No
         while True:
             text = request(judge_messages, "judge")
             try:
-                value = json.loads(text)
-                location = value.get("localization") if isinstance(value, dict) else None
-                if location is not None and location.get("coordinate_system") != "region_crop_pixels":
-                    raise ValueError("Inspection judge localization must use region_crop_pixels")
-                if isinstance(value, dict) and value.get("decision") == "change" and location is None:
-                    raise ValueError("Change prediction requires exactly one nonempty box")
-                result = validate_final(value, case, seen, service.evidence)
+                def judge(value):
+                    location = value.get("localization")
+                    if location is not None and location.get("coordinate_system") != "region_crop_pixels":
+                        raise ValueError("Inspection judge localization must use region_crop_pixels")
+                    if value.get("decision") == "change" and location is None:
+                        raise ValueError("Change prediction requires exactly one nonempty box")
+                    return validate_final(value, case, seen, service.evidence)
+                result = validated_reply(text, "judge", judge)
                 break
             except (ValueError, TypeError, AttributeError) as exc:
                 if isinstance(exc, PrivateEvidenceError):
@@ -354,5 +377,5 @@ def run_policy(policy, question, case, service, pool, out, protocol, *, event=No
                 result["hypothesis_evidence_id"] = hypothesis["evidence_id"]
             write_json(out / "result.json", result)
         persist()
-    trace("completed", status=result["status"], selection_termination=termination)
+    trace("completed", status=result["status"], selection_termination=termination, error=result.get("error"))
     return result

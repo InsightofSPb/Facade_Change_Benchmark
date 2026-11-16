@@ -435,7 +435,7 @@ def validate_public(document):
     return document
 
 
-def export(review_path, out):
+def export(review_path, out, *, question_ids=None):
     fingerprints = Fingerprints()
     _verify_recorded_artifacts(Path(review_path).resolve().parent, fingerprints.files)
     reviewed = read_bound(review_path, fingerprints)
@@ -445,14 +445,25 @@ def export(review_path, out):
         fingerprints.add(item["path"], item["sha256"])
     fingerprints.add(reviewed["candidates_path"], reviewed["candidate_sha256"])
     candidates = _load_candidates(reviewed["candidates_path"], fingerprints)
+    selected = candidates["candidates"]
+    if question_ids is not None:
+        lookup = {row["question_id"]: row for row in selected}
+        if (not question_ids or len(set(question_ids)) != len(question_ids)
+                or any(qid not in lookup for qid in question_ids)):
+            raise ValueError("Subset IDs must be known, nonempty and distinct")
+        if any(reviewed["states"].get(qid, {}).get("status") != "approved" for qid in question_ids):
+            raise ValueError("Every selected question must already be approved")
+        selected = [lookup[qid] for qid in question_ids]
     journal = new_run(out, {"review": str(Path(review_path).resolve()), "review_sha256": sha256(review_path)}, "facade_qa_export")
     try:
         questions, labels = [], []
-        for case in candidates["candidates"]:
+        for case in selected:
             decision = reviewed["states"].get(case["question_id"], {})
             if decision.get("status") != "approved":
                 continue
             label = _checked_label(case, decision["label"], fingerprints)
+            if question_ids is not None and label != decision["label"]:
+                raise ValueError("Subset export cannot normalize or change the approved label")
             for observation in case["observations"]:
                 for name in ("rgb", "support"):
                     fingerprints.add(observation[name + "_path"], observation[name + "_sha256"])
@@ -468,6 +479,13 @@ def export(review_path, out):
         private = _private("facade_qa_answers", model_manifest_sha256=sha256(journal.out / "questions.json"),
             review_source={"path": str(Path(review_path).resolve()), "sha256": sha256(review_path)}, cases=labels)
         write_json(journal.out / "answers.private.json", private)
+        if question_ids is not None:
+            write_json(journal.out / "selection.private.json", _private(
+                "facade_qa_subset", question_ids=question_ids, order="explicit_allowlist",
+                review_source=private["review_source"],
+                candidate_source={"path": reviewed["candidates_path"], "sha256": reviewed["candidate_sha256"]},
+                questions_sha256=private["model_manifest_sha256"],
+                answers_sha256=sha256(journal.out / "answers.private.json")))
         fingerprints.verify()
         summary = {"status": "completed", "approved_questions": len(questions), "protocol": PROTOCOL,
                    "model_manifest": str(journal.out / "questions.json"), "private_labels": str(journal.out / "answers.private.json")}

@@ -1,4 +1,4 @@
-"""Supplied-region adaptive visual inspection: preflight/run/evaluate/demo."""
+"""Supplied-region inspection: CPU admission, reviewed subsets and bounded runs."""
 from __future__ import annotations
 
 import argparse
@@ -30,10 +30,11 @@ data = importlib.import_module(".2026-11-10_inspection_data", __package__)
 policy_code = importlib.import_module(".2026-11-10_inspection_policy", __package__)
 
 
-def preflight(questions, histories, config_path, protocol_path, out):
+def preflight(questions, histories, config_path, protocol_path, out, *, progress=None):
     config, protocol = load_config(config_path), read_json(protocol_path)
-    journal = new_run(out, dict(config=config, protocol=protocol), "facade_inspection_preflight")
+    journal = new_run(out, dict(config=config, protocol=protocol), "facade_inspection_preflight", progress)
     try:
+        journal.event("inspection_preflight_started")
         resolved = data.resolve_inputs(questions, histories, config, protocol)
         write_json(journal.out / "eligibility.json", {k: v for k, v in resolved.items() if k not in {"public", "resolved"}})
         write_json(journal.out / "rgb_inventory.json", [r["inventory"] for r in resolved["resolved"]])
@@ -133,15 +134,16 @@ def render_report(root, records, title="Bounded supplied-region inspection"):
 
 
 def run(questions, histories, config_path, protocol_path, out, *, pool_factory=ModelPool,
-        detector_factory=RemotePool, check_resources=True):
+        detector_factory=RemotePool, check_resources=True, progress=None):
     supplied_config, protocol = load_config(config_path), data.validate_protocol(read_json(protocol_path))
     config = copy.deepcopy(supplied_config)
     config.update(store_root=str(Path(out).resolve() / "region-store"), methods=["anychange"],
                   diagnostic_baseline=None, fusion=None, retrieval_encoder=None)
-    journal = new_run(out, dict(supplied_config=supplied_config, execution_config=config, protocol=protocol), "facade_inspection")
+    journal = new_run(out, dict(supplied_config=supplied_config, execution_config=config, protocol=protocol), "facade_inspection", progress)
     wrappers = {p: [] for p in protocol["policies"]}
     outcomes, reports, prepared = [], [], []
     try:
+        journal.event("inspection_preflight_started")
         resolved = data.resolve_inputs(questions, histories, supplied_config, protocol, check_resources=check_resources)
         write_json(journal.out / "protocol.json", protocol)
         write_json(journal.out / "eligibility.json", {k: v for k, v in resolved.items() if k not in {"public", "resolved"}})
@@ -170,6 +172,7 @@ def run(questions, histories, config_path, protocol_path, out, *, pool_factory=M
                 question = selected["question"]
                 folder = journal.out / "cases" / question["question_id"]
                 for policy in protocol["policies"]:
+                    journal.event("inspection_policy_started", case_id=question["question_id"], policy=policy)
                     destination = folder / "policies" / policy
                     destination.mkdir(parents=True)
                     pool = None
@@ -212,6 +215,8 @@ def run(questions, histories, config_path, protocol_path, out, *, pool_factory=M
                         total_policy_case_seconds=(elapsed + case["preparation_costs"]["inspection_total_seconds"]) if case else None,
                         scope="preparation recorded once on case; incremental policy includes worker lifecycle; shared caches remain explicit")
                     write_json(costs_path, costs)
+                    journal.event("inspection_policy_finished", case_id=question["question_id"], policy=policy,
+                                  status=result["status"], error=result.get("error"), elapsed_seconds=elapsed)
                     wrappers[policy].append(dict(question_id=question["question_id"], result_path=str(destination / "result.json"),
                                                  result_sha256=sha256(destination / "result.json")))
                     outcomes.append(dict(question_id=question["question_id"], policy=policy, status=result["status"],
@@ -230,6 +235,8 @@ def run(questions, histories, config_path, protocol_path, out, *, pool_factory=M
         for policy, rows in wrappers.items():
             write_json(journal.out / (policy + "-predictions.json"), prediction_wrapper(sha256(questions), rows))
         render_report(journal.out, reports)
+        write_json(journal.out / "cost_summary.json", cost_summary(journal.out, protocol["policies"],
+                   [q["question_id"] for q in resolved["public"]["questions"]]))
         counts = {p: {status: sum(r["policy"] == p and r["status"] == status for r in outcomes)
                       for status in ("completed", "abstained", "error", "missing")} for p in protocol["policies"]}
         summary = dict(status="completed_with_errors" if any(r["status"] == "error" for r in outcomes) else "completed",
@@ -244,6 +251,51 @@ def run(questions, histories, config_path, protocol_path, out, *, pool_factory=M
         raise
     finally:
         journal.close()
+
+
+def cost_summary(root, policies, question_ids):
+    """Summarize saved measurements; missing values never become measured zero."""
+    root = Path(root)
+
+    def total(rows, key):
+        values = [r.get(key) for r in rows]
+        known = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return dict(total=sum(known) if len(known) == len(values) else None,
+                    observed_sum=sum(known), measured=len(known), expected=len(values))
+
+    result = dict(policies={}, scope="budget presentations include cache-source usage; actual usage is separate")
+    preparations = []
+    for qid in question_ids:
+        path = root / "cases" / qid / "case.json"
+        preparations.append(read_json(path).get("preparation_costs", {}) if path.exists() else {})
+    result["shared_preparation_once"] = total(preparations, "inspection_total_seconds")
+    for policy in policies:
+        rows = []
+        for qid in question_ids:
+            path = root / "cases" / qid / "policies" / policy / "costs.json"
+            rows.append(read_json(path) if path.exists() else {})
+        metrics = {k: total(rows, k) for k in (
+            "model_requests", "model_calls", "cache_hits", "model_loads", "retries", "invalid_replies",
+            "actions", "images", "input_tokens", "output_tokens", "incremental_policy_seconds",
+            "cold_loading_seconds", "warm_inference_seconds")}
+        metrics["stages"] = {}
+        for stage in ("planner", "judge"):
+            calls = [c for r in rows for c in r.get("calls", []) if c["stage"] == stage]
+            current = [c.get("usage", {}) for c in calls]
+            charged = [c.get("source_usage") or c.get("usage", {}) for c in calls]
+            complete = all("calls" in r and not r.get("incomplete") for r in rows)
+            metrics["stages"][stage] = dict(observed_requests=len(calls),
+                complete=complete, total_requests=len(calls) if complete else None,
+                elapsed_seconds=total(calls, "elapsed_seconds"),
+                actual={k: total(current, k) for k in ("model_calls", "cache_hits", "retries", "input_tokens", "output_tokens", "images")},
+                budget_source={k: total(charged, k) for k in ("input_tokens", "output_tokens", "images")})
+            if not complete:
+                metrics["stages"][stage]["elapsed_seconds"]["total"] = None
+                for kind in ("actual", "budget_source"):
+                    for value in metrics["stages"][stage][kind].values():
+                        value["total"] = None
+        result["policies"][policy] = metrics
+    return result
 
 
 def _at(group, threshold=.25):
@@ -325,7 +377,8 @@ def evaluate(questions, answers, run_path, out):
     # Prediction failures stay per-case. Cohort/protocol/inventory corruption is fatal.
     protected = {"input_manifest.json", "protocol.json", "source_snapshot.json"}
     protected.update(p for p in saved_hashes if p.endswith(("/inventory.json", "/proposals.json", "/case.json"))
-                     or "crops" in Path(p).parts or "maps" in Path(p).parts or p.endswith("/proposal_preview.png"))
+                     or "crops" in Path(p).parts or "maps" in Path(p).parts
+                     or p.endswith(("/proposal_preview.png", "/costs.json")))
     for relative in protected:
         if relative not in saved_hashes or sha256(root / relative) != saved_hashes[relative]:
             raise ValueError("Frozen inspection provenance changed: " + relative)
@@ -335,6 +388,12 @@ def evaluate(questions, answers, run_path, out):
     protocol = data.validate_protocol(read_json(root / "protocol.json"))
     if protocol["questions_sha256"] != sha256(questions):
         raise ValueError("Run protocol/public manifest mismatch")
+    cohort = importlib.import_module(".2026-11-16_inspection_cohort", __package__)
+    fingerprints = cohort.Fingerprints()
+    admission = cohort.load_admission(protocol, fingerprints)
+    identity_source = admission.get("identity_source") if admission else None
+    if identity_source:
+        fingerprints.add(identity_source["path"], identity_source["sha256"])
     journal = new_run(out, dict(run=str(root), questions_sha256=sha256(questions), protocol=protocol), "facade_inspection_evaluation")
     try:
         evaluations = {}
@@ -348,9 +407,11 @@ def evaluate(questions, answers, run_path, out):
                 if sha256(wrapper) != saved_hashes.get(wrapper.name):
                     raise ValueError("Saved prediction wrapper changed: " + wrapper.name)
                 write_json(journal.out / (policy + "-predictions.json"), read_json(wrapper))
-            evaluator.evaluate(questions, answers, wrapper, journal.out / policy)
+            evaluator.evaluate(questions, answers, wrapper, journal.out / policy,
+                               identity_map=identity_source["path"] if identity_source else None)
             evaluations[policy] = read_json(journal.out / policy / "evaluation.json")
         comparison = compare_evaluations(evaluations)
+        comparison["costs"] = cost_summary(root, protocol["policies"], [q["question_id"] for q in inputs["cohort"]])
         comparison.update(version=data.VERSION, scope=data.SCOPE, public_protocol="supplied_region_qa",
             proposal_diagnostics={p: proposal_diagnostics(e, root) for p, e in evaluations.items()},
             source_run=str(root), questions_sha256=sha256(questions),
@@ -364,6 +425,7 @@ def evaluate(questions, answers, run_path, out):
         render_report(journal.out, records, "PRIVATE — inspection comparison; see JSON/CSV for building F1")
         summary = dict(status="completed", primary=comparison["primary"], report_path=str(journal.out / "report.html"))
         write_json(journal.out / "summary.json", summary)
+        fingerprints.verify()
         complete_run(journal, "completed", summary=summary)
         return summary
     except BaseException as exc:
@@ -384,22 +446,52 @@ def parser():
     for flag in ("questions", "answers", "run", "out"):
         command.add_argument("--" + flag, required=True)
     commands.add_parser("demo", allow_abbrev=False).add_argument("--out", required=True)
+    command = commands.add_parser("inventory", allow_abbrev=False)
+    for flag in ("source", "histories", "available-at", "out"):
+        command.add_argument("--" + flag, required=True)
+    command.add_argument("--identity-map")
+    command.add_argument("--ids")
+    command.add_argument("--limit", type=int, default=30)
+    command = commands.add_parser("prepare", allow_abbrev=False)
+    for flag in ("review", "selection", "assessment-review", "out"):
+        command.add_argument("--" + flag, required=True)
+    command.add_argument("--smoke-ids")
+    command = commands.add_parser("check-config", allow_abbrev=False)
+    for flag in ("config", "protocol", "out"):
+        command.add_argument("--" + flag, required=True)
+    command.add_argument("--derive", action="store_true")
     return cli
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    from .cli import TerminalProgress
+    progress = TerminalProgress()
     try:
         # Existing fingerprint progress is diagnostic; stdout remains one JSON result.
         with contextlib.redirect_stdout(sys.stderr):
+            cohort = importlib.import_module(".2026-11-16_inspection_cohort", __package__)
+            progress("command_started", task="inspection " + args.task, out=args.out)
             if args.task == "demo":
                 result = importlib.import_module(".2026-11-10_inspection_demo", __package__).demo(args.out)
             elif args.task == "evaluate":
                 result = evaluate(args.questions, args.answers, args.run, args.out)
+            elif args.task == "inventory":
+                result = cohort.inventory(args.source, args.histories, args.out, available_at=args.available_at,
+                    identity_map=args.identity_map, ids=args.ids, limit=args.limit, progress=progress)
+            elif args.task == "prepare":
+                result = cohort.prepare(args.review, args.selection, args.assessment_review, args.out,
+                                        smoke_ids=args.smoke_ids, progress=progress)
+            elif args.task == "check-config":
+                result = cohort.check_config(args.config, args.protocol, args.out, derive=args.derive, progress=progress)
             else:
-                result = (preflight if args.task == "preflight" else run)(args.questions, args.histories, args.config, args.protocol, args.out)
+                result = (preflight if args.task == "preflight" else run)(args.questions, args.histories, args.config,
+                                                                       args.protocol, args.out, progress=progress)
+        progress("inspection_finished", status=result["status"])
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0 if result["status"] == "completed" else 2
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"inspection: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+    finally:
+        progress.close()

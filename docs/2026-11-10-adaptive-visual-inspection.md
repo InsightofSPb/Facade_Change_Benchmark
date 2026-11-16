@@ -1,5 +1,9 @@
 # Bounded adaptive visual inspection — 2026-11-10
 
+Updated preparation and complete foreground WSL commands:
+[`2026-11-16: CVPR smoke preparation`](2026-11-16-cvpr-smoke-preparation.md).
+That document supersedes the original cohort-size and separate-review suggestions below.
+
 Branch: `codex/2026-11-10-adaptive-visual-inspection`.
 Pinned base: [`9aa159c0489e3a4ee15a089b1e214ade8d980fc3`](https://github.com/InsightofSPb/Facade_Change_Benchmark/commit/9aa159c0489e3a4ee15a089b1e214ade8d980fc3).
 The remote `codex/2026-11-08-change-agentic-rag` was refreshed before editing and
@@ -125,12 +129,13 @@ The protocol declaration `assessability_reviewed_against` is the owner's explici
 attestation, not an automated visibility finding. Report A's restricted access
 when interpreting abstentions.
 
-The proposed development pilot is about 12 pairs across at least four buildings,
-with reviewed positives, stable and genuinely unassessable cases where available.
-Counts are not pre-existing dataset facts. First use a separately reviewed export
-of exactly two cases with `policies=["heuristic","agent"]`; that profile enforces
-two questions. The full four-policy export is reviewed separately. Model weights
-and real experiments are executed by the owner after code review.
+The current desired development pilot is 20–30 pairs across several physical
+buildings, if the CPU compatibility inventory confirms availability. These are
+targets, not existing counts. Reuse approved review through `inspection prepare`;
+the two-case `policies=["heuristic","agent"]` smoke is a subset of that same full
+cohort, without another review of unchanged boxes. Assessability against the exact
+permitted history needs its own documented confirmation; see the 2026-11-16 guide.
+Real models and experiments are executed by the owner after reviewing the smoke.
 
 ## Proposals, native crops and resources
 

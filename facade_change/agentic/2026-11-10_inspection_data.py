@@ -42,7 +42,7 @@ def protocol_document(history_sha, questions_sha, *, available_at="observation_d
 
 def validate_protocol(value):
     reject_forbidden(value)
-    if not isinstance(value, dict) or set(value) != PROTOCOL_KEYS:
+    if not isinstance(value, dict) or set(value) - {"admission"} != PROTOCOL_KEYS:
         raise ValueError("Protocol fields must be exactly: " + ", ".join(sorted(PROTOCOL_KEYS)))
     expected = protocol_document(value["history_manifest_sha256"], value["questions_sha256"])
     for key in ("schema_version", "kind", "version", "scope", "caps", "enable_sam3",
@@ -62,6 +62,9 @@ def validate_protocol(value):
         raise ValueError("Explicit archive availability required")
     if type(value["max_native_crop_pixels"]) is not int or value["max_native_crop_pixels"] < 1:
         raise ValueError("max_native_crop_pixels must be a positive integer")
+    if "admission" in value and (not isinstance(value["admission"], dict)
+                                or set(value["admission"]) != {"path", "sha256"}):
+        raise ValueError("admission requires a public certificate path and SHA")
     return copy.deepcopy(value)
 
 
@@ -199,6 +202,13 @@ def resolve_inputs(questions_path, histories, config, protocol, *, check_resourc
             if originals.setdefault(row["image_sha256"], identity) != identity:
                 raise ValueError("Canonical original image building/view/date conflict")
     tracks = {t["track_id"]: t for t in document["tracks"]}
+    cohort = importlib.import_module(".2026-11-16_inspection_cohort", __package__)
+    admission = cohort.load_admission(protocol, fp)
+    identity_source = admission.get("identity_source") if admission else None
+    identities = cohort.identity.Identities(identity_source["path"] if identity_source else None, fp,
+                                            identity_source["sha256"] if identity_source else None)
+    if admission and {r["question_id"] for r in admission["cases"]} != set(ids):
+        raise ValueError("Admission certificate does not cover the exact public cohort")
     resolved, eligibility = [], []
     if not public["questions"]:
         raise ValueError("An approved, nonempty public cohort is required")
@@ -206,6 +216,11 @@ def resolve_inputs(questions_path, histories, config, protocol, *, check_resourc
         identifier = question["question_id"]
         report = dict(question_id=identifier, status="ineligible", eligible_history_count=0)
         try:
+            universe = cohort.metadata(question, tracks.get(question["region_id"]), root,
+                                       protocol["archive_available_at"], identities, document["tracks"], report)
+            if admission and next(r["universe_sha256"] for r in admission["cases"]
+                                  if r["question_id"] == identifier) != digest(universe):
+                raise ValueError("Assessability certificate covers a different permitted RGB universe")
             qa.validate_public({**public, "questions": [question]})
             if question["task"] != "temporal_change" or len(question["observations"]) != 2:
                 raise ValueError("Select temporal_change questions with exactly two compared observations")

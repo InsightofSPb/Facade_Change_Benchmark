@@ -163,7 +163,7 @@ def _events(questions, labels):
         case = questions[identifier]
         for event in label["events"]:
             name = event["event_id"]
-            identity = (case["building_id"], tuple(case["task_dates"]))
+            identity = (case.get("physical_building_id", case["building_id"]), tuple(case["task_dates"]))
             entry = events.setdefault(name, {"event_id": name, "identity": identity, "representations": [], "mask_area": None})
             if entry["identity"] != identity:
                 raise ValueError("Reviewed event ID spans buildings/temporal intervals; use distinct physical episode IDs")
@@ -238,6 +238,7 @@ def _aggregate(questions, labels, predictions, thresholds):
         status = prediction["status"]
         assessment = label["assessment"]
         cases.append({"question_id": identifier, "building_id": case["building_id"], "assessment": assessment,
+            "physical_building_id": case.get("physical_building_id", case["building_id"]),
             "status": status, "decision": prediction.get("decision"), "available_predictions": len(prediction["regions"]),
             "error": prediction.get("error"),
             "supplied_predictions": prediction["supplied_prediction_count"], "ranking_source": prediction["ranking_source"],
@@ -294,25 +295,23 @@ def _aggregate(questions, labels, predictions, thresholds):
             "area_availability": dict(Counter(e["area_status"] for e in events.values())), "events": list(events.values())}
 
 
-def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.25, .5)):
-    if not thresholds or len(set(thresholds)) != len(thresholds) or any(
-            isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or not 0 < t <= 1 for t in thresholds):
-        raise ValueError("IoU thresholds must be distinct finite numbers in (0, 1]")
+def approved_cohort(questions_path, answers_path, fingerprints):
+    """Shared immutable review-chain validation for localization and WWW primary metrics."""
     qa = importlib.import_module(".2026-11-10_questions", __package__)
-    fingerprints = Fingerprints()
     _verify_recorded_artifacts(Path(questions_path).resolve().parent, fingerprints.files)
     _verify_recorded_artifacts(Path(answers_path).resolve().parent, fingerprints.files)
     public = qa.validate_public(_file(questions_path, fingerprints))
     private = _file(answers_path, fingerprints)
-    saved = _file(predictions_path, fingerprints)
     model_sha = sha256(questions_path)
     if private.get("kind") != "facade_qa_answers" or private.get("access") != qa.PRIVATE:
         raise ValueError("Only approved private QA answers can be scored")
     review_source = private["review_source"]
     _verify_recorded_artifacts(Path(review_source["path"]).resolve().parent, fingerprints.files)
     reviewed = _file(review_source["path"], fingerprints, review_source["sha256"])
-    if private.get("model_manifest_sha256") != model_sha or saved.get("model_manifest_sha256") != model_sha:
-        raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
+    if private.get("model_manifest_sha256") != model_sha:
+        raise ValueError("Answers must bind the identical fixed model-question cohort")
+    for item in reviewed["history"]:
+        fingerprints.add(item["path"], item["sha256"])
     questions = {r["question_id"]: r for r in public["questions"]}
     if len(private["cases"]) != len(questions) or {r["question_id"] for r in private["cases"]} != set(questions):
         raise ValueError("Private answers must cover the exact approved cohort once")
@@ -320,6 +319,8 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
     candidates = {r["question_id"]: r for r in qa._load_candidates(reviewed["candidates_path"], fingerprints)["candidates"]}
     labels = {}
     for row in private["cases"]:
+        if row["building_id"] != questions[row["question_id"]]["building_id"]:
+            raise ValueError("Private answer building ownership differs from the public question")
         if row["review"].get("status") != "approved" or not row["review"].get("reviewer"):
             raise ValueError("Unapproved cases cannot enter scored evaluation")
         if row["review"] != reviewed["states"].get(row["question_id"]):
@@ -341,6 +342,28 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
         if qa._checked_label(original, label, fingerprints) != label:
             raise ValueError("Reviewed labels disagree with their fixed reference support/mask provenance")
         labels[row["question_id"]] = label
+    return public, labels
+
+
+def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.25, .5), *, identity_map=None):
+    if not thresholds or len(set(thresholds)) != len(thresholds) or any(
+            isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or not 0 < t <= 1 for t in thresholds):
+        raise ValueError("IoU thresholds must be distinct finite numbers in (0, 1]")
+    qa = importlib.import_module(".2026-11-10_questions", __package__)
+    fingerprints = Fingerprints()
+    public, labels = approved_cohort(questions_path, answers_path, fingerprints)
+    model_sha = sha256(questions_path)
+    saved = _file(predictions_path, fingerprints)
+    if saved.get("model_manifest_sha256") != model_sha:
+        raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
+    questions = {r["question_id"]: r for r in public["questions"]}
+    identities = importlib.import_module(".2026-11-16_inspection_identity", __package__).Identities(identity_map, fingerprints)
+    if identity_map:
+        for row in questions.values():
+            problem = identities.problem(row["building_id"], list(questions.values()), require_members=False)
+            if problem:
+                raise ValueError(problem)
+    questions = {k: {**r, "physical_building_id": identities.physical(r["building_id"])} for k, r in questions.items()}
     predictions = _predictions(saved, questions, Path(predictions_path).resolve().parent, fingerprints)
     protocol = {"k": list(K_VALUES), "iou_thresholds": list(thresholds), "matching": "deterministic_maximum_cardinality_one_to_one",
         "rank_policy": "top K per question from saved non-GT ranking; no padding of single-box outputs",
@@ -348,13 +371,14 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
         "threshold_status": "0.25 is an initial coarse-localization choice; 0.5 stricter diagnostic, neither universally validated",
         "area_denominator": "fixed earlier reference geometric support; never reduced using later visibility",
         "pixel_support_policy": "fixed reviewed reference domain; prediction must cover every required pixel",
-        "empty_positive_cohort": "recall undefined", "statistical_unit": "building", "protocol": qa.PROTOCOL}
+        "empty_positive_cohort": "recall undefined", "statistical_unit": "physical_building", "protocol": qa.PROTOCOL,
+        "identity_source": identities.source}
     journal = new_run(out, {"model_manifest_sha256": model_sha, "inputs": fingerprints.files, **protocol}, "facade_qa_offline_evaluation")
     try:
         pooled = _aggregate(questions, labels, predictions, thresholds)
         buildings = {}
-        for building in sorted({row["building_id"] for row in questions.values()}):
-            cohort = {key: value for key, value in questions.items() if value["building_id"] == building}
+        for building in sorted({row["physical_building_id"] for row in questions.values()}):
+            cohort = {key: value for key, value in questions.items() if value["physical_building_id"] == building}
             buildings[building] = _aggregate(cohort, {key: labels[key] for key in cohort}, {key: predictions[key] for key in cohort}, thresholds)
         macro = []
         for index, row in enumerate(pooled["localization"]):
