@@ -39,11 +39,16 @@ class SyntheticPool:
         observations = [json.loads(b["text"]) for b in messages[1]["content"][1:] if b["type"] == "text"]
         ids = [r["observation_id"] for r in observations]
         used_tool = any('"retrieval_status"' in b.get("text", "") for m in messages for b in m["content"])
-        if allowance["allowed_action"] == "retrieve_or_final" and not used_tool:
+        archive_ids = allowance["archive_state"]["exposed_archive_evidence_ids"]
+        if allowance["allowed_action"] == "retrieve_or_decide" and not used_tool:
             value = {"type": "retrieve", "query": initial["question"], "observation_id": ids[-1]}
+        elif allowance["stage"] == "choose_action":
+            value = ({"type": "abstain", "reason": "Синтетический пример: архивные свидетельства не получены"}
+                     if initial["task"] == "archival_qa" and not archive_ids else {"type": "answer"})
         else:
             value = {"type": "final", "decision": "supported", "answer_text": "Синтетический ответ для проверки протокола.",
-                "citations": ids, "observation_ids": [], "date_interval": None, "boxes": [], "limitations": []}
+                "citations": archive_ids if initial["task"] == "archival_qa" else ids,
+                "observation_ids": [], "date_interval": None, "boxes": [], "limitations": []}
             if initial["task"] == "earliest_evidence":
                 value.update(decision="earliest_presence", observation_ids=[ids[0]], date_interval={
                     "start": observations[0]["date"], "end": observations[0]["date"], "precision": "year", "uncertain": True})
@@ -51,6 +56,11 @@ class SyntheticPool:
                 value.update(decision="change", observation_ids=ids, date_interval={"start": initial["task_dates"][0],
                     "end": initial["task_dates"][-1], "precision": "interval", "uncertain": True}, boxes=[{
                         "evidence_id": ids[-1], "coordinate_system": "region_crop_pixels", "bbox_xyxy": [3, 1, 6, 4]}])
+            elif not archive_ids:
+                value.update(decision="insufficient_data", limitations=["Синтетический пример: архивные свидетельства не получены"])
+            if allowance.get("required_decisions"):
+                value.update(decision="insufficient_data", boxes=[], observation_ids=[], date_interval=None,
+                             limitations=[allowance["selected_abstention_reason"]])
         usage.update(output_tokens=60, images=sum(b["type"] == "image" for m in messages for b in m["content"]))
         return {"status": "ok", "text": json.dumps(value, ensure_ascii=False), "usage": usage,
                 "generation": {"actual_output_tokens": 60, "max_new_tokens": payload["max_new_tokens"], "reached_max_new_tokens": False}}
@@ -123,7 +133,9 @@ def demo(out, progress=None):
         archive.index_archive(journal.out / "archive/corpus.json", config, journal.out / "index", pool_factory=SyntheticPool, synthetic=True)
         result = runner.run(questions, config, journal.out / "inference", archive_index=journal.out / "index/index.json",
                             pool_factory=SyntheticPool, synthetic=True, progress=progress)
-        if result["outcome_counts"] != {"completed": 9, "abstained": 0, "error": 0}:
+        # An archival question cannot be supported by photos_only. Its honest
+        # abstention is part of acceptance, not a simulated archive citation.
+        if result["outcome_counts"] != {"completed": 8, "abstained": 1, "error": 0}:
             raise RuntimeError("Synthetic 3-task × 3-condition acceptance failed: " + str(result))
         summary = {**result, "synthetic_fixture": True, "models_executed": False, "quality_claim": None}
         write_json(journal.out / "summary.json", summary)

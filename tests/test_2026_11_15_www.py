@@ -34,7 +34,7 @@ class WWWRunnerTest(unittest.TestCase):
                           synthetic=True, **{"pool_factory": demo.SyntheticPool, **kwargs})
 
     def test_three_tasks_identical_cohort_exposure_and_resume(self):
-        self.assertEqual(self.run_fixture()["outcome_counts"], {"completed": 9, "abstained": 0, "error": 0})
+        self.assertEqual(self.run_fixture()["outcome_counts"], {"completed": 8, "abstained": 1, "error": 0})
         records = read_json(self.root / "run/results.json")["results"]
         self.assertEqual({r["task"] for r in records}, runner.TASKS)
         for condition in runner.CONDITIONS:
@@ -71,19 +71,19 @@ class WWWRunnerTest(unittest.TestCase):
             def call(self, role, payload):
                 if role == "jina":
                     raise AssertionError("A scripted local-only final must not dispatch retrieval")
-                # Script a final response regardless of the offered action. This
+                # Script an answer/abstention choice without retrieval. This
                 # does not test whether a real model follows the new instruction.
                 scripted = copy.deepcopy(payload)
                 control = json.loads(scripted["messages"][-1]["content"][0]["text"])
-                control["allowed_action"] = "final"
+                control["allowed_action"] = "decide" if control["stage"] == "choose_action" else "final"
                 scripted["messages"][-1]["content"][0]["text"] = json.dumps(control)
                 return super().call(role, scripted)
         modes = (runner.CONDITIONS[0], runner.CONDITIONS[2])
         result = self.run_fixture(pool_factory=LocalOnly, conditions=modes)
-        self.assertEqual(result["outcome_counts"], {"completed": 6, "abstained": 0, "error": 0})
+        self.assertEqual(result["outcome_counts"], {"completed": 4, "abstained": 2, "error": 0})
         for row in read_json(self.root / "run/results.json")["results"]:
             self.assertEqual(row["costs"]["retrieval_rounds"], 0)
-            self.assertEqual(row["costs"]["qwen_requests"], 1)
+            self.assertEqual(row["costs"]["qwen_requests"], 1 if row["condition"] == "photos_only" else 2)
             folder = self.root / "run/questions" / row["question_id"] / row["condition"]
             exposed = read_json(folder / "exposure.json")
             self.assertEqual(exposed["tools"], [])
@@ -92,7 +92,7 @@ class WWWRunnerTest(unittest.TestCase):
             messages = [read_json(self.root / "run/questions" / question["question_id"] / c / "messages.json") for c in modes]
             self.assertEqual(messages[0][:2], messages[1][:2])  # Same factual instructions, question and RGB.
             controls = [json.loads(m[2]["content"][0]["text"]) for m in messages]
-            self.assertEqual([c["allowed_action"] for c in controls], ["final", "retrieve_or_final"])
+            self.assertEqual([c["allowed_action"] for c in controls], ["final", "retrieve_or_decide"])
             self.assertEqual([c["remaining_retrieval_rounds"] for c in controls], [0, 2])
 
     def test_private_or_unknown_fields_cannot_enter_public_manifest(self):
@@ -101,6 +101,88 @@ class WWWRunnerTest(unittest.TestCase):
         write_json(self.questions, value)
         with self.assertRaises(ValueError):
             self.run_fixture()
+
+    def test_action_selection_has_no_final_scaffold_and_preserves_archive_state(self):
+        self.run_fixture(conditions=("bounded_agentic_retrieval",))
+        states = set()
+        for row in read_json(self.root / "run/results.json")["results"]:
+            folder = self.root / "run/questions" / row["question_id"] / row["condition"]
+            calls = [read_json(path) for path in sorted((folder / "calls").glob("*-qwen.json"))]
+            controls = [json.loads(call["request"]["messages"][-1]["content"][0]["text"]) for call in calls]
+            self.assertEqual([c["stage"] for c in controls], ["choose_action", "choose_action", "answer"])
+            self.assertEqual(controls[0]["archive_state"]["search_status"], "not_searched")
+            self.assertEqual(controls[0]["archive_state"]["searches_performed"], 0)
+            self.assertNotIn("response_contract", calls[0]["request"]["messages"][1]["content"][0]["text"])
+            self.assertNotIn("response_contract", controls[0])
+            self.assertNotIn("response_contract", controls[1])
+            self.assertIn("response_contract", controls[2])
+            self.assertEqual(controls[1]["archive_state"], controls[2]["archive_state"])
+            states.add(controls[1]["archive_state"]["search_status"])
+            self.assertEqual(row["costs"]["qwen_requests"], 3)
+            self.assertEqual(row["costs"]["output_tokens"], 3 * 60)
+            self.assertEqual(row["costs"]["input_tokens"], sum(c["usage"]["input_tokens"] for c in row["costs"]["calls"]))
+        self.assertEqual(states, {"no_matches", "records_returned"})
+        events = [json.loads(line) for line in (self.root / "run/events.jsonl").read_text().splitlines()]
+        choices = [event for event in events if event["event_type"] == "agent_action_selected"]
+        self.assertEqual(len(choices), 6)
+
+    def test_archival_answer_rejects_local_only_support_even_when_archive_is_exposed(self):
+        question = read_json(self.questions)["questions"][2]
+        folder = self.root / "prepared-archive"
+        folder.mkdir()
+        prepared, evidence, common, support = runner._prepare(question, folder, Fingerprints(), runner.PROTOCOL)
+        search = archive.ArchiveSearch(self.index, self.config, Fingerprints(), synthetic=True)
+        identifier = next(iter(search.records))
+        evidence[identifier], _ = runner._expose_archive(search, {"evidence_id": identifier}, 0)
+        answer = {"type": "final", "decision": "supported", "answer_text": "Synthetic claim",
+                  "citations": [next(iter(evidence))], "observation_ids": [], "date_interval": None,
+                  "boxes": [], "limitations": []}
+        with self.assertRaisesRegex(ValueError, "cited archive record"):
+            runner.validate_answer(answer, question, evidence, prepared, common, support, runner.PROTOCOL)
+        answer["citations"] = [identifier]
+        self.assertEqual(runner.validate_answer(answer, question, evidence, prepared, common, support,
+                                               runner.PROTOCOL)["status"], "completed")
+
+    def test_unsupported_archive_answer_choice_can_retry_with_real_tool_dispatch(self):
+        public = read_json(self.questions)
+        question = public["questions"][2]
+        write_json(self.questions, {**public, "questions": [question]})
+        self.config["budgets"]["max_model_calls"] = 5
+
+        class PrematureAnswer(demo.SyntheticPool):
+            sent_bad_choice = False
+
+            def call(self, role, payload):
+                result = super().call(role, payload)
+                if role == "qwen" and not self.sent_bad_choice:
+                    self.sent_bad_choice = True
+                    result["text"] = '{"type":"answer"}'
+                return result
+
+        result = self.run_fixture(pool_factory=PrematureAnswer, conditions=("bounded_agentic_retrieval",))
+        self.assertEqual(result["outcome_counts"], {"completed": 1, "abstained": 0, "error": 0})
+        row = read_json(self.root / "run/results.json")["results"][0]
+        self.assertEqual(row["costs"]["qwen_requests"], 4)
+        self.assertEqual(row["costs"]["retrieval_rounds"], 1)
+        first = read_json(self.root / "run/questions" / question["question_id"] / row["condition"] / "reply-001.json")
+        self.assertIn("No archive evidence", first["validation_error"])
+        self.assertEqual(row["answer"]["citations"], ["fixture-archive-b1"])
+
+    def test_final_cannot_bypass_action_selection(self):
+        class PrematureFinal(demo.SyntheticPool):
+            def call(self, role, payload):
+                if role == "jina":
+                    raise AssertionError("An invalid final must not cause automatic retrieval")
+                result = super().call(role, payload)
+                result["text"] = '{"type":"final"}'
+                return result
+
+        result = self.run_fixture(pool_factory=PrematureFinal, conditions=("bounded_agentic_retrieval",))
+        self.assertEqual(result["outcome_counts"], {"completed": 0, "abstained": 0, "error": 3})
+        for row in read_json(self.root / "run/results.json")["results"]:
+            self.assertIn("Choose an action first", row["error"])
+            self.assertEqual(row["costs"]["qwen_requests"], 2)
+            self.assertEqual(row["costs"]["retrieval_rounds"], 0)
 
     def test_identity_freeze_and_asset_hash(self):
         value = read_json(self.package)
@@ -161,7 +243,7 @@ class WWWRunnerTest(unittest.TestCase):
                 if value["type"] == "final":
                     tool = next(m for m in reversed(payload["messages"])
                                 if '"retrieval_status"' in m["content"][0].get("text", ""))
-                    contract = json.loads(tool["content"][0]["text"])["response_contract"]
+                    contract = json.loads(payload["messages"][-1]["content"][0]["text"])["response_contract"]
                     photo = json.loads(tool["content"][1]["text"])
                     identifier = photo["observation_id"]
                     value.update(citations=[identifier], observation_ids=[identifier], date_interval={

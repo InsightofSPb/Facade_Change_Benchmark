@@ -104,7 +104,8 @@ class TerminalProgress:
                 if event == "pool_model_requested" and self.pending_model == (role, op, "agent"):
                     return  # Same call is also represented by the reasoning trace.
                 self.pending_model = (role, op, "agent" if event.startswith("agent_") else "pool")
-                self._begin(f"модель {role}: запрос {op}")
+                stage = " (выбор действия)" if values.get("stage") == "choose_action" else ""
+                self._begin(f"модель {role}: запрос {op}{stage}")
             elif event in {"agent_model_returned", "pool_model_returned"}:
                 role, op = values.get("role", "qwen"), values.get("op", "generate")
                 if event == "pool_model_returned" and self.pending_model == (role, op, "agent"):
@@ -116,6 +117,8 @@ class TerminalProgress:
                 if usage.get("incomplete") or usage.get("unobserved_worker_cost"):
                     tokens = "токены: учёт неполный"
                 self._write(f"модель {role}: {values.get('status', 'unknown')} {tokens}; " + self._details(values))
+            elif event == "agent_action_selected":
+                self._write("выбор агента: " + str(values.get("action")))
             elif event == "agent_tool_requested":
                 self._begin(f"инструмент {values.get('name')}: вызов")
             elif event == "agent_tool_returned":

@@ -349,7 +349,9 @@ class FactualAuditTests(unittest.TestCase):
         summary = factual.audit(self.root / "run", self.root / "audit")
         self.assertEqual(summary["expected_rows"], 48)
         self.assertEqual(summary["exported_rows"], 48)
-        self.assertEqual(summary["execution_status_counts"], {"completed": 39, "error": 3, "abstained": 3, "missing": 3})
+        # Five archival questions now abstain in photos_only: local citations
+        # cannot substantiate archive contents. All 48 rows remain in the audit.
+        self.assertEqual(summary["execution_status_counts"], {"completed": 34, "error": 3, "abstained": 8, "missing": 3})
         self.assertEqual(summary["human_reviewed"], 0)
         self.assertFalse(summary["models_executed"])
         payload = read_json(self.root / "audit/blind-review.private.json")
