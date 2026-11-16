@@ -2,7 +2,8 @@
 <title>PRIVATE — WWW review</title><style>
 body{font:16px system-ui;max-width:1500px;margin:25px auto;padding:0 15px;background:#f5f6f8;color:#20242b}
 section{background:white;padding:18px;margin:20px 0;border:1px solid #b7c4d2;border-radius:6px}textarea{width:100%;min-height:7em}
-.photos{display:flex;gap:12px;overflow:auto}figure{margin:0;min-width:220px}canvas{width:min(460px,80vw);height:auto;border:1px solid #ccc}
+.photos{display:flex;gap:12px;overflow:auto}figure{margin:0;min-width:220px}canvas{width:min(460px,80vw);height:auto;border:0;outline:1px solid #ccc}
+.photos canvas{cursor:crosshair;touch-action:none}.box.active{outline:2px solid #3267b8}
 .wording{min-height:3em;height:4em}
 input[type=number]{width:75px}label{display:inline-block;margin:5px}button,select,input,textarea{font:inherit}button{margin:8px;padding:6px}
 .note{white-space:pre-wrap}.box{padding:8px;background:#f0f3f7;margin:6px 0}.error{color:#a21}
@@ -24,19 +25,37 @@ for(const item of data.items){
  const status=node("select",undefined,section);for(const v of ["candidate","approved","rejected"]){const o=node("option",v,status);o.value=v}
  node("p","Текущая revision: "+item.revision+"; прошлый статус: "+item.previous_status,section);
  node("p","Физическое здание: "+(item.physical_building_id||item.building_id)+(item.identity_review_pending?"; identity review pending":"")+". Цель отбора: "+(item.provisional_review_target||"—")+" — не готовая метка ответа.",section);
+ node("p","Вопрос для модели — здесь только вопрос, без ответа и подсказок.",section);
  const wording=node("textarea",item.question,section);wording.className="wording";wording.setAttribute("aria-label","Редактируемый вопрос");
  const scope=item.task==="earliest_evidence"?node("select",undefined,section):null;
  if(scope){for(const [value,text] of [["","— Уточните область вопроса —"],["supplied_observations","Самое раннее среди показанных наблюдений"],["frozen_collection","Самое раннее подтверждённое в frozen collection"]]){const o=node("option",text,scope);o.value=value}scope.value=item.label.question_scope||"";node("p","Перед approval явно уточните эту область в тексте вопроса. Общая формулировка «самое раннее доступное» неоднозначна. Вопрос и references затем замораживаются одинаково для A/B/C.",section)}
  if(item.human_text_judgment){const p=node("p",item.human_text_judgment.answer_ru+"\nУточнение: "+(item.human_text_judgment.clarification_verbatim||"—"),section);p.className="note"}
+ node("p","Рамки: протяните мышью по любому локальному фото. Координаты заполнятся автоматически в общей решётке кропа "+item.frame.shape[1]+"×"+item.frame.shape[0]+" px. Для изменения рамки нажмите «Перерисовать мышью». После проверки укажите event_id и отдельно подтвердите координаты.",section);
  const photos=node("div",undefined,section);photos.className="photos";const canvases=[],boxes=[];
- function draw(){for(const {canvas,image} of canvases){if(!image.complete||!image.naturalWidth)continue;const c=canvas.getContext("2d");c.clearRect(0,0,canvas.width,canvas.height);c.drawImage(image,0,0);for(const b of boxes){const xy=b.coords.map(e=>Number(e.value));if(xy.every(Number.isFinite)){c.strokeStyle=b.confirm.checked?"#00864b":"#c97800";c.lineWidth=2;c.strokeRect(xy[0],xy[1],xy[2]-xy[0],xy[3]-xy[1]);c.fillStyle=c.strokeStyle;c.fillText(b.event.value||"PROPOSAL",xy[0]+2,Math.max(12,xy[1]-3))}}}}
- for(const photo of item.images){const f=node("figure",undefined,photos);node("figcaption",photo.date+" / "+photo.observation_id,f);const canvas=node("canvas",undefined,f),image=new Image();canvas.width=item.frame.shape[1];canvas.height=item.frame.shape[0];canvases.push({canvas,image});image.onload=draw;image.src=photo.src}
+ let activeBox=null,drag=null;
+ function selectBox(box){activeBox=box;for(const b of boxes)b.row.className="box"+(b===box?" active":"")}
+ function draw(){for(const {canvas,image} of canvases){if(!image.complete||!image.naturalWidth)continue;const c=canvas.getContext("2d");c.clearRect(0,0,canvas.width,canvas.height);c.drawImage(image,0,0);for(const b of boxes){const xy=b.coords.map(e=>e.value.trim()===""?NaN:Number(e.value));if(xy.every(Number.isFinite)&&xy[2]>xy[0]&&xy[3]>xy[1]){c.strokeStyle=b.confirm.checked?"#00864b":"#c97800";c.lineWidth=2;c.strokeRect(xy[0],xy[1],xy[2]-xy[0],xy[3]-xy[1]);c.fillStyle=c.strokeStyle;c.fillText(b.event.value||"PROPOSAL",xy[0]+2,Math.max(12,xy[1]-3))}}if(drag){const [x,y]=drag.start,[right,bottom]=drag.end;c.strokeStyle="#3267b8";c.lineWidth=2;c.strokeRect(x,y,right-x,bottom-y)}}}
+ function point(canvas,event){const r=canvas.getBoundingClientRect();return [Math.max(0,Math.min(canvas.width,(event.clientX-r.left)*canvas.width/r.width)),Math.max(0,Math.min(canvas.height,(event.clientY-r.top)*canvas.height/r.height))]}
+ for(const photo of item.images){const f=node("figure",undefined,photos);node("figcaption",photo.date+" / "+photo.observation_id,f);const canvas=node("canvas",undefined,f),image=new Image();canvas.width=item.frame.shape[1];canvas.height=item.frame.shape[0];canvases.push({canvas,image});image.onload=draw;image.src=photo.src;
+  canvas.onpointerdown=e=>{if(e.button!==0||drag||!image.complete||!image.naturalWidth)return;
+   if(image.naturalWidth!==canvas.width||image.naturalHeight!==canvas.height){document.getElementById("message").textContent="Размер фото не совпадает с общей решёткой кропа; рисование отключено.";return}
+   e.preventDefault();const start=point(canvas,e);drag={canvas,pointer:e.pointerId,start,end:start,box:activeBox};canvas.setPointerCapture(e.pointerId);draw()};
+  canvas.onpointermove=e=>{if(!drag||drag.canvas!==canvas||drag.pointer!==e.pointerId)return;drag.end=point(canvas,e);draw()};
+  canvas.onpointerup=e=>{if(!drag||drag.canvas!==canvas||drag.pointer!==e.pointerId)return;
+   const start=drag.start,end=point(canvas,e),target=drag.box;drag=null;canvas.releasePointerCapture(e.pointerId);
+   if(start[0]===end[0]||start[1]===end[1]){draw();return}
+   const xy=[Math.floor(Math.min(start[0],end[0])),Math.floor(Math.min(start[1],end[1])),Math.ceil(Math.max(start[0],end[0])),Math.ceil(Math.max(start[1],end[1]))];
+   const b=target||addBox();b.coords.forEach((v,i)=>v.value=xy[i]);b.confirm.checked=false;selectBox(null);draw()};
+  canvas.onpointercancel=canvas.onlostpointercapture=e=>{if(drag&&drag.canvas===canvas&&drag.pointer===e.pointerId){drag=null;draw()}};
+ }
  const boxRows=node("div",undefined,section);
- function addBox(proposal={bbox_xyxy:[0,0,0,0],event_id:""}){const row=node("div",undefined,boxRows);row.className="box";
-  const b={event:input(row,"Physical event_id ","text",proposal.event_id),coords:[],confirm:input(row,"Координаты проверены вручную ","checkbox")};
+ function addBox(proposal={bbox_xyxy:["","","",""],event_id:""}){const row=node("div",undefined,boxRows);row.className="box";
+  const b={row,event:input(row,"Physical event_id ","text",proposal.event_id),coords:[],confirm:input(row,"Координаты проверены вручную ","checkbox")};
   for(const [i,name] of ["left","top","right","bottom"].entries()){const e=input(row,name+" ","number",proposal.bbox_xyxy[i]);e.step="any";e.oninput=()=>{b.confirm.checked=false;draw()};b.coords.push(e)}
-  b.event.oninput=()=>{b.confirm.checked=false;draw()};b.confirm.onchange=draw;boxes.push(b);node("small","region_crop_pixels / "+item.region_id+" / "+(proposal.label_provenance||"manual draft"),row);draw();}
- for(const p of item.proposed_boxes)addBox(p);const add=node("button","Добавить рамку",section);add.onclick=()=>addBox();
+  b.event.oninput=()=>{b.confirm.checked=false;draw()};b.confirm.onchange=draw;boxes.push(b);node("small","region_crop_pixels / "+item.region_id+" / "+(proposal.label_provenance||"manual draft"),row);
+  const redraw=node("button","Перерисовать мышью",row);redraw.onclick=()=>selectBox(b);
+  const remove=node("button","Удалить рамку",row);remove.onclick=()=>{if(drag&&drag.box===b)drag=null;boxes.splice(boxes.indexOf(b),1);row.remove();if(activeBox===b)selectBox(null);draw()};draw();return b;}
+ for(const p of item.proposed_boxes)addBox(p);const add=node("button","Добавить рамку мышью",section);add.onclick=()=>selectBox(addBox());
  const archive=node("details",undefined,section);node("summary","Архивные источники для ручной проверки ("+(item.archive_evidence||[]).length+")",archive);
  const archiveCanvases=[];
  for(const source of item.archive_evidence||[]){const card=node("div",undefined,archive);node("h3",source.evidence_id+" / "+(source.title||""),card);
@@ -53,9 +72,10 @@ for(const item of data.items){
   const c=canvas.getContext("2d"),sx=canvas.width/source.image.shape[1],sy=canvas.height/source.image.shape[0];c.drawImage(image,0,0,canvas.width,canvas.height);for(const v of Array.isArray(values)?values:[]){const xy=v.bbox_xyxy;if(v.evidence_id===source.evidence_id&&Array.isArray(xy)&&xy.length===4&&xy.every(Number.isFinite)){c.strokeStyle="#3267b8";c.lineWidth=2;c.strokeRect(xy[0]*sx,xy[1]*sy,(xy[2]-xy[0])*sx,(xy[3]-xy[1])*sy)}}}}
  archive.ontoggle=()=>{if(archive.open)for(const a of archiveCanvases){if(!a.image.getAttribute("src"))a.image.src=a.source.image.src}};
  correspondence.oninput=drawArchive;
- node("p","Структурный ответ (редактируемый JSON). events заполняются только из отмеченных выше рамок. archival_stratum задаётся до запуска моделей; supporting_evidence_ids — проверенные источники, не результат retrieval.",section);
+ node("p","Эталонный ответ — приватный JSON, модель его не получает. Описание изменений пишите в reference_answer. events заполняются только из отмеченных выше рамок. archival_stratum задаётся до запуска моделей; supporting_evidence_ids — проверенные источники, не результат retrieval.",section);
  const label=node("textarea",JSON.stringify(item.label,null,2),section);label.rows=16;
  const details=node("details",undefined,section);node("summary","Положительные факты исходных аннотаций (отдельная диагностика)",details);node("pre",JSON.stringify(item.positive_annotation_facts,null,2),details);
+ node("p","Приватные заметки: обоснование решения и ограничения наблюдения. Обязательны при экспорте.",section);
  const note=node("textarea",item.human_text_judgment?"Текстовое решение импортировано из handoff; здесь проверена структурная привязка/локализация.":"",section);note.setAttribute("aria-label","Рationale / private notes");
  editors.push({item,include,status,wording,label,note,boxes,correspondence,scope});
 }
@@ -64,7 +84,7 @@ function decisions(reviewer){if(!reviewer.trim())throw Error("Укажите р�
   const d={question_id:e.item.question_id,expected_revision:e.item.revision,status:e.status.value,reviewer,private_notes:e.note.value,reviewed_question:e.wording.value};
   if(d.status==="approved"){const label=JSON.parse(e.label.value);if("archive_correspondence" in label||"correspondence_boxes" in label)throw Error("Архивное соответствие экспортируется отдельно от метки ответа");label.events=[];
    if(e.scope){if(!e.scope.value||(e.scope.value!==e.item.label.question_scope&&e.wording.value===e.item.question))throw Error("Уточните в тексте вопроса: earliest среди показанных наблюдений или внутри frozen collection");label.question_scope=e.scope.value}
-   for(const b of e.boxes){if(!b.confirm.checked)continue;const xy=b.coords.map(v=>Number(v.value));if(!b.event.value.trim()||!xy.every(Number.isFinite)||xy[0]<0||xy[1]<0||xy[2]<=xy[0]||xy[3]<=xy[1]||xy[2]>e.item.frame.shape[1]||xy[3]>e.item.frame.shape[0])throw Error(e.item.question_id+": недопустимая рамка/event_id");
+   for(const b of e.boxes){if(!b.confirm.checked)continue;const xy=b.coords.map(v=>v.value.trim()===""?NaN:Number(v.value));if(!b.event.value.trim()||!xy.every(Number.isFinite)||xy[0]<0||xy[1]<0||xy[2]<=xy[0]||xy[3]<=xy[1]||xy[2]>e.item.frame.shape[1]||xy[3]>e.item.frame.shape[0])throw Error(e.item.question_id+": недопустимая рамка/event_id");
     label.events.push({event_id:b.event.value.trim(),bbox_xyxy:xy,coordinate_system:"region_crop_pixels",region_id:e.item.region_id});}
    if(label.assessment==="confirmed_change"&&!label.events.length)throw Error(e.item.question_id+": для change нужны проверенные event_id и рамки");
    if(label.assessment!=="confirmed_change"&&label.events.length)throw Error(e.item.question_id+": events допустимы только для confirmed_change");

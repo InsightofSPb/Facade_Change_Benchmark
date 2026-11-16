@@ -5,12 +5,18 @@ import assert from 'node:assert/strict';
 const elements = [], images = [], blobs = [], strokes = [];
 class Element {
   constructor(tag) { this.tag = tag; this.children = []; this.value = ''; this.checked = false; this.attributes = {}; elements.push(this); }
+  set value(v) { this.currentValue = String(v); }
+  get value() { return this.currentValue; }
   append(e) { this.children.push(e); }
   set textContent(v) { this.text = v; if (this.tag === 'textarea') this.value = v; }
   get textContent() { return this.text; }
   setAttribute(k, v) { this.attributes[k] = v; }
   getAttribute(k) { return this.attributes[k]; }
   getContext() { return {clearRect(){}, drawImage(){}, fillText(){}, strokeRect(...args){strokes.push(args);}}; }
+  getBoundingClientRect() { return this.rect; }
+  setPointerCapture(id) { this.pointer = id; }
+  releasePointerCapture() { this.pointer = null; }
+  remove() { this.removed = true; }
   click() {}
 }
 class Image {
@@ -75,3 +81,64 @@ earliest.item.question=earliest.wording.value;
 earliest.scope.value='frozen_collection';
 assert.throws(()=>vm.runInContext('decisions("fixture-reviewer")',scoped),/Уточните/);
 console.log('Earliest scope: explicit human choice and revised wording required; original question unchanged.');
+
+// Dragging uses the displayed canvas rectangle, but stores native crop pixels.
+const drawItem={...item,frame:{shape:[80,160]},label:{...item.label,assessment:'confirmed_change'}};
+ids.data.textContent=JSON.stringify({...payload,items:[drawItem]});
+const drawing=vm.createContext({document,Image,Blob:class{},URL:{createObjectURL:()=>'',revokeObjectURL(){}}});
+const firstElement=elements.length,firstImage=images.length;
+vm.runInContext(script,drawing);
+const drawEditor=vm.runInContext('editors[0]',drawing);
+const canvas=elements.slice(firstElement).find(e=>e.tag==='canvas');
+canvas.rect={left:100,top:200,width:640,height:320};
+const localImage=images[firstImage];
+const pointer=(x,y,id=1)=>({clientX:x,clientY:y,pointerId:id,button:0,preventDefault(){}});
+canvas.onpointerdown(pointer(436,368));
+assert.equal(canvas.pointer,undefined); // An unloaded image cannot be annotated.
+localImage.complete=true;localImage.naturalWidth=160;localImage.naturalHeight=80;
+canvas.onpointerdown(pointer(436,368));
+canvas.onpointermove(pointer(116,208));
+canvas.onpointerup(pointer(116,208));
+assert.equal(drawEditor.boxes.length,1);
+const box=drawEditor.boxes[0];
+const coordinates=()=>Array.from(box.coords,v=>Number(v.value));
+assert.deepEqual(coordinates(),[4,2,84,42]);
+assert.equal(box.confirm.checked,false);
+assert.equal(drawEditor.include.checked,false);
+assert.equal(drawEditor.wording.value,'Question');
+drawEditor.include.checked=true;drawEditor.status.value='approved';drawEditor.note.value='Human fixture';
+assert.throws(()=>vm.runInContext('decisions("reviewer")',drawing),/проверенные/);
+box.confirm.checked=true;
+assert.throws(()=>vm.runInContext('decisions("reviewer")',drawing),/event_id/);
+box.event.value='fixture-physical-event';
+const approved=vm.runInContext('decisions("reviewer")',drawing).decisions[0];
+assert.deepEqual(Array.from(approved.label.events[0].bbox_xyxy),[4,2,84,42]);
+assert.equal(approved.label.events[0].coordinate_system,'region_crop_pixels');
+assert.equal(approved.label.events[0].region_id,'region');
+assert.equal(approved.reviewed_question,'Question');
+const redraw=box.row.children.find(e=>e.textContent==='Перерисовать мышью');
+redraw.onclick();canvas.onpointerdown(pointer(120,220));
+canvas.onpointermove(pointer(240,280));canvas.onpointercancel(pointer(240,280));
+assert.deepEqual(coordinates(),[4,2,84,42]);
+assert.equal(box.confirm.checked,true); // Cancel leaves the existing decision intact.
+canvas.rect={left:100,top:200,width:80,height:40};
+canvas.onpointerdown(pointer(110,205));canvas.onpointermove(pointer(500,500));
+canvas.onpointerup(pointer(500,500));
+assert.deepEqual(coordinates(),[20,10,160,80]);
+assert.equal(drawEditor.boxes.length,1);
+assert.equal(box.confirm.checked,false); // Editing never retains old confirmation.
+assert.throws(()=>vm.runInContext('decisions("reviewer")',drawing),/проверенные/);
+canvas.onpointerdown(pointer(110,205));canvas.onpointerup(pointer(110,205));
+assert.equal(drawEditor.boxes.length,1); // Clicks do not create zero-area events.
+canvas.onpointerdown(pointer(110,205));canvas.onlostpointercapture(pointer(120,210));
+canvas.onpointerup(pointer(120,210));
+assert.equal(drawEditor.boxes.length,1);
+localImage.naturalWidth=161;canvas.onpointerdown(pointer(110,205));
+assert.match(ids.message.textContent,/Размер фото/);
+localImage.naturalWidth=160;
+box.confirm.checked=true;box.coords[0].value='';
+assert.throws(()=>vm.runInContext('decisions("reviewer")',drawing),/недопустимая/);
+box.row.children.find(e=>e.textContent==='Удалить рамку').onclick();
+assert.equal(drawEditor.boxes.length,0);
+assert.throws(()=>vm.runInContext('decisions("reviewer")',drawing),/проверенные/);
+console.log('Mouse rectangles: scaling, reverse drag, clipping, cancellation, redraw, deletion and explicit approval passed.');
