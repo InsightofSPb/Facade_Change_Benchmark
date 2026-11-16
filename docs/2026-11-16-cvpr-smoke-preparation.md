@@ -157,6 +157,21 @@ private isolation, видимые этапы и неизвестные расх�
 Последующие проверки восстановили исходную диагностику и используют штатный `_copy`.
 Это журнал исправлений тестов, не результат реальной модели.
 
+Отдельный CLI demo выполнен на чистом кодовом коммите
+[`70b1b98f9f11af90b9e85197e5b37442900b5b85`](https://github.com/InsightofSPb/Facade_Change_Benchmark/commit/70b1b98f9f11af90b9e85197e5b37442900b5b85),
+`source_snapshot.dirty=false`, каталог Cloud
+`/workspace/work/2026-11-16-inspection-demo-001`. Analysis/evaluation completed;
+запрограммированные heuristic F1=1/3 и agent F1=1 сохранились. В каждом режиме
+4 completed, 1 abstained, 0 error, 0 missing. Положительные **синтетические** здания
+основной метрики: b1/b2; stable-only: b3; b4 — unassessable. Это не измерение качества VLM.
+
+CLI inventory на кандидатах этой фикстуры:
+`/workspace/work/2026-11-16-inspection-inventory-001`, completed, 15 исходных кандидатов,
+5 eligible / 10 ineligible, выбраны 5 случаев четырёх синтетических зданий.
+Весь assessability template остался pending. На stderr появились этапы до итогового JSON.
+Эти числа не переносятся на реальные данные. Полные CPU-логи сохранены вне Git в
+`/workspace/work/2026-11-16-{focused-tests-003,workflow-tests,cohort-final-tests,inspection-demo-001,inspection-inventory-001}.log`.
+
 ## WSL: безопасное обновление и обнаружение входов
 
 Каждый блок запускается отдельно в foreground. Оболочка блока не оставляет shell
