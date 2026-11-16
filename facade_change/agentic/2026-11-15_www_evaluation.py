@@ -4,7 +4,6 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timezone
 import importlib
-import json
 from pathlib import Path
 import secrets
 
@@ -14,7 +13,6 @@ from ..history_features import Fingerprints, digest
 from ..io import read_json, sha256, write_json
 from ..visualization import write_static_gallery
 from .evaluation import _verify_recorded_artifacts
-from .report import _copy
 from .runner import complete_run, new_run
 from .store import PrivateEvidenceError, reject_forbidden, temporal_value
 
@@ -22,6 +20,7 @@ qa = importlib.import_module(".2026-11-10_questions", __package__)
 evaluation = importlib.import_module(".2026-11-10_qa_evaluation", __package__)
 runner = importlib.import_module(".2026-11-15_www_runner", __package__)
 curation = importlib.import_module(".2026-11-15_www_curation", __package__)
+factual = importlib.import_module(".2026-11-16_www_factual", __package__)
 ratio = evaluation.ratio
 AGGREGATION = {"unit": "physical_building", "seed": 20261116, "replicates": 2000, "confidence_level": .95}
 PAIRED_CONTRASTS = (("photos_only", "fixed_retrieval"), ("fixed_retrieval", "bounded_agentic_retrieval"),
@@ -287,7 +286,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
     journal = new_run(out, {"questions_sha256": sha256(questions_path), "answers_sha256": sha256(answers_path),
         "plan_sha256": sha256(plan_path), "inference_run": str(root), "primary_endpoint": "reviewed_task_specific_structured_answer"}, "www_offline_metrics")
     try:
-        rows, normalized, blind, blind_key, panels, sources = [], {}, [], [], [], {}
+        rows, normalized, blind, blind_key, panels, blind_items = [], {}, [], [], [], []
         (journal.out / "assets").mkdir()
         blind_salt = secrets.token_hex(16)
         gold_panels = []
@@ -341,21 +340,12 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                     "citations": len(citations), "valid_citations": len(set(citations) & set(exposed)), "costs": result.get("costs", {})}
                 rows.append(row)
                 blind_id = digest([blind_salt, identifier, condition])[:16]
-                blind.append({"blind_id": blind_id, "question": question["question"], "answer_text": answer.get("answer_text", ""),
-                    "citation_ids": citations, "factual_support": "", "contradiction": "", "image_source_relevance": "", "reviewer": "", "notes": ""})
-                blind_key.append({"blind_id": blind_id, "question_id": identifier, "condition": condition})
-                section_panels = []
-                for key in citations:
-                    evidence = exposed[key]
-                    if evidence.get("image_path"):
-                        fingerprints.add(evidence["image_path"], evidence["image_sha256"])
-                        section_panels.append({"src": _copy(journal.out, evidence["image_path"], journal.out, sources), "label": key})
-                source_text = [{"evidence_id": k, "source_page_url": exposed[k].get("source_page_url"),
-                    "shown_source_excerpt": runner.archive.source_excerpt(exposed[k], exposed[k]["text_selection"]["used_characters"])[0]
-                        if exposed[k].get("origin") == "archive" else None,
-                    "observation_date": exposed[k].get("observation_date", exposed[k].get("date"))} for k in citations]
-                panels.append({"title": blind_id, "caption": json.dumps({"question": question["question"],
-                    "answer": answer.get("answer_text"), "sources": source_text}, ensure_ascii=False), "panels": section_panels})
+                blind_row, blind_item, section, trace = factual.blind_case(question, result, exposed, folder, journal.out,
+                    fingerprints, blind_id, root=root, target={"reference_answer": label["reference_answer"]})
+                blind.append(blind_row)
+                blind_items.append(blind_item)
+                panels.append(section)
+                blind_key.append({"blind_id": blind_id, "question_id": identifier, "condition": condition, **trace})
         summaries, paired = {}, {}
         for cohort in ("development", "evaluation"):
             for stratum in ("all", "archival"):
@@ -418,11 +408,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
         write_json(journal.out / "annotation-diagnostics.private.json", annotation_report)
         write_static_gallery(gold_root, "PRIVATE — reviewed localization, never an inference input", gold_panels)
         curation.csv_rows(journal.out / "structured-cases.private.csv", rows)
-        curation.csv_rows(journal.out / "blind-review.private.csv", sorted(blind, key=lambda r: r["blind_id"]))
-        write_json(journal.out / "blind-key.private.json", qa._private("www_blind_review_key", cases=blind_key))
-        write_static_gallery(journal.out, "Blind factual-support review", sorted(panels, key=lambda r: r["title"]), notes=[
-            "Judge answer/source meaning in blind-review.private.csv. Condition mapping is separately private.",
-            "A valid citation ID does not prove factual support. No gold overlays appear on this page."])
+        factual.write_blind(journal.out, blind, blind_items, panels, blind_key)
         fingerprints.verify()
         summary = {"status": "completed", "questions": len(questions), "conditions": list(runner.CONDITIONS),
             "cohort_condition_rows": len(rows), "report_path": str(journal.out / "gallery.html"),

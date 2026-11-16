@@ -68,6 +68,8 @@ def parser():
     review.add_argument("--previous")
     review.add_argument("--archive-corpus")
     review.add_argument("--identity-map")
+    review.add_argument("--private-audit")
+    review.add_argument("--inventory")
     package = commands.add_parser("review-package", help="CPU inventory, target selection and private local/archive review; no approvals")
     package.add_argument("--candidates", required=True)
     package.add_argument("--histories", required=True)
@@ -79,6 +81,7 @@ def parser():
     package.add_argument("--preserved-selection")
     package.add_argument("--previous")
     package.add_argument("--targets")
+    package.add_argument("--private-audit")
     package.add_argument("--per-building", type=int, default=12)
     package.add_argument("--seed", default="2026-11-16-www-review-v1")
     plan = commands.add_parser("plan", help="Freeze approved cohort/strata/model contract before model execution")
@@ -95,7 +98,20 @@ def parser():
     score.add_argument("--answers", required=True)
     score.add_argument("--run", required=True)
     score.add_argument("--plan", required=True)
-    for command in (imp, index, run, demo, inventory, batch, handoff, public, review, package, plan, score):
+    pending = commands.add_parser("archive-audit-review", help="Private pending archive panels; independent of batch eligibility, CPU only")
+    pending.add_argument("--private-audit", required=True, help="Local directory or ZIP; supplied scripts are never executed")
+    pending.add_argument("--candidates")
+    pending.add_argument("--inventory")
+    pending.add_argument("--archive-corpus")
+    pending.add_argument("--identity-map")
+    pending.add_argument("--handoff")
+    pending.add_argument("--previous")
+    audit = commands.add_parser("audit", help="Blind factual review of saved outputs, including old unscored runs; no plan or inference")
+    audit.add_argument("--run", required=True)
+    audit.add_argument("--questions", help="Default: the saved run/questions.json")
+    audit.add_argument("--candidates", help="Exact original candidates, only with --handoff")
+    audit.add_argument("--handoff", help="Optional original human target text; never automatic factual judgments")
+    for command in (imp, index, run, demo, inventory, batch, handoff, public, review, package, plan, score, pending, audit):
         command.add_argument("--out", required=True)
         command.add_argument("--quiet", action="store_true")
     return root
@@ -132,12 +148,22 @@ def main(argv=None):
             elif args.action == "review-page":
                 result = module("curation").review_page(args.candidates, args.selection, args.out,
                     handoff_path=args.handoff, previous=args.previous, archive_corpus=args.archive_corpus,
-                    identity_map=args.identity_map, progress=progress)
+                    identity_map=args.identity_map, private_audit=args.private_audit, inventory_path=args.inventory, progress=progress)
             elif args.action == "review-package":
                 result = module("curation").review_package(args.candidates, args.histories, args.archive_corpus, args.out,
                     identity_map=args.identity_map, exposure_path=args.exposure_audit, exposed_questions=args.exposed_questions,
                     handoff_path=args.handoff, preserved_selection=args.preserved_selection, previous=args.previous,
-                    targets=read_json(args.targets) if args.targets else None, per_building=args.per_building, seed=args.seed, progress=progress)
+                    targets=read_json(args.targets) if args.targets else None, per_building=args.per_building, seed=args.seed,
+                    private_audit=args.private_audit, progress=progress)
+            elif args.action == "archive-audit-review":
+                result = importlib.import_module(".2026-11-16_www_private_audit", __package__).export(
+                    args.private_audit, args.out, candidates_path=args.candidates, inventory_path=args.inventory,
+                    archive_corpus=args.archive_corpus, identity_map=args.identity_map,
+                    handoff_path=args.handoff, previous=args.previous, progress=progress)
+            elif args.action == "audit":
+                result = importlib.import_module(".2026-11-16_www_factual", __package__).audit(
+                    args.run, args.out, questions_path=args.questions, candidates_path=args.candidates,
+                    handoff_path=args.handoff, progress=progress)
             elif args.action == "plan":
                 result = module("evaluation").plan(args.questions, args.answers, args.inventory, load_config(args.config), args.out,
                     archive_index=args.archive_index, allow_empty_archive=args.allow_empty_archive,

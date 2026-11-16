@@ -477,7 +477,7 @@ def proposals(case, fingerprints, annotation_index=None):
 
 
 def review_page(candidates_path, selection_path, out, *, handoff_path=None, previous=None,
-                archive_corpus=None, identity_map=None, progress=None):
+                archive_corpus=None, identity_map=None, private_audit=None, inventory_path=None, progress=None):
     fingerprints = Fingerprints()
     candidates, rows = selected_cases(candidates_path, selection_path, fingerprints)
     selection = qa.read_bound(selection_path, fingerprints)
@@ -503,6 +503,12 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
         "identity_source": identities.source}, "www_private_review_ui", progress)
     try:
         (journal.out / "assets").mkdir()
+        pending = None
+        if private_audit:
+            pending = importlib.import_module(".2026-11-16_www_private_audit", __package__).export(
+                private_audit, journal.out / "pending-audit", candidates_path=candidates_path,
+                inventory_path=inventory_path, archive_corpus=archive_corpus, identity_map=identity_map,
+                handoff_path=handoff_path, previous=previous, progress=progress)
         sources, items, sections = {}, [], []
         for number, case in enumerate(rows, 1):
             journal.event("case_started", case_id=case["question_id"], index=number, total=len(rows))
@@ -562,6 +568,7 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
             sections.append({"title": case["question_id"], "caption": json.dumps(item, ensure_ascii=False), "panels": panels})
             journal.event("case_prepared", case_id=case["question_id"], status="completed")
         payload = qa._private("www_review_page", candidate_sha256=sha256(candidates_path), items=items,
+            pending_audit_link="pending-audit/index.html" if pending else None,
             identity_source=identities.source, archive_corpus_sha256=sha256(archive_corpus) if archive_corpus else None)
         write_json(journal.out / "drafts.private.json", payload)
         # Existing static gallery remains available, with a small separate editor over the same copied RGB.
@@ -573,6 +580,7 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
         (journal.out / "review.html").write_text(template.replace("__REVIEW_DATA__", embedded), encoding="utf-8")
         fingerprints.verify()
         summary = {"status": "completed", "questions": len(items), "imported_text_judgments": len(judgments),
+            "pending_private_audit": pending,
             "approved": 0, "annotation_facts": sum(len(r["positive_annotation_facts"]) for r in items),
             "automatic_proposals": sum(len(r["proposed_boxes"]) for r in items), "report_path": str(journal.out / "review.html")}
         write_json(journal.out / "summary.json", summary)
@@ -587,7 +595,7 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
 
 def review_package(candidates_path, histories, archive_corpus, out, *, identity_map=None, exposure_path=None,
                    exposed_questions=(), handoff_path=None, preserved_selection=None, previous=None,
-                   targets=None, per_building=12, seed="2026-11-16-www-review-v1", progress=None):
+                   targets=None, per_building=12, seed="2026-11-16-www-review-v1", private_audit=None, progress=None):
     """CPU orchestration of the existing inventory/batch/editor; never reads model outcomes."""
     targets = dict(REVIEW_TARGETS if targets is None else targets)
     if bool(handoff_path) != bool(preserved_selection):
@@ -629,13 +637,15 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
             cohort="development", exposed_questions=exposed_paths)
         journal.event("review_stage", stage="экспорт датированных RGB и архивных источников для приватного review")
         reviewed = review_page(candidates_path, journal.out / "batch/selection.private.json", journal.out / "review",
-            archive_corpus=archive_corpus, identity_map=identity_path, progress=progress)
+            archive_corpus=archive_corpus, identity_map=identity_path, private_audit=private_audit,
+            inventory_path=journal.out / "inventory/inventory.json", handoff_path=handoff_path, progress=progress)
         if handoff_path:
             journal.event("review_stage", stage="сохранение прежних человеческих решений отдельным разделом")
             preserved = review_page(candidates_path, preserved_selection, journal.out / "preserved-review",
                 handoff_path=handoff_path, previous=previous, archive_corpus=archive_corpus, identity_map=identity_path, progress=progress)
         summary = {**selected, "approved": 0, "models_executed": False,
             "review_path": reviewed["report_path"], "preserved_review": preserved,
+            "pending_private_audit": reviewed["pending_private_audit"],
             "identity_review": str(identity_path), "report_path": str(journal.out / "index.html"),
             "full_target_cohort_created": selected["selected"] == sum(targets.values()),
             "preserved_cases_scope": "separate original review; not counted toward new provisional targets"}
@@ -646,6 +656,8 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
             "identity-review.json is a proposal: review a separate copy, then create a new inventory/selection with that reviewed map.",
             "Archive correspondence proposals are separate from change-event GT. No labels are approved by this exporter."])
         links = '<li><a href="review/review.html">Новые вопросы и архивные источники</a></li>'
+        if reviewed["pending_private_audit"]:
+            links += '<li><a href="review/pending-audit/index.html">Pending-аудит: все предложения, включая исключённые из batch</a></li>'
         if preserved:
             links += '<li><a href="preserved-review/review.html">Сохранённые человеческие решения, включая уточнения</a></li>'
         links += '<li><a href="inventory/gallery.html">Исходные IDs, split и exposure</a></li><li><a href="identity-review.json" download>Копия identity mapping для отдельного review</a></li>'
