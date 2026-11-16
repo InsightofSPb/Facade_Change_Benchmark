@@ -207,7 +207,7 @@ class WWWRunnerTest(unittest.TestCase):
         self.assertIn("No archive evidence", first["validation_error"])
         self.assertEqual(row["answer"]["citations"], ["fixture-archive-b1"])
 
-    def test_final_cannot_bypass_action_selection(self):
+    def test_incomplete_final_cannot_bypass_answer_validation(self):
         class PrematureFinal(demo.SyntheticPool):
             def call(self, role, payload):
                 if role == "jina":
@@ -219,9 +219,103 @@ class WWWRunnerTest(unittest.TestCase):
         result = self.run_fixture(pool_factory=PrematureFinal, conditions=("bounded_agentic_retrieval",))
         self.assertEqual(result["outcome_counts"], {"completed": 0, "abstained": 0, "error": 3})
         for row in read_json(self.root / "run/results.json")["results"]:
-            self.assertIn("Choose an action first", row["error"])
+            self.assertIn("missing fields", row["error"])
             self.assertEqual(row["costs"]["qwen_requests"], 2)
             self.assertEqual(row["costs"]["retrieval_rounds"], 0)
+
+    def test_complete_stage_final_can_finish_without_redundant_choice(self):
+        class DirectFinal(demo.SyntheticPool):
+            def call(self, role, payload):
+                if role == "jina":
+                    raise AssertionError("A complete local final must not cause retrieval")
+                scripted = copy.deepcopy(payload)
+                control = json.loads(scripted["messages"][-1]["content"][0]["text"])
+                control.update(stage="answer", allowed_action="final")
+                scripted["messages"][-1]["content"][0]["text"] = json.dumps(control)
+                response = super().call(role, scripted)
+                value = json.loads(response["text"])
+                del value["type"]
+                value["stage"] = "answer"
+                response["text"] = json.dumps(value)
+                return response
+
+        summary = self.run_fixture(pool_factory=DirectFinal, conditions=("bounded_agentic_retrieval",))
+        self.assertEqual(summary["outcome_counts"], {"completed": 2, "abstained": 1, "error": 0})
+        for row in read_json(self.root / "run/results.json")["results"]:
+            self.assertEqual(row["costs"]["qwen_requests"], 1)
+            self.assertEqual(row["costs"]["retrieval_rounds"], 0)
+            folder = self.root / "run/questions" / row["question_id"] / row["condition"]
+            reply = read_json(folder / "reply-001.json")
+            self.assertIsNone(reply["normalized_action"])
+            self.assertEqual(reply["normalized_final"], {
+                **{k: v for k, v in reply["parsed"].items() if k != "stage"}, "type": "final"})
+            self.assertEqual(read_json(folder / "final_raw.json"), reply["parsed"])
+
+    def test_archive_draft_selects_answer_but_only_complete_final_is_scored(self):
+        draft = {"type": "archival_qa", "answer": {"source": "https://example.invalid/draft",
+                 "evidence_id": "unverified-draft-id", "date": "1900-01-01", "precision": "year"}}
+
+        class DraftThenFinal(demo.SyntheticPool):
+            def call(self, role, payload):
+                response = super().call(role, payload)
+                if role == "qwen":
+                    value = json.loads(response["text"])
+                    if value["type"] == "answer":
+                        value = {"stage": "answer", "action": "answer", "response_contract": draft}
+                    elif value["type"] == "final":
+                        del value["type"]
+                        value["stage"] = "answer"
+                    response["text"] = json.dumps(value)
+                return response
+
+        public = read_json(self.questions)
+        question = public["questions"][2]
+        write_json(self.questions, {**public, "questions": [question]})
+        summary = self.run_fixture(pool_factory=DraftThenFinal, conditions=("bounded_agentic_retrieval",))
+        self.assertEqual(summary["outcome_counts"], {"completed": 1, "abstained": 0, "error": 0})
+        row = read_json(self.root / "run/results.json")["results"][0]
+        self.assertEqual(row["costs"]["qwen_requests"], 3)
+        self.assertEqual(row["costs"]["retrieval_rounds"], 1)
+        self.assertEqual(row["answer"]["citations"], ["fixture-archive-b1"])
+        folder = self.root / "run/questions" / question["question_id"] / row["condition"]
+        choice = read_json(folder / "reply-002.json")
+        self.assertIsNone(choice["normalized_final"])
+        self.assertIsNone(choice["validation_error"])
+        self.assertEqual(choice["normalized_action"]["response_contract"], draft)
+        last = read_json(folder / "reply-003.json")
+        self.assertEqual(row["answer"], {**last["normalized_final"], "status": "completed"})
+
+    def test_retrieval_cap_goes_directly_to_final_with_unchanged_call_accounting(self):
+        class SearchUntilCap(demo.SyntheticPool):
+            def call(self, role, payload):
+                response = super().call(role, payload)
+                if role == "qwen":
+                    control = json.loads(payload["messages"][-1]["content"][0]["text"])
+                    if control["stage"] == "choose_action":
+                        query = "synthetic search " + str(control["archive_state"]["searches_performed"])
+                        response["text"] = json.dumps({"type": "retrieve", "query": query})
+                return response
+
+        public = read_json(self.questions)
+        question = public["questions"][2]
+        write_json(self.questions, {**public, "questions": [question]})
+        for cap, expected_rounds in ((4, 2), (1, 1)):
+            with self.subTest(max_archive_records=cap):
+                name = f"cap-{cap}"
+                summary = self.run_fixture(name, pool_factory=SearchUntilCap,
+                    protocol={**runner.PROTOCOL, "max_archive_records": cap}, conditions=("bounded_agentic_retrieval",))
+                self.assertEqual(summary["outcome_counts"], {"completed": 1, "abstained": 0, "error": 0})
+                row = read_json(self.root / name / "results.json")["results"][0]
+                self.assertEqual(row["costs"]["retrieval_rounds"], expected_rounds)
+                self.assertEqual(row["costs"]["qwen_requests"], expected_rounds + 1)
+                self.assertEqual(row["costs"]["budget_output_tokens"], (expected_rounds + 1) * 60)
+                folder = self.root / name / "questions" / question["question_id"] / row["condition"]
+                calls = [read_json(p) for p in sorted((folder / "calls").glob("*-qwen.json"))]
+                controls = [json.loads(c["request"]["messages"][-1]["content"][0]["text"]) for c in calls]
+                self.assertEqual([c["stage"] for c in controls], ["choose_action"] * expected_rounds + ["answer"])
+                self.assertIn("output_instruction", controls[-1])
+                events = [json.loads(line) for line in (self.root / name / "events.jsonl").read_text().splitlines()]
+                self.assertEqual(sum(e["event_type"] == "agent_final_required" for e in events), 1)
 
     def test_identity_freeze_and_asset_hash(self):
         value = read_json(self.package)

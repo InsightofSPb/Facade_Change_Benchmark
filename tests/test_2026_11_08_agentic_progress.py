@@ -107,11 +107,13 @@ class TerminalProgressTests(unittest.TestCase):
         progress("agent_model_requested", role="qwen", op="generate", stage="choose_action")
         progress("agent_action_selected", action="retrieve")
         progress("agent_tool_requested", name="archive_search")
+        progress("agent_final_required")
         text = output.snapshot()
         self.assertIn("выбор действия", text)
         self.assertIn("выбор агента: retrieve", text)
         self.assertIn("инструмент archive_search: вызов", text)
-        self.assertGreaterEqual(output.flushes, 3)
+        self.assertIn("лимит поиска исчерпан", text)
+        self.assertGreaterEqual(output.flushes, 4)
 
     def test_model_wait_progress_is_flushed_before_completion_and_stdout_is_one_json(self):
         entered, release = threading.Event(), threading.Event()

@@ -23,6 +23,8 @@ class TransportTests(unittest.TestCase):
             {"action": "abstain", "reason": "Синтетическая окклюзия"},
             {"type": "retrieve", "query": "  Preserve spacing  ", "observation_id": "shown-id", "reason": "Check source"},
             {"type": "answer"},
+            {"stage": "answer", "action": "answer", "response": {"answer": "Incomplete synthetic draft"}},
+            {"stage": "choose_action", "action": "answer", "response_contract": {"type": "archival_qa", "answer": {}}},
         ]
         for original in actions:
             with self.subTest(original=original):
@@ -58,6 +60,8 @@ class TransportTests(unittest.TestCase):
             {"action": ["retrieve", "answer"]},
             {"retrieve": {"query": "x"}, "answer": {}},
             {"action": "final", "decision": "supported"},
+            {"stage": "answer", "action": "answer", "response": "not an object"},
+            {"stage": "answer", "action": "answer", "response": {}, "response_contract": {}},
         ]
         for original in invalid:
             with self.subTest(original=original), self.assertRaises(ValueError):
@@ -137,6 +141,33 @@ class AnswerTests(unittest.TestCase):
         value["date_interval"]["start"] = "2008"
         with self.assertRaisesRegex(ValueError, 'start: expected "2009", received "2008"'):
             runner.validate_answer(value, *args, runner.PROTOCOL)
+
+    def test_final_envelopes_preserve_content_and_cannot_repair_incomplete_drafts(self):
+        args = self.prepare("temporal_change")
+        final = self.answer(args)
+        expected = runner.validate_answer(final, *args, runner.PROTOCOL)
+        content = {key: value for key, value in final.items() if key != "type"}
+        for envelope in ({"stage": "answer", **content},
+                         {"stage": "answer", "action": "answer", "response": content}):
+            before = copy.deepcopy(envelope)
+            changes = []
+            self.assertEqual(runner.validate_answer(envelope, *args, runner.PROTOCOL,
+                                                   normalizations=changes), expected)
+            self.assertIn("answer_stage_to_final_type", changes)
+            self.assertEqual(envelope, before)
+        drafts = [
+            {"stage": "answer", "action": "answer", "response": {"answer": "Draft", "evidence_id": "missing"}},
+            {"stage": "answer", "action": "answer", "response_contract": {"type": "archival_qa", "answer": {}}},
+            {"stage": "answer", "decision": "change"},
+            {"stage": "answer", "action": "retrieve", **content},
+            {"stage": "answer", **content, "citations": ["not-shown"]},
+            {"stage": "answer", **content, "date_interval": {**content["date_interval"], "start": "1800"}},
+        ]
+        for draft in drafts:
+            before = copy.deepcopy(draft)
+            with self.subTest(draft=draft), self.assertRaises(ValueError):
+                runner.validate_answer(draft, *args, runner.PROTOCOL)
+            self.assertEqual(draft, before)
 
     def test_earliest_canonical_year_unknown_uncertainty_and_malformed_boxes(self):
         args = self.prepare("earliest_evidence")

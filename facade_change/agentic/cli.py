@@ -119,6 +119,8 @@ class TerminalProgress:
                 self._write(f"модель {role}: {values.get('status', 'unknown')} {tokens}; " + self._details(values))
             elif event == "agent_action_selected":
                 self._write("выбор агента: " + str(values.get("action")))
+            elif event == "agent_final_required":
+                self._write("лимит поиска исчерпан: формирование финального ответа или отказа")
             elif event == "agent_tool_requested":
                 self._begin(f"инструмент {values.get('name')}: вызов")
             elif event == "agent_tool_returned":
