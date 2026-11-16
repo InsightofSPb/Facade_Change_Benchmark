@@ -319,7 +319,10 @@ def normalize_action(value, normalizations=None):
         del value["stage"]
     if "action" in value:
         if "type" in value:
-            raise ValueError("Use one action discriminator, type or action, not both")
+            if value["type"] not in (value["action"], "action"):
+                raise ValueError(f"Conflicting action discriminators: type={value['type']!r}, action={value['action']!r}")
+            changes.append("collapsed_matching_action_discriminators" if value["type"] == value["action"]
+                           else "unwrapped_explicit_action_type")
         value["type"] = value.pop("action")
         changes.append("action_key_to_type")
     action = value.get("type")
@@ -834,7 +837,7 @@ def execution_contract(path, config, archive_sha, conditions, protocol, budgets,
         "execution_order": "conditions_first" if condition_major else "questions_first",
         "prompt_revision": PROMPT_REVISION, "prompt_sha256": digest(SYSTEM),
         "agentic_action_protocol": "model-selected retrieve/answer/abstain or complete final; final-only after retrieval cap; all calls charged to unchanged budgets",
-        "action_transport_revision": "2026-11-17-explicit-nested-final-v4",
+        "action_transport_revision": "2026-11-17-consistent-action-discriminators-v5",
         "implementation_sha256": {p.name: sha256(p) for p in source_files},
         "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []},
         **({"identity_source": identity_source} if identity_source else {})}

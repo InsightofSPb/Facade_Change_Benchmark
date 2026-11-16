@@ -3,6 +3,7 @@ import copy
 import importlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -187,6 +188,73 @@ class ReviewAndMetricsTest(unittest.TestCase):
         self.assertTrue(all(row["correct"] for row in report["cases"]))
         with self.assertRaisesRegex(ValueError, "human-approved"):
             qa.export(self.root / "review/reviewed.json", self.root / "bad-subset", question_ids=["not-approved"])
+
+    def test_launcher_reuses_frozen_inputs_for_new_smoke_and_continuation(self):
+        _, _, index = self.approve()
+        curation.inventory(self.histories, self.root / "rgb", candidates_path=self.candidates,
+                           qa_policy=curation.rgb_policy.POLICY)
+        inventory = self.root / "rgb/inventory.json"
+        config = self.root / "config.json"
+        write_json(config, self.config)
+        script = Path(__file__).resolve().parents[1] / "scripts/2026-11-17-run-approved-www.py"
+        spec = importlib.util.spec_from_file_location("www_launch_fixture", script)
+        launch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launch)
+        args = ["--decisions", str(self.root / "decisions.private.json"), "--candidates", str(self.candidates),
+                "--corpus", str(self.root / "archive/corpus.json"), "--inventory", str(inventory),
+                "--config", str(config), "--expected-approved", "5"]
+        prior = self.root / "prior"
+        self.assertEqual(launch.main(args + ["--out", str(prior), "--prepare-only"]), 0)
+        (prior / "archive-index").mkdir()
+        shutil.copyfile(index, prior / "archive-index/index.json")
+        smoke_id = next(q["question_id"] for q in read_json(prior / "public/questions.json")["questions"]
+                        if q["region_id"] == "change")
+        qa.export(prior / "review/reviewed.json", prior / "smoke-public", question_ids=[smoke_id])
+        order = ("photos_only", "bounded_agentic_retrieval", "fixed_retrieval")
+        for folder, plan in (("public", "plan"), ("smoke-public", "smoke-plan")):
+            metrics.plan(prior / folder / "questions.json", prior / folder / "answers.private.json", inventory,
+                         self.config, prior / plan, archive_index=prior / "archive-index/index.json", synthetic=True,
+                         include_reviewed=True, conditions=order, condition_major=True)
+        originals = {str(p): sha256(p) for p in prior.rglob("*") if p.is_file()}
+        calls = []
+        cli = importlib.import_module("facade_change.agentic.2026-11-15_www")
+
+        def command(repo, *arguments, allow_errors=False):
+            calls.append(arguments[:2])
+            self.assertEqual(arguments[0], "www")
+            values = cli.parser().parse_args(list(map(str, arguments[1:])))
+            if values.action == "plan":
+                result = metrics.plan(values.questions, values.answers, values.inventory, self.config, values.out,
+                    archive_index=values.archive_index, synthetic=True, include_reviewed=values.include_reviewed,
+                    conditions=values.conditions, condition_major=values.condition_major)
+            elif values.action == "run":
+                result = demo.runner.run(values.questions, self.config, values.out, archive_index=values.archive_index,
+                    pool_factory=demo.SyntheticPool, synthetic=True, conditions=values.conditions, condition_major=values.condition_major)
+            elif values.action == "score":
+                result = metrics.score(values.questions, values.answers, values.run, values.plan, values.out)
+            else:
+                self.fail("Prepared inputs must not rebuild the index or export reviews")
+            return int(result["status"] == "completed_with_errors")
+
+        out = self.root / "reused"
+        with patch.object(launch, "command", side_effect=command):
+            self.assertEqual(launch.main(args + ["--prepared-from", str(prior), "--out", str(out), "--smoke-only"]), 0)
+            self.assertFalse((out / "inference").exists())
+            self.assertEqual(launch.main(args + ["--out", str(out), "--continue"]), 0)
+        for folder in ("public", "smoke-public"):
+            for filename in ("questions.json", "answers.private.json"):
+                self.assertEqual(sha256(prior / folder / filename), sha256(out / folder / filename))
+        self.assertEqual(originals, {str(p): sha256(p) for p in prior.rglob("*") if p.is_file()})
+        self.assertEqual(calls.count(("www", "run")), 2)
+        self.assertEqual(calls.count(("www", "score")), 2)
+        rows = read_json(out / "inference/results.json")["results"]
+        self.assertEqual([row["condition"] for row in rows], [c for c in order for _ in range(5)])
+        self.assertEqual(len(read_json(out / "score/metrics.private.json")["cases"]), 15)
+        with (prior / "archive-index/index.json").open("a") as stream:
+            stream.write("\n")
+        with self.assertRaisesRegex(ValueError, "индекс"):
+            launch.main(args + ["--prepared-from", str(prior), "--out", str(self.root / "changed"), "--prepare-only"])
+        self.assertFalse((self.root / "changed").exists())
 
     def test_interrupted_condition_pass_scores_ac_and_marks_b_comparisons_pending(self):
         questions, answers, index = self.approve()

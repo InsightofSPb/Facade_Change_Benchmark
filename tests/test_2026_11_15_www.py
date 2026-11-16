@@ -239,6 +239,58 @@ class WWWRunnerTest(unittest.TestCase):
             self.assertEqual(row["costs"]["retrieval_rounds"], 1)
             self.assertEqual(row["costs"]["qwen_requests"], 3)
 
+    def test_consistent_action_discriminators_preserve_content_and_reject_conflicts(self):
+        for action in ("retrieve", "answer", "abstain"):
+            extras = {"query": "dated facade photo", "observation_id": "local-id"} if action == "retrieve" else {}
+            for discriminator in (action, "action"):
+                value = {"stage": "choose_action", "type": discriminator, "action": action,
+                         "reason": "Synthetic explanation", **extras}
+                original = copy.deepcopy(value)
+                changes = []
+                checked = runner.normalize_action(value, changes)
+                self.assertEqual(checked, {"type": action, "reason": value["reason"], **extras})
+                self.assertEqual(value, original)
+                self.assertTrue(changes)
+        for value in (
+            {"type": "retrieve", "action": "answer", "query": "unchanged query"},
+            {"type": "answer", "action": "abstain", "reason": "conflict"},
+            {"type": "action", "action": "retrieve"},
+            {"type": "action", "action": "unknown"},
+            {"type": "action", "action": "abstain"},
+            {"type": "action", "action": ["answer"]},
+            {"type": "action", "action": "answer", "decision": "change"},
+            {"stage": "answer", "type": "action", "action": "retrieve", "query": "wrong stage"},
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                runner.normalize_action(value)
+
+    def test_dual_action_discriminators_dispatch_without_retries(self):
+        for generic in (False, True):
+            class DualPool(demo.SyntheticPool):
+                def call(self, role, payload):
+                    response = super().call(role, payload)
+                    if role == "qwen":
+                        value = json.loads(response["text"])
+                        if value["type"] != "final":
+                            value["action"] = value["type"]
+                            if generic:
+                                value["type"] = "action"
+                            response["text"] = json.dumps(value)
+                    return response
+
+            name = "dual-generic" if generic else "dual-matching"
+            summary = self.run_fixture(name, pool_factory=DualPool, conditions=("bounded_agentic_retrieval",))
+            self.assertEqual(summary["outcome_counts"], {"completed": 3, "abstained": 0, "error": 0})
+            for row in read_json(self.root / name / "results.json")["results"]:
+                self.assertEqual(row["costs"]["qwen_requests"], 3)
+                self.assertEqual(row["costs"]["retrieval_rounds"], 1)
+                folder = self.root / name / "questions" / row["question_id"] / row["condition"]
+                reply = read_json(folder / "reply-001.json")
+                self.assertEqual(reply["parsed"]["action"], "retrieve")
+                self.assertEqual(reply["normalized_action"]["type"], "retrieve")
+                self.assertEqual(reply["normalized_action"]["query"], reply["parsed"]["query"])
+                self.assertIsNone(reply["validation_error"])
+
     def test_unsupported_archive_answer_choice_can_retry_with_real_tool_dispatch(self):
         public = read_json(self.questions)
         question = public["questions"][2]

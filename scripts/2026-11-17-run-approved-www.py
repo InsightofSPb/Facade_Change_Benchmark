@@ -55,13 +55,17 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=repo / "configs/2026-11-15-www-archive-20mp-001.local.json")
     parser.add_argument("--expected-approved", type=int, default=103)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--prepared-from", type=Path, help="Reuse unchanged public exports and archive index from a prior smoke; freeze new plans")
     parser.add_argument("--prepare-only", action="store_true", help="Validate/export the human decisions on CPU, without any model execution")
     parser.add_argument("--smoke-only", action="store_true", help="Run one approved case in A/C/B and print its offline metrics, then stop")
     parser.add_argument("--continue", dest="continue_prepared", action="store_true", help="Continue the successful smoke folder with all A, then all C, then all B")
     args = parser.parse_args(argv)
+    if args.prepared_from and args.continue_prepared:
+        raise ValueError("--prepared-from создаёт новый запуск; для его продолжения используйте только --continue")
     inputs = args.out / "inputs"
     frozen_decisions = inputs / "2026-11-17-decisions.private.json"
-    decisions = (args.decisions or (frozen_decisions if args.continue_prepared else find_decisions())).resolve()
+    prior_decisions = args.prepared_from / "inputs/2026-11-17-decisions.private.json" if args.prepared_from else None
+    decisions = (args.decisions or prior_decisions or (frozen_decisions if args.continue_prepared else find_decisions())).resolve()
     for path in (decisions, args.candidates, args.corpus, args.inventory, args.config):
         if not path.is_file():
             raise ValueError(f"Отсутствует входной файл: {path}")
@@ -106,17 +110,52 @@ def main(argv=None):
     answers = args.out / "public/answers.private.json"
     order = ["photos_only", "bounded_agentic_retrieval", "fixed_retrieval"]
     manifest_path = inputs / "2026-11-17-launch-inputs.private.json"
+    reused_files = {}
+    if args.prepared_from:
+        previous_manifest = args.prepared_from / "inputs/2026-11-17-launch-inputs.private.json"
+        recorded = read(previous_manifest)
+        for path in (args.candidates, args.corpus, args.inventory, args.config):
+            if recorded.get(str(path.resolve())) != file_sha(path):
+                raise ValueError(f"Вход отличается от подготовленного запуска: {path}")
+        for path, expected in recorded.items():
+            if not Path(path).is_file() or file_sha(path) != expected:
+                raise ValueError(f"Подготовленный вход изменился: {path}")
+        if file_sha(decisions) != file_sha(prior_decisions):
+            raise ValueError("Решения отличаются от подготовленного запуска")
+        for folder, plan_folder in (("public", "plan"), ("smoke-public", "smoke-plan")):
+            plan_path = args.prepared_from / plan_folder / "plan.private.json"
+            previous_plan = read(plan_path)
+            for name, key in (("questions.json", "questions_sha256"), ("answers.private.json", "answers_sha256")):
+                path = args.prepared_from / folder / name
+                if file_sha(path) != previous_plan[key]:
+                    raise ValueError(f"Подготовленный экспорт изменился: {path}")
+                reused_files[str(path.resolve())] = file_sha(path)
+            path = args.prepared_from / "archive-index/index.json"
+            if file_sha(path) != previous_plan["execution_contract"]["archive_index_sha256"]:
+                raise ValueError("Подготовленный индекс не соответствует исходному плану")
+            reused_files[str(path.resolve())] = file_sha(path)
+            reused_files[str(plan_path.resolve())] = file_sha(plan_path)
+        reused_files[str(previous_manifest.resolve())] = file_sha(previous_manifest)
     if not args.continue_prepared:
         args.out.mkdir(parents=True)
         inputs.mkdir()
         shutil.copyfile(decisions, frozen_decisions)
-        command(repo, "qa", "review", "--candidates", args.candidates, "--decisions", frozen_decisions,
-                "--reviewed-gallery-only", "--out", args.out / "review")
-        command(repo, "qa", "export", "--review", args.out / "review/reviewed.json", "--out", args.out / "public")
+        if args.prepared_from:
+            for folder in ("public", "smoke-public"):
+                shutil.copytree(args.prepared_from / folder, args.out / folder)
+            (args.out / "archive-index").mkdir()
+            shutil.copyfile(args.prepared_from / "archive-index/index.json", args.out / "archive-index/index.json")
+            print("Готовые экспорты и индекс переиспользованы без инференса; планы будут созданы для текущего кода.", flush=True)
+        else:
+            command(repo, "qa", "review", "--candidates", args.candidates, "--decisions", frozen_decisions,
+                    "--reviewed-gallery-only", "--out", args.out / "review")
+            command(repo, "qa", "export", "--review", args.out / "review/reviewed.json", "--out", args.out / "public")
         sources = [args.candidates, args.corpus, args.inventory, args.config, frozen_decisions, questions, answers]
         if identity:
             sources.append(identity_path)
-        manifest_path.write_text(json.dumps({str(p.resolve()): file_sha(p) for p in sources}, indent=2) + "\n", encoding="utf-8")
+        if args.prepared_from:
+            sources.extend(args.out / name for name in ("archive-index/index.json", "smoke-public/questions.json", "smoke-public/answers.private.json"))
+        manifest_path.write_text(json.dumps({**reused_files, **{str(p.resolve()): file_sha(p) for p in sources}}, indent=2) + "\n", encoding="utf-8")
     else:
         manifest = read(manifest_path)
         if any(str(p.resolve()) not in manifest for p in (args.candidates, args.corpus, args.inventory, args.config)):
@@ -139,8 +178,9 @@ def main(argv=None):
         return 0
     index = args.out / "archive-index/index.json"
     if not args.continue_prepared:
-        command(repo, "www", "archive-index", "--corpus", args.corpus, "--config", args.config,
-                "--out", args.out / "archive-index")
+        if not args.prepared_from:
+            command(repo, "www", "archive-index", "--corpus", args.corpus, "--config", args.config,
+                    "--out", args.out / "archive-index")
         command(repo, "www", "plan", "--questions", questions, "--answers", answers, "--inventory", args.inventory,
                 "--config", args.config, "--archive-index", index, "--include-reviewed", "--conditions", *order,
                 "--condition-major", *identity_args, "--out", args.out / "plan")
@@ -154,8 +194,12 @@ def main(argv=None):
                    and r["view_id"] in (None, q["view_id"]) for r in records)]
         smoke_id = (covered or changes)[0]["question_id"]
         print("\nE2E smoke: один существующий approved вопрос " + smoke_id, flush=True)
-        command(repo, "qa", "export", "--review", args.out / "review/reviewed.json", "--question-id", smoke_id,
-                "--out", args.out / "smoke-public")
+        if args.prepared_from:
+            if [q["question_id"] for q in read(args.out / "smoke-public/questions.json")["questions"]] != [smoke_id]:
+                raise ValueError("Повтор smoke должен использовать тот же заранее выбранный вопрос")
+        else:
+            command(repo, "qa", "export", "--review", args.out / "review/reviewed.json", "--question-id", smoke_id,
+                    "--out", args.out / "smoke-public")
         smoke_questions = args.out / "smoke-public/questions.json"
         smoke_answers = args.out / "smoke-public/answers.private.json"
         command(repo, "www", "plan", "--questions", smoke_questions, "--answers", smoke_answers,

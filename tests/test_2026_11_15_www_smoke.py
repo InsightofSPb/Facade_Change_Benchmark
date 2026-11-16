@@ -23,6 +23,7 @@ class TransportTests(unittest.TestCase):
             {"action": "abstain", "reason": "Синтетическая окклюзия"},
             {"type": "retrieve", "query": "  Preserve spacing  ", "observation_id": "shown-id", "reason": "Check source"},
             {"type": "answer"},
+            {"type": "answer", "action": "answer"},
             {"stage": "answer", "action": "answer", "response": {"answer": "Incomplete synthetic draft"}},
             {"stage": "choose_action", "action": "answer", "response_contract": {"type": "archival_qa", "answer": {}}},
         ]
@@ -45,7 +46,7 @@ class TransportTests(unittest.TestCase):
     def test_ambiguous_or_semantically_incomplete_actions_are_not_repaired(self):
         invalid = [
             {"type": "answer", "action": "retrieve"},
-            {"type": "answer", "action": "answer"},
+            {"type": "retrieve", "action": "abstain", "query": "x", "reason": "conflict"},
             {"stage": "answer", "action": "retrieve", "query": "x"},
             {"action": "retrieve"},
             {"action": "retrieve", "query": ""},
