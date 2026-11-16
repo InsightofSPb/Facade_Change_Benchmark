@@ -37,12 +37,15 @@ def _reference_corpus(labels, corpus_sha256, identity_source=None):
 
 
 def plan(questions_path, answers_path, inventory_path, config, out, *, archive_index=None,
-         allow_empty_archive=False, protocol=None, synthetic=False, identity_map=None):
+         allow_empty_archive=False, protocol=None, synthetic=False, identity_map=None, include_reviewed=False,
+         conditions=runner.CONDITIONS, condition_major=False):
     """Freeze reviewed stratum/cohort membership before any model outcomes exist."""
     fingerprints = Fingerprints()
     identities = runner.archive.identity.Identities(identity_map, fingerprints)
     public, labels = evaluation.approved_cohort(questions_path, answers_path, fingerprints)
     inv = qa.read_bound(inventory_path, fingerprints)
+    if include_reviewed and inv.get("qa_policy", {}).get("id") != curation.rgb_policy.POLICY:
+        raise ValueError("Including the full reviewed cohort requires the explicit RGB QA policy inventory")
     if inv.get("identity_source") != identities.source:
         raise ValueError("Inventory and plan must use the same reviewed identity mapping")
     private = qa.read_bound(answers_path, fingerprints)
@@ -62,22 +65,28 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
     members = []
     for question in public["questions"]:
         view = views.get((question["building_id"], question["view_id"]), {})
-        if not view.get("eligible") or view.get("cohort") not in {"development", "evaluation"}:
+        allowed_cohorts = {"development", "evaluation", "unassigned"} if include_reviewed else {"development", "evaluation"}
+        if not view.get("eligible") or view.get("cohort") not in allowed_cohorts:
             raise ValueError("Cohort includes an unaudited/ineligible building; review inventory/exposure before freezing")
         stratum = labels[question["question_id"]].get("archival_stratum")
         if type(stratum) is not bool:
             raise ValueError("Set reviewed archival_stratum=true/false before running models; no outcome-based stratum selection")
         members.append({"question_id": question["question_id"], "building_id": question["building_id"],
                         "physical_building_id": identities.physical(question["building_id"]),
-                        "cohort": view["cohort"], "archival_stratum": stratum})
+                        "cohort": view["cohort"], "archival_stratum": stratum,
+                        "qa_exposure_status": view.get("qa_exposure_status", view.get("exposure_status")),
+                        "evaluation_eligible": view.get("evaluation_eligible", view["cohort"] == "evaluation")})
         if archive:
             archive.eligible(question)
+    if len(conditions) != len(runner.CONDITIONS) or set(conditions) != set(runner.CONDITIONS):
+        raise ValueError("A paired plan must retain all three conditions, in the declared execution order")
     contract = runner.execution_contract(questions_path, config, archive.sha256 if archive else None,
-                                         runner.CONDITIONS, protocol, budgets, synthetic, identities.source)
+                                         conditions, protocol, budgets, synthetic, identities.source, condition_major)
     journal = new_run(out, {"questions_sha256": sha256(questions_path), "answers_sha256": sha256(answers_path),
         "inventory_sha256": sha256(inventory_path), "execution_contract_sha256": digest(contract)}, "www_cohort_freeze")
     try:
         payload = qa._private("www_cohort_plan", created_at=datetime.now(timezone.utc).isoformat(),
+            cohort_scope="all_reviewed" if include_reviewed else "audited_cohorts",
             qa_preparation_policy=inv.get("qa_policy", {"id": curation.rgb_policy.LEGACY}),
             questions_sha256=sha256(questions_path), answers_sha256=sha256(answers_path), inventory_sha256=sha256(inventory_path),
             execution_contract=contract, archive_corpus_sha256=corpus_sha, cases=members,
@@ -348,9 +357,13 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                 panels.append(section)
                 blind_key.append({"blind_id": blind_id, "question_id": identifier, "condition": condition, **trace})
         summaries, paired = {}, {}
-        for cohort in ("development", "evaluation"):
+        groups = [("development", "development"), ("evaluation", "evaluation")]
+        if plan_doc.get("cohort_scope") == "all_reviewed":
+            groups = [("all_reviewed", None)]
+        for cohort, selected_cohort in groups:
             for stratum in ("all", "archival"):
-                subset = [r for r in rows if r["cohort"] == cohort and (stratum == "all" or r["archival_stratum"])]
+                subset = [r for r in rows if (selected_cohort is None or r["cohort"] == selected_cohort)
+                          and (stratum == "all" or r["archival_stratum"])]
                 key = cohort + "/" + stratum
                 summaries[key] = {}
                 for condition in runner.CONDITIONS:
@@ -359,6 +372,11 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                         family: aggregate([r for r in selected if r["family"] == family]) for family in sorted({r["family"] for r in selected})}}
                 paired[key] = []
                 for a, b in PAIRED_CONTRASTS:
+                    observed = {r["condition"] for r in subset if r["status"] != "missing"}
+                    if subset and contract.get("execution_order") == "conditions_first" and not {a, b} <= observed:
+                        paired[key].append({"contrast": b + " minus " + a, "status": "pending_condition",
+                                            "mean_paired_difference": None, "paired_confidence_intervals": None})
+                        continue
                     left, right = summaries[key][a]["buildings"], summaries[key][b]["buildings"]
                     differences = {name: right[name]["structured_accuracy"] - left[name]["structured_accuracy"] for name in left}
                     paired[key].append({"contrast": b + " minus " + a, "buildings": differences,
@@ -386,15 +404,19 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                                        for r in evaluated["pooled"]["localization"]]
             checked = evaluation._predictions(wrapper, questions, journal.out, fingerprints)
             localization_strata[condition] = {}
-            for cohort in ("development", "evaluation"):
+            for cohort, selected_cohort in groups:
                 for stratum in ("all", "archival"):
-                    ids = [key for key in questions if members[key]["cohort"] == cohort and (stratum == "all" or members[key]["archival_stratum"])]
+                    ids = [key for key in questions if (selected_cohort is None or members[key]["cohort"] == selected_cohort)
+                           and (stratum == "all" or members[key]["archival_stratum"])]
                     values = evaluation._aggregate({k: {**questions[k], "physical_building_id": identities.physical(questions[k]["building_id"])} for k in ids},
                                                   {k: labels[k] for k in ids}, {k: checked[k] for k in ids}, (.25, .5))
                     localization_strata[condition][cohort + "/" + stratum] = [{**r, "physical_event_f1": ratio(2*r["matched"], r["eligible_events"] + r["available_predictions"])} for r in values["localization"]]
         annotation_report = annotation_diagnostics(answers_path, labels, fingerprints)
         annotation_report["synthetic_fixture"] = contract["synthetic_fixture"]
         report = qa._private("www_metrics", primary_endpoint="task-specific structured correctness; free-text semantics require human review",
+            cohort_scope=plan_doc.get("cohort_scope", "audited_cohorts"),
+            frozen_exposure=[{k: member.get(k) for k in ("question_id", "cohort", "qa_exposure_status", "evaluation_eligible")}
+                             for member in members.values()],
             synthetic_fixture=contract["synthetic_fixture"],
             denominator="all predeclared question-condition rows including errors and missing", summaries=summaries,
             aggregation_protocol=plan_doc.get("aggregation_protocol", AGGREGATION),

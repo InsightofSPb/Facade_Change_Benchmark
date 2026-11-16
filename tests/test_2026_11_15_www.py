@@ -345,6 +345,48 @@ class WWWRunnerTest(unittest.TestCase):
             self.assertEqual(row["costs"]["qwen_requests"], 2)
             self.assertEqual(row["costs"]["retrieval_rounds"], 0)
 
+    def test_explicit_nested_final_completes_locally_without_another_model_call(self):
+        public = read_json(self.questions)
+        question = public["questions"][1]
+        write_json(self.questions, {**public, "questions": [question]})
+        envelopes = ({"type": "answer"}, {"stage": "choose_action", "action": "answer"},
+                     {"stage": "answer"}, {}, {"type": "final"})
+        for number, envelope in enumerate(envelopes):
+            class NestedFinal(demo.SyntheticPool):
+                def call(self, role, payload):
+                    if role == "jina":
+                        raise AssertionError("A complete local answer must not trigger retrieval")
+                    scripted = copy.deepcopy(payload)
+                    control = json.loads(scripted["messages"][-1]["content"][0]["text"])
+                    control.update(stage="answer", allowed_action="final")
+                    scripted["messages"][-1]["content"][0]["text"] = json.dumps(control)
+                    response = super().call(role, scripted)
+                    value = json.loads(response["text"])
+                    del value["type"]
+                    response["text"] = json.dumps({**envelope, "final": value})
+                    return response
+
+            with self.subTest(envelope=envelope):
+                name = f"nested-{number}"
+                summary = self.run_fixture(name, pool_factory=NestedFinal, conditions=("bounded_agentic_retrieval",))
+                self.assertEqual(summary["outcome_counts"], {"completed": 1, "abstained": 0, "error": 0})
+                row = read_json(self.root / name / "results.json")["results"][0]
+                self.assertEqual(row["costs"]["qwen_requests"], 1)
+                self.assertEqual(row["costs"]["retrieval_rounds"], 0)
+                folder = self.root / name / "questions" / question["question_id"] / row["condition"]
+                raw = read_json(folder / "final_raw.json")
+                for returned, given in zip(row["answer"]["boxes"], raw["final"]["boxes"]):
+                    self.assertEqual({k: returned[k] for k in given}, given)
+                prepared = read_json(self.root / name / "questions" / question["question_id"] / "preparation.json")
+                evidence = read_json(folder / "exposure.json")["evidence"]
+                common = np.load(Path(prepared["common_support_path"]), allow_pickle=False)
+                support = {"evidence_id": "fixture-support", "geometry": {"crop_shape": list(common.shape)}}
+                for invalid in ({"type": "retrieve", "query": "q", "final": raw["final"]},
+                                {"type": "answer", "final": {}}, {"type": "answer", "final": None},
+                                {**raw, "final": {**raw["final"], "citations": ["unseen"]}}):
+                    with self.assertRaises(ValueError):
+                        runner.validate_answer(invalid, question, evidence, prepared, common, support, runner.PROTOCOL)
+
     def test_complete_stage_final_can_finish_without_redundant_choice(self):
         class DirectFinal(demo.SyntheticPool):
             def call(self, role, payload):
@@ -752,6 +794,29 @@ class WWWRunnerTest(unittest.TestCase):
         question = read_json(self.questions)["questions"][0]
         with self.assertRaisesRegex(ValueError, "no silent temporal truncation"):
             runner._prepare(question, self.root, Fingerprints(), {**runner.PROTOCOL, "max_local_images": 1})
+
+    def test_condition_major_keeps_all_a_then_c_and_checkpoints_before_b(self):
+        order = ("photos_only", "bounded_agentic_retrieval", "fixed_retrieval")
+        original = runner._condition
+
+        def interrupt_before_b(question, condition, *args, **kwargs):
+            if condition == "fixed_retrieval":
+                raise KeyboardInterrupt("synthetic interruption before B")
+            return original(question, condition, *args, **kwargs)
+
+        with patch.object(runner, "_condition", side_effect=interrupt_before_b), self.assertRaises(KeyboardInterrupt):
+            self.run_fixture("partial", conditions=order, condition_major=True)
+        partial = self.root / "partial"
+        rows = read_json(partial / "results.json")["results"]
+        self.assertEqual([r["condition"] for r in rows], [order[0]] * 3 + [order[1]] * 3)
+        self.assertEqual(read_json(partial / "run.json")["status"], "interrupted")
+        self.assertEqual(read_json(partial / "contract.json")["execution_order"], "conditions_first")
+        self.run_fixture("resumed-phases", conditions=order, condition_major=True, resume_from=partial)
+        resumed = read_json(self.root / "resumed-phases/results.json")["results"]
+        self.assertEqual([r["condition"] for r in resumed], [c for c in order for _ in range(3)])
+        self.assertTrue(all(r["costs"]["model_calls"] == 0 for r in resumed[:6]))
+        with self.assertRaisesRegex(ValueError, "Resume .*changed"):
+            self.run_fixture("different-order", conditions=order, resume_from=partial)
 
 
 if __name__ == "__main__":

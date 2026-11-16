@@ -36,6 +36,7 @@ def parser():
     run.add_argument("--protocol", help="Optional frozen JSON evidence limits, not model settings")
     run.add_argument("--resume-from")
     run.add_argument("--identity-map")
+    run.add_argument("--condition-major", action="store_true", help="Run every question in one condition before the next condition")
     demo = commands.add_parser("demo", help="Clearly synthetic CPU fixture; no real model execution")
     inventory = commands.add_parser("inventory", help="CPU inventory of all canonical tracks/splits for archive research")
     inventory.add_argument("--histories", required=True)
@@ -101,6 +102,9 @@ def parser():
     plan.add_argument("--allow-empty-archive", action="store_true")
     plan.add_argument("--protocol")
     plan.add_argument("--identity-map")
+    plan.add_argument("--include-reviewed", action="store_true", help="Freeze all eligible approved RGB QA cases, preserving unknown exposure")
+    plan.add_argument("--conditions", nargs="+", choices=module("runner").CONDITIONS, default=module("runner").CONDITIONS)
+    plan.add_argument("--condition-major", action="store_true")
     score = commands.add_parser("score", help="Offline primary metrics, qa localization, known-support and blind review")
     score.add_argument("--questions", required=True)
     score.add_argument("--answers", required=True)
@@ -143,7 +147,8 @@ def main(argv=None):
             elif args.action == "run":
                 result = module("runner").run(args.questions, load_config(args.config), args.out,
                     archive_index=args.archive_index, allow_empty_archive=args.allow_empty_archive, conditions=args.conditions,
-                    protocol=read_json(args.protocol) if args.protocol else None, resume_from=args.resume_from, progress=progress, identity_map=args.identity_map)
+                    protocol=read_json(args.protocol) if args.protocol else None, resume_from=args.resume_from, progress=progress,
+                    identity_map=args.identity_map, condition_major=args.condition_major)
             elif args.action == "inventory":
                 result = module("curation").inventory(args.histories, args.out, candidates_path=args.candidates,
                     exposure_path=args.exposure_audit, addresses_path=args.addresses, identity_map=args.identity_map,
@@ -184,6 +189,7 @@ def main(argv=None):
                     args.run, args.out, questions_path=args.questions, costs_only=True, progress=progress)
             elif args.action == "plan":
                 result = module("evaluation").plan(args.questions, args.answers, args.inventory, load_config(args.config), args.out,
+                    include_reviewed=args.include_reviewed, conditions=args.conditions, condition_major=args.condition_major,
                     archive_index=args.archive_index, allow_empty_archive=args.allow_empty_archive,
                     protocol=read_json(args.protocol) if args.protocol else None, identity_map=args.identity_map)
             elif args.action == "score":

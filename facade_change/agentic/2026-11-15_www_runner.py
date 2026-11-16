@@ -257,7 +257,8 @@ def parse_reply(raw, normalizations=None):
     if not isinstance(value, dict):
         raise ValueError("Expected one JSON object")
     value = copy.deepcopy(value)
-    if value.get("type") == "final" and "boxes" not in value:
+    if (value.get("type") == "final" and "boxes" not in value
+            and not {"final", "response", "response_contract"} & set(value)):
         value["boxes"] = []
         changes.append("defaulted_omitted_optional_boxes")
     return value
@@ -353,6 +354,25 @@ def normalize_final(value, normalizations=None):
     changes = normalizations if normalizations is not None else []
     if not isinstance(value, dict):
         raise ValueError("final must be one JSON object")
+    if "final" in value:
+        if (set(value) - {"final", "stage", "action", "type", "reason"}
+                or value.get("stage") not in (None, "choose_action", "answer")
+                or value.get("action") not in (None, "answer")
+                or value.get("type") not in (None, "answer", "final")):
+            raise ValueError("A final envelope must contain one answer, without a conflicting action or extra arguments")
+        if "reason" in value and (not isinstance(value["reason"], str) or not value["reason"].strip()
+                                  or len(value["reason"]) > 2000):
+            raise ValueError("Final envelope reason must be a concise, nonempty string")
+        value = copy.deepcopy(value["final"])
+        if not isinstance(value, dict):
+            raise ValueError("The final envelope must contain a JSON answer object")
+        changes.append("unwrapped_explicit_final")
+        if "type" not in value:
+            value["type"] = "final"
+            changes.append("explicit_final_envelope_to_final_type")
+        if "boxes" not in value:
+            value["boxes"] = []
+            changes.append("defaulted_omitted_optional_boxes")
     if value.get("stage") == "answer":
         if value.get("action", "answer") != "answer" or value.get("type", "final") != "final":
             raise ValueError("Final stage conflicts with type/action")
@@ -736,7 +756,7 @@ def _condition(question, condition, prepared, local, common, support_record, sea
             try:
                 value = parse_reply(raw, parsing["normalizations"])
                 parsing["parsed"] = value
-                final_reply = (value.get("type") == "final" or
+                final_reply = (value.get("type") == "final" or "final" in value or
                                (value.get("stage") == "answer" and "decision" in value))
                 if stage == "answer" or final_reply:
                     value = normalize_final(value, parsing["normalizations"])
@@ -805,21 +825,24 @@ def _overlay(out, box, record, index, *, reviewed=False):
     return path
 
 
-def execution_contract(path, config, archive_sha, conditions, protocol, budgets, synthetic=False, identity_source=None):
+def execution_contract(path, config, archive_sha, conditions, protocol, budgets, synthetic=False, identity_source=None,
+                       condition_major=False):
     source_files = [Path(__file__), Path(archive.__file__), Path(qa.__file__)] + [Path(__file__).with_name(name + ".py")
                     for name in ("models", "model_worker", "reasoning", "coordinates", "store", "retrieval", "config", "2026-11-16_www_identity")]
     return {"schema_version": 1, "questions_sha256": sha256(path), "archive_index_sha256": archive_sha,
         "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
+        "execution_order": "conditions_first" if condition_major else "questions_first",
         "prompt_revision": PROMPT_REVISION, "prompt_sha256": digest(SYSTEM),
         "agentic_action_protocol": "model-selected retrieve/answer/abstain or complete final; final-only after retrieval cap; all calls charged to unchanged budgets",
-        "action_transport_revision": "2026-11-17-stage-draft-checked-shape-v3",
+        "action_transport_revision": "2026-11-17-explicit-nested-final-v4",
         "implementation_sha256": {p.name: sha256(p) for p in source_files},
         "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []},
         **({"identity_source": identity_source} if identity_source else {})}
 
 
 def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=False, conditions=CONDITIONS,
-        protocol=None, resume_from=None, pool_factory=None, synthetic=False, progress=None, identity_map=None):
+        protocol=None, resume_from=None, pool_factory=None, synthetic=False, progress=None, identity_map=None,
+        condition_major=False):
     path = Path(questions_path).expanduser().resolve()
     public = public_questions(path)
     if not public["questions"] or not conditions or len(set(conditions)) != len(conditions) or set(conditions) - set(CONDITIONS):
@@ -838,7 +861,8 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
             search.eligible(question)
             if set(search.records) & {r["observation_id"] for r in question["observations"]}:
                 raise ValueError("Archive/local evidence ID collision; fix the public source IDs before inference")
-    contract = execution_contract(path, config, search.sha256 if search else None, conditions, protocol, budgets, synthetic, identities.source)
+    contract = execution_contract(path, config, search.sha256 if search else None, conditions, protocol, budgets,
+                                  synthetic, identities.source, condition_major)
     if resume_from:
         old = Path(resume_from).expanduser().resolve()
         if read_json(old / "run.json").get("status") not in {"completed", "completed_with_errors", "failed", "interrupted"}:
@@ -856,21 +880,31 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
         with factory({r: config["models"][r] for r in ("qwen", "jina") if r in config["models"]}, journal.out / "workers",
                      gpu_mode=config["gpu_mode"], timeout=config["worker_timeout"], cache_dir=config["cache_root"]) as pool:
             pool.progress = progress
-            for number, question in enumerate(public["questions"], 1):
+            work = [(number, question, conditions) for number, question in enumerate(public["questions"], 1)]
+            if condition_major:
+                work = [(number, question, (condition,)) for condition in conditions
+                        for number, question in enumerate(public["questions"], 1)]
+            prepared_cases = {}
+            for number, question, case_conditions in work:
                 base = journal.out / "questions" / question["question_id"]
-                base.mkdir(parents=True)
-                journal.event("case_started", case_id=question["question_id"], index=number, total=len(public["questions"]))
-                try:
-                    prepared, local, common, support_record = _prepare(question, base, fingerprints, protocol)
-                    journal.event("case_prepared", case_id=question["question_id"], status="completed")
-                except (OSError, ValueError, KeyError) as exc:
-                    for condition in conditions:
+                if question["question_id"] not in prepared_cases:
+                    base.mkdir(parents=True)
+                    journal.event("case_started", case_id=question["question_id"], index=number, total=len(public["questions"]))
+                    try:
+                        prepared_cases[question["question_id"]] = _prepare(question, base, fingerprints, protocol)
+                        journal.event("case_prepared", case_id=question["question_id"], status="completed")
+                    except (OSError, ValueError, KeyError) as exc:
+                        prepared_cases[question["question_id"]] = exc
+                        journal.event("case_failed", case_id=question["question_id"], error=str(exc))
+                cached_preparation = prepared_cases[question["question_id"]]
+                if isinstance(cached_preparation, Exception):
+                    for condition in case_conditions:
                         results.append({"question_id": question["question_id"], "task": question["task"], "condition": condition,
                             "building_id": question["building_id"], "split": question["split"], "status": "error", "decision": None,
-                            "answer": None, "error": "preparation: " + str(exc), "costs": {}})
-                    journal.event("case_failed", case_id=question["question_id"], error=str(exc))
+                            "answer": None, "error": "preparation: " + str(cached_preparation), "costs": {}})
                     continue
-                for condition in conditions:
+                prepared, local, common, support_record = cached_preparation
+                for condition in case_conditions:
                     destination = base / condition
                     journal.event("mode_started", case_id=question["question_id"], mode=condition)
                     prior = Path(resume_from) / "questions" / question["question_id"] / condition if resume_from else None
@@ -902,6 +936,9 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
                     sections.append({"title": question["question_id"] + " / " + condition, "caption": json.dumps({
                         "question": question["question"], "status": result["status"], "answer": result.get("answer"),
                         "error": result.get("error"), "costs": {k: v for k, v in result["costs"].items() if k != "calls"}}, ensure_ascii=False), "panels": panels})
+                if condition_major and number == len(public["questions"]):
+                    write_json(journal.out / "results.json", {"kind": "www_public_answers", "questions_sha256": sha256(path),
+                        "contract_sha256": digest(contract), "conditions": list(conditions), "results": results})
         write_json(journal.out / "results.json", {"kind": "www_public_answers", "questions_sha256": sha256(path),
             "contract_sha256": digest(contract), "conditions": list(conditions), "results": results})
         for condition in conditions:
@@ -932,6 +969,8 @@ def run(questions_path, config, out, *, archive_index=None, allow_empty_archive=
         complete_run(journal, summary["status"], summary=summary)
         return summary
     except BaseException as exc:
+        write_json(journal.out / "results.json", {"kind": "www_public_answers", "questions_sha256": sha256(path),
+            "contract_sha256": digest(contract), "conditions": list(conditions), "results": results})
         complete_run(journal, "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", error=str(exc))
         raise
     finally:

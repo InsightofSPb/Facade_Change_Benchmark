@@ -394,7 +394,7 @@ def _checked_label(case, label, fingerprints):
     return result
 
 
-def review(candidates_path, decisions_path, out, previous=None):
+def review(candidates_path, decisions_path, out, previous=None, *, reviewed_gallery_only=False):
     fingerprints = Fingerprints()
     candidates = _load_candidates(candidates_path, fingerprints)
     candidate_sha = sha256(candidates_path)
@@ -414,7 +414,8 @@ def review(candidates_path, decisions_path, out, previous=None):
     cases = {r["question_id"]: r for r in candidates["candidates"]}
     journal = new_run(out, {"candidates": str(Path(candidates_path).resolve()), "candidate_sha256": candidate_sha,
                            "previous": str(Path(previous).resolve()) if previous else None,
-                           "decisions": str(Path(decisions_path).resolve())}, "facade_qa_review")
+                           "decisions": str(Path(decisions_path).resolve()),
+                           "reviewed_gallery_only": reviewed_gallery_only}, "facade_qa_review")
     try:
         touched = set()
         for decision in supplied["decisions"]:
@@ -454,7 +455,9 @@ def review(candidates_path, decisions_path, out, previous=None):
                           candidates_path=str(Path(candidates_path).resolve()), history=history, states=states,
                           input_sha256=fingerprints.files)
         write_json(journal.out / "reviewed.json", result)
-        _review_view(journal.out, candidates["candidates"], states)
+        gallery_cases = ([case for case in candidates["candidates"] if case["question_id"] in states]
+                         if reviewed_gallery_only else candidates["candidates"])
+        _review_view(journal.out, gallery_cases, states)
         fingerprints.verify()
         summary = {"status": "completed", **{status: sum(r.get("status", "candidate") == status for r in
             [states.get(case["question_id"], {}) for case in candidates["candidates"]]) for status in ("candidate", "approved", "rejected")}}
@@ -491,7 +494,7 @@ def validate_public(document):
     return document
 
 
-def export(review_path, out):
+def export(review_path, out, *, question_ids=None):
     fingerprints = Fingerprints()
     _verify_recorded_artifacts(Path(review_path).resolve().parent, fingerprints.files)
     reviewed = read_bound(review_path, fingerprints)
@@ -501,12 +504,17 @@ def export(review_path, out):
         fingerprints.add(item["path"], item["sha256"])
     fingerprints.add(reviewed["candidates_path"], reviewed["candidate_sha256"])
     candidates = _load_candidates(reviewed["candidates_path"], fingerprints)
-    journal = new_run(out, {"review": str(Path(review_path).resolve()), "review_sha256": sha256(review_path)}, "facade_qa_export")
+    selected = set(question_ids) if question_ids is not None else None
+    approved = {key for key, state in reviewed["states"].items() if state.get("status") == "approved"}
+    if selected is not None and (not selected or not selected <= approved):
+        raise ValueError("Export selection must contain only existing human-approved question IDs")
+    journal = new_run(out, {"review": str(Path(review_path).resolve()), "review_sha256": sha256(review_path),
+                           "selected_question_ids": sorted(selected) if selected is not None else None}, "facade_qa_export")
     try:
         questions, labels = [], []
         for case in candidates["candidates"]:
             decision = reviewed["states"].get(case["question_id"], {})
-            if decision.get("status") != "approved":
+            if decision.get("status") != "approved" or selected is not None and case["question_id"] not in selected:
                 continue
             label = _checked_label(case, decision["label"], fingerprints)
             for observation in case["observations"]:
@@ -552,8 +560,10 @@ def main(argv=None):
     rev.add_argument("--candidates", required=True)
     rev.add_argument("--decisions", required=True)
     rev.add_argument("--previous")
+    rev.add_argument("--reviewed-gallery-only", action="store_true", help="Render only reviewed rows; retain original candidate binding and all decisions")
     exp = commands.add_parser("export")
     exp.add_argument("--review", required=True)
+    exp.add_argument("--question-id", action="append", help="Optional explicit subset of the existing approved review")
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--questions", required=True)
     evaluate.add_argument("--answers", required=True)
@@ -570,9 +580,10 @@ def main(argv=None):
                     knowledge_cutoff=args.knowledge_cutoff, task_mode=args.task_mode, available_at=args.available_at,
                     damage_categories=args.damage_categories, splits=args.splits)
             elif args.action == "review":
-                result = review(args.candidates, args.decisions, args.out, args.previous)
+                result = review(args.candidates, args.decisions, args.out, args.previous,
+                                reviewed_gallery_only=args.reviewed_gallery_only)
             elif args.action == "export":
-                result = export(args.review, args.out)
+                result = export(args.review, args.out, question_ids=args.question_id)
             elif args.action == "evaluate":
                 module = importlib.import_module(".2026-11-10_qa_evaluation", __package__)
                 result = module.evaluate(args.questions, args.answers, args.predictions, args.out, args.iou)

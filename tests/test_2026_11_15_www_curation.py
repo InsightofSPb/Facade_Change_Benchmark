@@ -3,8 +3,11 @@ import copy
 import importlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from facade_change.history_features import Fingerprints
 from facade_change.io import read_json, sha256, write_json
@@ -85,7 +88,8 @@ class ReviewAndMetricsTest(unittest.TestCase):
                               "reviewer": "synthetic_only", "private_notes": "Explicit fixture, no human data", "label": label})
         decision_path = self.root / "decisions.private.json"
         write_json(decision_path, {"candidate_sha256": sha256(self.candidates), "decisions": decisions})
-        qa.review(self.candidates, decision_path, self.root / "review")
+        qa.review(self.candidates, decision_path, self.root / "review", reviewed_gallery_only=True)
+        self.assertEqual(len(read_json(self.root / "review/reviewed.json")["states"]), 5)
         qa.export(self.root / "review/reviewed.json", self.root / "export")
         questions, answers = self.root / "export/questions.json", self.root / "export/answers.private.json"
         demo.archive.import_archive(self.package, self.root / "archive")
@@ -93,6 +97,121 @@ class ReviewAndMetricsTest(unittest.TestCase):
         index = self.root / "index/index.json"
         metrics.plan(questions, answers, self.inventory, self.config, self.root / "plan", archive_index=index, synthetic=True)
         return questions, answers, index
+
+    def test_all_reviewed_rgb_plan_preserves_unknown_exposure_and_scores_every_case(self):
+        questions, answers, index = self.approve()
+        order = ("photos_only", "bounded_agentic_retrieval", "fixed_retrieval")
+        with self.assertRaisesRegex(ValueError, "explicit RGB QA policy"):
+            metrics.plan(questions, answers, self.inventory, self.config, self.root / "invalid-legacy",
+                         archive_index=index, synthetic=True, include_reviewed=True)
+        curation.inventory(self.histories, self.root / "rgb", candidates_path=self.candidates,
+                           qa_policy=curation.rgb_policy.POLICY)
+        inventory = self.root / "rgb/inventory.json"
+        before = sha256(inventory)
+        with self.assertRaisesRegex(ValueError, "unaudited/ineligible"):
+            metrics.plan(questions, answers, inventory, self.config, self.root / "strict",
+                         archive_index=index, synthetic=True)
+        metrics.plan(questions, answers, inventory, self.config, self.root / "all-plan",
+                     archive_index=index, synthetic=True, include_reviewed=True, conditions=order, condition_major=True)
+        plan = self.root / "all-plan/plan.private.json"
+        frozen = read_json(plan)
+        self.assertEqual(frozen["cohort_scope"], "all_reviewed")
+        self.assertEqual({r["cohort"] for r in frozen["cases"]}, {"unassigned"})
+        self.assertTrue(all(r["qa_exposure_status"] == "unknown" and not r["evaluation_eligible"] for r in frozen["cases"]))
+        self.assertEqual(sha256(inventory), before)
+        demo.runner.run(questions, self.config, self.root / "run", archive_index=index,
+                        pool_factory=demo.SyntheticPool, synthetic=True, conditions=order, condition_major=True)
+        metrics.score(questions, answers, self.root / "run", plan, self.root / "all-score")
+        report = read_json(self.root / "all-score/metrics.private.json")
+        self.assertEqual(len(report["cases"]), 15)
+        for condition in demo.runner.CONDITIONS:
+            self.assertEqual(report["summaries"]["all_reviewed/all"][condition]["questions"], 5)
+        self.assertEqual(len(report["paired_building_differences"]["all_reviewed/all"]), 3)
+        self.assertTrue(all(not r["evaluation_eligible"] for r in report["frozen_exposure"]))
+        bad = read_json(inventory)
+        for view in bad["views"]:
+            view["eligible"] = False
+        write_json(self.root / "ineligible.json", bad)
+        with self.assertRaisesRegex(ValueError, "unaudited/ineligible"):
+            metrics.plan(questions, answers, self.root / "ineligible.json", self.config, self.root / "bad-plan",
+                         archive_index=index, synthetic=True, include_reviewed=True)
+
+    def test_cpu_launcher_preserves_approved_ids_and_stops_before_models(self):
+        questions, _, _ = self.approve()
+        identity = self.root / "identity.json"
+        write_json(identity, {"schema_version": 1, "kind": "www_physical_identity_review", "groups": []})
+        curation.inventory(self.histories, self.root / "rgb", candidates_path=self.candidates,
+                           qa_policy=curation.rgb_policy.POLICY, identity_map=identity)
+        config = self.root / "config.json"
+        write_json(config, self.config)
+        script = Path(__file__).resolve().parents[1] / "scripts/2026-11-17-run-approved-www.py"
+        source = self.root / "decisions.private.json"
+        original = sha256(source)
+        argv = [sys.executable, str(script), "--decisions", str(source), "--candidates", str(self.candidates),
+                "--corpus", str(self.root / "archive/corpus.json"), "--inventory", str(self.root / "rgb/inventory.json"),
+                "--config", str(config), "--prepare-only"]
+        out = self.root / "launch"
+        result = subprocess.run(argv + ["--out", str(out), "--expected-approved", "5"],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sha256(source), original)
+        self.assertEqual(sha256(out / "inputs/2026-11-17-decisions.private.json"), original)
+        expected = {q["question_id"] for q in read_json(questions)["questions"]}
+        self.assertEqual({q["question_id"] for q in read_json(out / "public/questions.json")["questions"]}, expected)
+        self.assertFalse((out / "archive-index").exists())
+        self.assertFalse((out / "inference").exists())
+        bad = self.root / "wrong-count"
+        result = subprocess.run(argv + ["--out", str(bad), "--expected-approved", "4"],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(bad.exists())
+
+    def test_one_case_export_keeps_reference_and_supports_full_e2e_scoring(self):
+        questions, answers, index = self.approve()
+        original = read_json(answers)
+        identifier = next(q["question_id"] for q in read_json(questions)["questions"] if q["region_id"] == "change")
+        qa.export(self.root / "review/reviewed.json", self.root / "smoke-public", question_ids=[identifier])
+        subset = read_json(self.root / "smoke-public/answers.private.json")
+        self.assertEqual(subset["cases"], [r for r in original["cases"] if r["question_id"] == identifier])
+        self.assertEqual(subset["review_source"], original["review_source"])
+        smoke_q = self.root / "smoke-public/questions.json"
+        smoke_a = self.root / "smoke-public/answers.private.json"
+        order = ("photos_only", "bounded_agentic_retrieval", "fixed_retrieval")
+        metrics.plan(smoke_q, smoke_a, self.inventory, self.config, self.root / "smoke-plan", archive_index=index,
+                     synthetic=True, conditions=order, condition_major=True)
+        demo.runner.run(smoke_q, self.config, self.root / "smoke", archive_index=index,
+                        pool_factory=demo.SyntheticPool, synthetic=True, conditions=order, condition_major=True)
+        metrics.score(smoke_q, smoke_a, self.root / "smoke", self.root / "smoke-plan/plan.private.json", self.root / "smoke-score")
+        report = read_json(self.root / "smoke-score/metrics.private.json")
+        self.assertEqual(len(report["cases"]), 3)
+        self.assertTrue(all(row["correct"] for row in report["cases"]))
+        with self.assertRaisesRegex(ValueError, "human-approved"):
+            qa.export(self.root / "review/reviewed.json", self.root / "bad-subset", question_ids=["not-approved"])
+
+    def test_interrupted_condition_pass_scores_ac_and_marks_b_comparisons_pending(self):
+        questions, answers, index = self.approve()
+        order = ("photos_only", "bounded_agentic_retrieval", "fixed_retrieval")
+        metrics.plan(questions, answers, self.inventory, self.config, self.root / "phased-plan",
+                     archive_index=index, synthetic=True, conditions=order, condition_major=True)
+        original = demo.runner._condition
+
+        def before_b(question, condition, *args, **kwargs):
+            if condition == "fixed_retrieval":
+                raise KeyboardInterrupt("synthetic stop before B")
+            return original(question, condition, *args, **kwargs)
+
+        with patch.object(demo.runner, "_condition", side_effect=before_b), self.assertRaises(KeyboardInterrupt):
+            demo.runner.run(questions, self.config, self.root / "partial", archive_index=index,
+                            pool_factory=demo.SyntheticPool, synthetic=True, conditions=order, condition_major=True)
+        metrics.score(questions, answers, self.root / "partial", self.root / "phased-plan/plan.private.json",
+                      self.root / "partial-score")
+        report = read_json(self.root / "partial-score/metrics.private.json")
+        self.assertEqual(len(report["cases"]), 15)
+        self.assertEqual(report["summaries"]["development/all"]["fixed_retrieval"]["outcome_counts"], {"missing": 5})
+        pairs = report["paired_building_differences"]["development/all"]
+        self.assertEqual(sum(p.get("status") == "pending_condition" for p in pairs), 2)
+        ac = next(p for p in pairs if p["contrast"] == "bounded_agentic_retrieval minus photos_only")
+        self.assertIsNotNone(ac["mean_paired_difference"])
 
     def test_reviewed_endpoint_costs_support_and_all_error_denominators(self):
         questions, answers, index = self.approve()
