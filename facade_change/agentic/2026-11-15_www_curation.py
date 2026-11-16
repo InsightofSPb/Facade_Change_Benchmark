@@ -477,7 +477,10 @@ def proposals(case, fingerprints, annotation_index=None):
 
 
 def review_page(candidates_path, selection_path, out, *, handoff_path=None, previous=None,
-                archive_corpus=None, identity_map=None, private_audit=None, inventory_path=None, progress=None):
+                archive_corpus=None, identity_map=None, private_audit=None, inventory_path=None,
+                private_audit_supplement=None, progress=None):
+    if private_audit_supplement and not private_audit:
+        raise ValueError("--private-audit-supplement requires the original --private-audit gallery package")
     fingerprints = Fingerprints()
     candidates, rows = selected_cases(candidates_path, selection_path, fingerprints)
     selection = qa.read_bound(selection_path, fingerprints)
@@ -508,7 +511,7 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
             pending = importlib.import_module(".2026-11-16_www_private_audit", __package__).export(
                 private_audit, journal.out / "pending-audit", candidates_path=candidates_path,
                 inventory_path=inventory_path, archive_corpus=archive_corpus, identity_map=identity_map,
-                handoff_path=handoff_path, previous=previous, progress=progress)
+                handoff_path=handoff_path, previous=previous, supplement_path=private_audit_supplement, progress=progress)
         sources, items, sections = {}, [], []
         for number, case in enumerate(rows, 1):
             journal.event("case_started", case_id=case["question_id"], index=number, total=len(rows))
@@ -595,8 +598,11 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
 
 def review_package(candidates_path, histories, archive_corpus, out, *, identity_map=None, exposure_path=None,
                    exposed_questions=(), handoff_path=None, preserved_selection=None, previous=None,
-                   targets=None, per_building=12, seed="2026-11-16-www-review-v1", private_audit=None, progress=None):
+                   targets=None, per_building=12, seed="2026-11-16-www-review-v1", private_audit=None,
+                   private_audit_supplement=None, progress=None):
     """CPU orchestration of the existing inventory/batch/editor; never reads model outcomes."""
+    if private_audit_supplement and not private_audit:
+        raise ValueError("--private-audit-supplement requires the original --private-audit gallery package")
     targets = dict(REVIEW_TARGETS if targets is None else targets)
     if bool(handoff_path) != bool(preserved_selection):
         raise ValueError("Preserve the original human handoff together with its bound selection")
@@ -638,7 +644,8 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
         journal.event("review_stage", stage="экспорт датированных RGB и архивных источников для приватного review")
         reviewed = review_page(candidates_path, journal.out / "batch/selection.private.json", journal.out / "review",
             archive_corpus=archive_corpus, identity_map=identity_path, private_audit=private_audit,
-            inventory_path=journal.out / "inventory/inventory.json", handoff_path=handoff_path, progress=progress)
+            inventory_path=journal.out / "inventory/inventory.json", handoff_path=handoff_path,
+            private_audit_supplement=private_audit_supplement, progress=progress)
         if handoff_path:
             journal.event("review_stage", stage="сохранение прежних человеческих решений отдельным разделом")
             preserved = review_page(candidates_path, preserved_selection, journal.out / "preserved-review",

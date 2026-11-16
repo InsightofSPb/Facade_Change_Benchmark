@@ -69,6 +69,7 @@ def parser():
     review.add_argument("--archive-corpus")
     review.add_argument("--identity-map")
     review.add_argument("--private-audit")
+    review.add_argument("--private-audit-supplement", help="V4.1 metadata handoff, alongside the original --private-audit gallery")
     review.add_argument("--inventory")
     package = commands.add_parser("review-package", help="CPU inventory, target selection and private local/archive review; no approvals")
     package.add_argument("--candidates", required=True)
@@ -82,6 +83,7 @@ def parser():
     package.add_argument("--previous")
     package.add_argument("--targets")
     package.add_argument("--private-audit")
+    package.add_argument("--private-audit-supplement", help="V4.1 metadata handoff; exposed privately without automatic coordinate transfer")
     package.add_argument("--per-building", type=int, default=12)
     package.add_argument("--seed", default="2026-11-16-www-review-v1")
     plan = commands.add_parser("plan", help="Freeze approved cohort/strata/model contract before model execution")
@@ -100,6 +102,7 @@ def parser():
     score.add_argument("--plan", required=True)
     pending = commands.add_parser("archive-audit-review", help="Private pending archive panels; independent of batch eligibility, CPU only")
     pending.add_argument("--private-audit", required=True, help="Local directory or ZIP; supplied scripts are never executed")
+    pending.add_argument("--private-audit-supplement", help="Supplementary ZIP/directory without gallery images; all files exposed for review")
     pending.add_argument("--candidates")
     pending.add_argument("--inventory")
     pending.add_argument("--archive-corpus")
@@ -148,18 +151,19 @@ def main(argv=None):
             elif args.action == "review-page":
                 result = module("curation").review_page(args.candidates, args.selection, args.out,
                     handoff_path=args.handoff, previous=args.previous, archive_corpus=args.archive_corpus,
-                    identity_map=args.identity_map, private_audit=args.private_audit, inventory_path=args.inventory, progress=progress)
+                    identity_map=args.identity_map, private_audit=args.private_audit, inventory_path=args.inventory,
+                    private_audit_supplement=args.private_audit_supplement, progress=progress)
             elif args.action == "review-package":
                 result = module("curation").review_package(args.candidates, args.histories, args.archive_corpus, args.out,
                     identity_map=args.identity_map, exposure_path=args.exposure_audit, exposed_questions=args.exposed_questions,
                     handoff_path=args.handoff, preserved_selection=args.preserved_selection, previous=args.previous,
                     targets=read_json(args.targets) if args.targets else None, per_building=args.per_building, seed=args.seed,
-                    private_audit=args.private_audit, progress=progress)
+                    private_audit=args.private_audit, private_audit_supplement=args.private_audit_supplement, progress=progress)
             elif args.action == "archive-audit-review":
                 result = importlib.import_module(".2026-11-16_www_private_audit", __package__).export(
                     args.private_audit, args.out, candidates_path=args.candidates, inventory_path=args.inventory,
                     archive_corpus=args.archive_corpus, identity_map=args.identity_map,
-                    handoff_path=args.handoff, previous=args.previous, progress=progress)
+                    handoff_path=args.handoff, previous=args.previous, supplement_path=args.private_audit_supplement, progress=progress)
             elif args.action == "audit":
                 result = importlib.import_module(".2026-11-16_www_factual", __package__).audit(
                     args.run, args.out, questions_path=args.questions, candidates_path=args.candidates,

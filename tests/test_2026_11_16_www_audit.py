@@ -43,6 +43,38 @@ def private_fixture(root, case):
     return root
 
 
+def flat_private_fixture(root, cases):
+    """Real reported schema/counts, entirely synthetic images, IDs and provenance."""
+    root.mkdir()
+    assets, data = {}, {}
+    for i in range(41):
+        key = f"synthetic-flat-{i:02d}"
+        path = root / (key + ".png")
+        size = (1110, 640) if i == 0 else (32, 24)
+        Image.new("RGB", size, (i, 80, 160)).save(path)
+        assets[key] = {"sha256": sha256(path), "width": size[0], "height": size[1],
+            "label": "Synthetic native photo " + str(i), "evidence_id": "fixture-archive-b1",
+            "capture_date": "2013", "precision": "year", "source_url": "https://example.invalid/synthetic",
+            "note": "Fixture metadata, not a real survey image", "source_workspace_path": str(path),
+            "delivery_location": private.GALLERY + "#asset-data", "extra_field": {"retained": i}}
+        data[key] = "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode()
+    write_json(root / private.REGISTER, assets)
+    (root / private.GALLERY).write_text('<script id="asset-data" type="application/json">' + json.dumps(data) + '</script>')
+    rows = []
+    for i in range(13):
+        case = cases[i % 7]
+        rows.append({"review_id": f"synthetic-flat-R-{i:02d}", "building_group": "Synthetic-proposed-group",
+            "inventory_ids": [case["building_id"]], "local_view_ids": [case["view_id"]],
+            "local_region_ids": [case["region_id"]] if i < 8 else [],
+            "question_ids": [case["question_id"]] if i < 8 else [],
+            "category": "damage_or_repair_question" if i < 8 else "architectural_alteration",
+            "proposed_question": "A different proposed comparison; never replace the existing context question",
+            "uncertainty": "Synthetic pending correspondence", "panels": [
+                {"asset": f"synthetic-flat-{3*i+j:02d}", "box_xyxy": [1, 2, 20, 22]} for j in range(3)]})
+    write_json(root / private.PROPOSALS, {"synthetic_fixture": True, "rows": rows})
+    return root
+
+
 class PrivateArchiveAuditTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -135,6 +167,10 @@ class PrivateArchiveAuditTests(unittest.TestCase):
         self.assertEqual(private.export(zipped, self.root / "zip-review")["pending"], 13)
 
     def test_pending_review_survives_zero_batch_and_explains_cross_split_guard(self):
+        proposals = read_json(self.private / private.PROPOSALS)
+        for row in proposals["rows"][7:]:
+            row["inventory_ids"] = [row.pop("building_id")]
+        write_json(self.private / private.PROPOSALS, proposals)
         identity_path = self.root / "identities.json"
         mapping = demo.archive.identity.template()
         mapping["groups"][0].update(decision="same_building", reviewer="synthetic_human", rationale="Fixture only",
@@ -154,12 +190,126 @@ class PrivateArchiveAuditTests(unittest.TestCase):
         self.assertEqual(item["decision"], "pending")
         # The existing package has no eligible fixture views without an exposure
         # audit. Its independent pending section must still retain all 13 rows.
+        supplement = self.root / "supplement"
+        supplement.mkdir()
+        (supplement / "comparison-cards.md").write_text("Synthetic V4.1 comparison card, pending")
         result = curation.review_package(self.candidates, self.root / "fixture/inputs/histories", self.corpus,
-            self.root / "package-review", private_audit=self.private)
+            self.root / "package-review", private_audit=self.private, private_audit_supplement=supplement)
         self.assertEqual(result["selected"], 0)
         self.assertEqual(result["shortfall"], 100)
         self.assertEqual(result["pending_private_audit"]["pending"], 13)
+        self.assertEqual(result["pending_private_audit"]["supplement_files"], 1)
         self.assertIn("pending-audit/index.html", (self.root / "package-review/index.html").read_text())
+
+    def test_flat_register_plural_ids_link_only_existing_question_context(self):
+        package = flat_private_fixture(self.root / "flat", self.cases)
+        zipped = self.root / "2026-11-16-www-v4-private-region-review.zip"
+        with zipfile.ZipFile(zipped, "w") as bundle:
+            for name in (private.PROPOSALS, private.REGISTER, private.GALLERY):
+                bundle.write(package / name, name)
+        before = {p: p.read_bytes() for p in (self.candidates, package / private.REGISTER, package / private.PROPOSALS)}
+        summary = private.export(zipped, self.root / "flat-review", candidates_path=self.candidates, archive_corpus=self.corpus)
+        self.assertEqual([summary[k] for k in ("assets", "panels", "invalid_panels", "pending", "linked_candidate_rows",
+            "unique_linked_questions", "unresolved_candidate_links", "approved")], [41, 39, 0, 13, 8, 7, 5, 0])
+        result = read_json(self.root / "flat-review/audit.private.json")
+        for key, original in read_json(package / private.REGISTER).items():
+            normalized = result["assets"][key]
+            self.assertEqual({k: normalized[k] for k in original}, original)
+            self.assertEqual(normalized["provenance"]["source_fields"]["source_workspace_path"], original["source_workspace_path"])
+            self.assertEqual(sha256(self.root / "flat-review" / normalized["src"]), original["sha256"])
+        self.assertEqual((self.root / "flat-review/source.private" / private.REGISTER).read_bytes(), before[package / private.REGISTER])
+        self.assertTrue(all(r["decision"] == "pending" and not r["approved"] for r in result["rows"]))
+        self.assertTrue(all(r["candidate_link"]["context_only"] for r in result["rows"]))
+        self.assertEqual(result["rows"][0]["category"], "damage_or_repair_question")
+        self.assertEqual(result["rows"][8]["category"], "architectural_alteration")
+        self.assertEqual(result["rows"][8]["event_category"], "unreviewed")
+        editor = read_json(self.root / "flat-review/candidate-review/drafts.private.json")
+        self.assertEqual({r["question_id"]: r["question"] for r in editor["items"]},
+                         {r["question_id"]: r["question"] for r in self.cases[:7]})
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        with self.assertRaises(PrivateEvidenceError):
+            reject_forbidden(result)
+
+    def test_flat_metadata_does_not_bypass_source_or_asset_validation(self):
+        package = flat_private_fixture(self.root / "flat", self.cases)
+        raw = private.package_bytes(package, Fingerprints())
+        register = json.loads(raw[private.REGISTER])
+        key = "synthetic-flat-40"  # Unused by the 39 panels, still fully verified.
+        out = self.root / "loaded"
+        (out / "assets").mkdir(parents=True)
+        for change in ({"sha256": "0"*64}, {"width": 31}, {"provenance": {}},
+                       {field: None for field in ("evidence_id", "source_url", "source_workspace_path", "delivery_location")}):
+            changed = copy.deepcopy(register)
+            changed[key].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                private.load_assets({**raw, private.REGISTER: json.dumps(changed).encode()}, out)
+        bmp = self.root / "unsupported.bmp"
+        Image.new("RGB", (32, 24)).save(bmp)
+        register[key]["sha256"] = sha256(bmp)
+        html = raw[private.GALLERY].decode()
+        parser = private.AssetData()
+        parser.feed(html)
+        embedded = json.loads("".join(parser.parts))
+        embedded[key] = "data:image/png;base64," + base64.b64encode(bmp.read_bytes()).decode()
+        with self.assertRaisesRegex(ValueError, "format mismatch"):
+            private.load_assets({**raw, private.REGISTER: json.dumps(register).encode(),
+                private.GALLERY: ('<script id="asset-data" type="application/json">' + json.dumps(embedded) + '</script>').encode()}, out)
+
+    def test_plural_identifier_ambiguity_conflicts_and_proposed_group(self):
+        # Reported identifier structure, tested independently from any real image.
+        row = {"review_id": "R-V1", "building_group": "Voskova12-proposed-group", "inventory_ids": ["Voskova_10"],
+            "local_view_ids": ["Voskova_10"], "local_region_ids": ["5c246d589c516955e16a23dd"],
+            "question_ids": ["qa-8ed445b0c2faaca6b3f4265b"], "category": "damage_or_repair_question"}
+        case = {**self.case, "building_id": "Voskova_10", "view_id": "Voskova_10", "region_id": row["local_region_ids"][0],
+                "question_id": row["question_ids"][0]}
+        linked = private.candidate_link(row, [case])
+        self.assertEqual(linked["question_id"], case["question_id"])
+        self.assertNotIn("building_group", linked["supplied_identifiers"])
+        alternative = {**case, "question_id": "another-explicit-question"}
+        both = {**row, "question_ids": [case["question_id"], alternative["question_id"]]}
+        ambiguous = private.candidate_link(both, [case, alternative])
+        self.assertTrue(ambiguous["ambiguous"])
+        self.assertIsNone(ambiguous["question_id"])
+        conflict = private.candidate_link({**row, "question_id": alternative["question_id"]}, [case, alternative])
+        self.assertEqual(conflict["identifier_conflicts"], ["question_id"])
+        self.assertIsNone(conflict["question_id"])
+        self.assertIsNone(private.candidate_link({**row, "local_view_ids": ["other-view"]}, [case])["question_id"])
+        self.assertIsNone(private.candidate_link({"review_id": "group-only", "building_group": "Voskova_10"}, [case])["question_id"])
+        with self.assertRaisesRegex(ValueError, "list of nonempty IDs"):
+            private.candidate_link({**row, "question_ids": case["question_id"]}, [case])
+
+    def test_v41_supplement_exposes_every_member_without_projecting_or_overriding(self):
+        supplement = self.root / "2026-11-16-v4.1-correction-private-handoff.zip"
+        files = {"coordinate-mappings.json": json.dumps({"source_asset": "synthetic-extracted-photo",
+                    "source_sha256": "0"*64, "preview_box": [1, 2, 3, 4], "status": "needs_verification"}).encode(),
+            "comparison-cards.html": b'<h1>Pending comparison</h1><script>NEVER_EXECUTE_SUPPLEMENT()</script>',
+            "nested/notes.md": b'Synthetic correction note', private.REGISTER: b'{"must_not_override_base":true}',
+            "unknown.bin": b'\x80\x00\xff'}
+        with zipfile.ZipFile(supplement, "w") as bundle:
+            for name, content in files.items():
+                bundle.writestr(name, content)
+        before = supplement.read_bytes()
+        summary = private.export(self.private, self.root / "supplement-review", supplement_path=supplement)
+        self.assertEqual((summary["supplement_files"], summary["invalid_panels"], summary["approved"]), (5, 0, 0))
+        self.assertFalse(summary["supplemental_coordinates_applied"])
+        result = read_json(self.root / "supplement-review/audit.private.json")
+        for name, content in files.items():
+            target = self.root / "supplement-review" / result["supplement_files"][name]["saved_as"]
+            self.assertEqual(target.read_bytes(), content)
+            self.assertEqual(sha256(target), result["supplement_files"][name]["sha256"])
+            self.assertEqual(target.suffix, ".txt")
+        page = (self.root / "supplement-review/supplement/gallery.html").read_text()
+        self.assertIn("&lt;script&gt;NEVER_EXECUTE_SUPPLEMENT()&lt;/script&gt;", page)
+        self.assertNotIn("<script>", page)
+        self.assertIn("supplement/gallery.html", (self.root / "supplement-review/index.html").read_text())
+        with Image.open(self.root / "supplement-review/assets/proposal-0-0.png") as image:
+            self.assertEqual(image.size, (1110, 640))
+            self.assertEqual(image.getpixel((1100, 30)), (30, 160, 255))
+        self.assertEqual(supplement.read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "private-audit-supplement"):
+            private.export(supplement, self.root / "wrong-base")
+        with self.assertRaisesRegex(ValueError, "requires the original"):
+            curation.review_page(self.candidates, "unused-selection", self.root / "no-base", private_audit_supplement=supplement)
 
 
 class FactualAuditTests(unittest.TestCase):

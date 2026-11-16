@@ -56,7 +56,7 @@ class AssetData(HTMLParser):
             self.parts.append(data)
 
 
-def package_bytes(path, fingerprints):
+def package_bytes(path, fingerprints, *, supplement=False):
     """Read named inert files without extracting or executing archive members."""
     path = Path(path).resolve()
     if path.is_dir():
@@ -73,17 +73,24 @@ def package_bytes(path, fingerprints):
             names = bundle.namelist()
             if len(names) != len(set(names)):
                 raise ValueError("Duplicate private audit ZIP members")
-        files = dict.fromkeys(names)
+            files = {item.filename: None for item in bundle.infolist() if not item.is_dir()}
         def read(name):
             with zipfile.ZipFile(path) as bundle:
                 if bundle.getinfo(name).file_size > MAX_BYTES:
                     raise ValueError("Private audit member exceeds size limit")
                 return bundle.read(name)
+    if supplement:
+        if not files:
+            raise ValueError("Private audit supplement contains no files")
+        # Supplements have no mandatory gallery or filename pattern. Expose ALL
+        # members as pending source material, never as executable code or overrides.
+        return {name: read(name) for name in sorted(files)}
     chosen = {}
     for basename in (PROPOSALS, REGISTER, GALLERY):
         matches = [name for name in files if Path(name).name == basename]
         if len(matches) != 1:
-            raise ValueError("Missing/ambiguous private audit member: " + basename)
+            raise ValueError("Missing/ambiguous private audit member: " + basename +
+                "; a metadata-only handoff belongs in --private-audit-supplement alongside the original gallery package")
         chosen[basename] = read(matches[0])
     for name in files:
         basename = Path(name).name
@@ -94,6 +101,22 @@ def package_bytes(path, fingerprints):
                 raise ValueError("Ambiguous auxiliary audit filename")
             chosen[basename] = read(name)
     return chosen
+
+
+def asset_provenance(record, key):
+    if isinstance(record, dict):
+        if "provenance" in record:
+            value = record["provenance"]
+            if isinstance(value, (dict, list, str)) and value:
+                return copy.deepcopy(value)
+        else:
+            fields = ("label", "evidence_id", "capture_date", "precision", "source_url", "note",
+                      "source_workspace_path", "delivery_location")
+            source = {field: copy.deepcopy(record[field]) for field in fields if field in record}
+            if any(isinstance(source.get(field), str) and source[field].strip() for field in
+                   ("evidence_id", "source_url", "source_workspace_path", "delivery_location")):
+                return {"schema": "flat_asset_register", "source_fields": source}
+    raise ValueError("Asset requires nonempty provenance or flat source metadata: " + key)
 
 
 def load_assets(raw, out):
@@ -110,8 +133,7 @@ def load_assets(raw, out):
         raise ValueError("asset-data must be an asset-key mapping")
     result = {}
     for key, record in assets.items():
-        if not isinstance(record, dict) or not isinstance(record.get("provenance"), (dict, list, str)):
-            raise ValueError("Asset requires SHA-256, native dimensions and preserved provenance: " + key)
+        provenance = asset_provenance(record, key)
         value = embedded.get(key)
         value = value.get("data_url") if isinstance(value, dict) else value
         if not isinstance(value, str) or not value.startswith(("data:image/png;base64,", "data:image/jpeg;base64,")):
@@ -128,7 +150,8 @@ def load_assets(raw, out):
             suffix = ".png" if image.format == "PNG" else ".jpg"
         relative = "assets/" + record["sha256"] + suffix
         (out / relative).write_bytes(content)
-        result[key] = {**copy.deepcopy(record), "asset": key, "src": relative, "shape": [height, width]}
+        result[key] = {**copy.deepcopy(record), "provenance": provenance,
+                       "asset": key, "src": relative, "shape": [height, width]}
     return result
 
 
@@ -164,23 +187,48 @@ def checked_panel(panel, assets, public_records, evidence_ids=()):
             "src": asset["src"], "provenance": asset["provenance"], "temporal_gold": False}
 
 
+def proposal_identifiers(row):
+    """Arrays are alternatives within one field; independently supplied fields must agree."""
+    constraints = {}
+    for scalar, plural in (("building_id", "inventory_ids"), ("view_id", "local_view_ids"),
+                           ("region_id", "local_region_ids"), ("question_id", "question_ids")):
+        values = row.get(plural)
+        if values is not None:
+            if not isinstance(values, list) or any(not isinstance(v, str) or not v.strip() for v in values):
+                raise ValueError(f"{row['review_id']}: {plural} must be a list of nonempty IDs")
+            if values:
+                constraints[scalar] = set(values)
+        value = row.get(scalar)
+        if value is not None:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{row['review_id']}: {scalar} must be a nonempty ID")
+            constraints[scalar] = constraints[scalar] & {value} if scalar in constraints else {value}
+    # building_group is deliberately absent: it is a proposed display label.
+    return {key: sorted(values) for key, values in constraints.items()}
+
+
 def candidate_link(row, candidates):
     """Resolve supplied identifiers only. An address or event description is not a crop match."""
+    constraints = proposal_identifiers(row)
+    context = {"supplied_identifiers": constraints, "identifier_conflicts": [k for k, v in constraints.items() if not v],
+        "context_only": True, "scope": "existing question context only; proposed question, scope, category and factual support are not approved"}
     if candidates is None:
-        return {"status": "dataset_not_supplied", "question_id": None, "missing_inputs": ["candidate_manifest", "exact_region_correspondence"], "candidates": []}
-    constrained = [c for c in candidates if all(not row.get(k) or row[k] == c[k] for k in ("building_id", "view_id", "region_id", "question_id"))]
-    identifiers = bool(row.get("question_id") or (row.get("region_id") and row.get("view_id")))
+        return {**context, "status": "dataset_not_supplied", "question_id": None,
+                "missing_inputs": ["candidate_manifest", "exact_region_correspondence"], "candidates": []}
+    constrained = [c for c in candidates if all(c[k] in values for k, values in constraints.items())]
+    identifiers = "question_id" in constraints or {"region_id", "view_id"} <= constraints.keys()
     matched = constrained[0] if identifiers and len(constrained) == 1 else None
-    return {"status": "exact_identifiers" if matched else "unresolved", "question_id": matched["question_id"] if matched else None,
+    return {**context, "status": "exact_identifiers" if matched else "unresolved", "question_id": matched["question_id"] if matched else None,
+        "ambiguous": bool(identifiers and len(constrained) > 1),
         "missing_inputs": [] if matched else ["exact_question_or_region_view_ids", "local_crop_to_archive_correspondence_review"],
-        "candidates": [{k: c[k] for k in ("question_id", "question", "building_id", "view_id", "region_id", "task", "task_dates", "split")} for c in constrained],
-        "scope": "identifier linkage only; comparison dates, event category and factual support remain unreviewed"}
+        "candidates": [{k: c[k] for k in ("question_id", "question", "building_id", "view_id", "region_id", "task", "task_dates", "split")} for c in constrained]}
 
 
 def export(package, out, *, candidates_path=None, inventory_path=None, archive_corpus=None, identity_map=None,
-           handoff_path=None, previous=None, progress=None):
+           handoff_path=None, previous=None, supplement_path=None, progress=None):
     fingerprints = Fingerprints()
     raw = package_bytes(package, fingerprints)
+    supplemental = package_bytes(supplement_path, fingerprints, supplement=True) if supplement_path else {}
     document = json.loads(raw[PROPOSALS])
     rows = document if isinstance(document, list) else document.get("rows", document.get("proposals"))
     if not isinstance(rows, list) or any(not isinstance(r, dict) or not isinstance(r.get("panels"), list) for r in rows):
@@ -194,7 +242,9 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
             raise ValueError("Private audit editor must preserve human decisions against their exact original candidate bytes")
     inventory = qa.read_bound(inventory_path, fingerprints) if inventory_path else {}
     corpus = archive.validate_package(qa.read_bound(archive_corpus, fingerprints), Path(archive_corpus).resolve().parent, fingerprints) if archive_corpus else None
-    journal = new_run(out, {"private_package": str(Path(package).resolve()), "models_executed": False}, "www_private_archive_audit", progress)
+    journal = new_run(out, {"private_package": str(Path(package).resolve()),
+        "private_supplement": str(Path(supplement_path).resolve()) if supplement_path else None,
+        "models_executed": False}, "www_private_archive_audit", progress)
     try:
         (journal.out / "assets").mkdir()
         (journal.out / "source.private").mkdir()
@@ -210,12 +260,34 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
             target.write_bytes(content)  # Original HTML remains inert text.
             source_files[name] = {"sha256": hashlib.sha256(content).hexdigest(), "saved_as": str(target.relative_to(journal.out))}
         assets = load_assets(raw, journal.out)
+        supplement_files = {}
+        if supplemental:
+            journal.event("review_stage", stage=f"приватное дополнение: {len(supplemental)} файлов для просмотра; перенос координат не выполняется")
+            supplement_out = journal.out / "supplement"
+            supplement_out.mkdir()
+            supplement_sections = []
+            for n, (name, content) in enumerate(supplemental.items()):
+                target = supplement_out / f"source-{n:03d}.txt"
+                target.write_bytes(content)  # Inert filename even for supplied HTML/scripts.
+                try:
+                    shown = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    shown = "Binary source retained byte-for-byte; no preview or interpretation."
+                metadata = {"sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content),
+                            "saved_as": str(target.relative_to(journal.out)), "status": "exposed_pending_not_applied"}
+                supplement_files[name] = metadata
+                supplement_sections.append({"title": name, "caption": json.dumps(metadata, ensure_ascii=False) + "\n\n" + shown})
+            write_static_gallery(supplement_out, "PRIVATE V4.1 supplement — pending mappings and comparison cards", supplement_sections, notes=[
+                "All supplemental files are preserved and exposed as inert source material. Nothing overrides the original gallery or human decisions.",
+                "Mappings are not automatically verified or applied. Main review boxes remain on the exact registered native image; no projected boxes are produced."])
         records = {r["evidence_id"]: r for r in (corpus or {}).get("records", [])}
         items, sections = [], []
         for n, row in enumerate(rows):
             journal.event("case_started", case_id=row["review_id"], index=n+1, total=len(rows))
             linked = candidate_link(row, candidates)
-            members = identities.candidate_members(row.get("building_id"))
+            buildings = set(linked["supplied_identifiers"].get("building_id", []))
+            buildings.update(c["building_id"] for c in linked["candidates"] if c["question_id"] == linked["question_id"])
+            members = {member for building in buildings for member in identities.candidate_members(building)}
             views = [v for v in inventory.get("views", []) if v["building_id"] in members]
             splits = sorted({c["split"] for c in candidates or [] if c["building_id"] in members} | {v["split"] for v in views})
             checked = []
@@ -230,7 +302,8 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
                         value["src"] = assets[panel["asset"]]["src"]
                 checked.append(value)
             item = {"review_id": row["review_id"], "proposal": copy.deepcopy(row), "decision": "pending", "approved": False,
-                "candidate_link": linked, "identity_review_pending": identities.pending(row.get("building_id")),
+                "candidate_link": linked, "identity_review_pending": any(identities.pending(b) for b in buildings),
+                "building_group": row.get("building_group"), "category": row.get("category"),
                 "original_splits": splits, "eligible": None, "inventory_views": views,
                 "cross_split_consequence": "same_building confirmation blocks BOTH development and evaluation selection; guard unchanged" if len(splits) > 1 else None,
                 "event_category": row.get("event_category", "unreviewed"), "question_scope": row.get("question_scope", "unreviewed"),
@@ -261,6 +334,7 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
             if name not in {PROPOSALS, REGISTER, GALLERY}:
                 sections.append({"title": "Pending source audit: " + name, "caption": content.decode("utf-8"), "panels": []})
         result = qa._private("www_archive_audit_review", rows=items, assets=assets, source_files=source_files,
+            supplement_files=supplement_files, supplemental_coordinates_applied=False,
             candidate_sha256=sha256(candidates_path) if candidates_path else None,
             archive_corpus_sha256=sha256(archive_corpus) if archive_corpus else None,
             identity_source=identities.source, input_sha256=fingerprints.files, temporal_gold=False)
@@ -285,6 +359,10 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
             "Earliest among supplied observations and earliest supported within the frozen collection are different question scopes.",
             "Architectural alterations are not automatically damage or repair. Use the existing question editor after resolving the exact candidate."])
         summary = {"status": "completed", "proposals": len(items), "pending": len(items), "approved": 0, "models_executed": False,
+            "assets": len(assets), "panels": sum(len(i["panels"]) for i in items),
+            "linked_candidate_rows": sum(i["candidate_link"]["question_id"] is not None for i in items),
+            "unique_linked_questions": len(linked_ids),
+            "supplement_files": len(supplement_files), "supplemental_coordinates_applied": False,
             "unresolved_candidate_links": sum(i["candidate_link"]["question_id"] is None for i in items),
             "cross_split_review_rows": sum(i["cross_split_consequence"] is not None for i in items),
             "cross_split_policy": CROSS_SPLIT_POLICY,
@@ -294,8 +372,13 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
             "corpus_binding": result["corpus_binding"],
             "report_path": str(journal.out / "index.html")}
         links = '<li><a href="gallery.html">Все pending-предложения и исходные панели</a></li>'
+        if supplement_files:
+            links += '<li><a href="supplement/gallery.html">V4.1 supplement: все mappings и comparison cards; pending, без переноса координат</a><ul>'
+            for name, metadata in supplement_files.items():
+                links += '<li><a download href="' + metadata["saved_as"] + '">' + html.escape(name) + '</a></li>'
+            links += '</ul></li>'
         if linked_review:
-            links += '<li><a href="candidate-review/review.html">Редактор точно связанных кандидатов; eligibility не изменена</a></li>'
+            links += '<li><a href="candidate-review/review.html">Исходные вопросы как контекст; предлагаемые вопросы и scope не утверждены</a></li>'
         (journal.out / "index.html").write_text('<!doctype html><meta charset="utf-8"><title>PRIVATE pending audit</title>'
             '<h1>Приватный аудит: решения pending</h1><ul>' + links + '</ul><pre>' +
             html.escape(json.dumps(summary, ensure_ascii=False, indent=2)) + '</pre>', encoding="utf-8")

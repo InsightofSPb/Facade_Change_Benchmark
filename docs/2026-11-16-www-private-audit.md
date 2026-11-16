@@ -6,11 +6,21 @@
 
 ## Что проверено и что пока недоступно
 
-Ссылка Library на новый приватный пакет вернула HTTP 403; сам пакет и настоящий
-48-row pilot в Cloud недоступны. Импорт проверен на **синтетической** структуре:
-13 предложений (7 region audits и 6 shortlisted comparisons), отдельная фотография
-1110×640 и другая публичная страница 1013×1432 под связанным evidence ID.
-Это не проверка реальных изображений, строк пакета или ответов Qwen.
+После `c169a28` исправлена совместимость с сообщённой реальной схемой:
+плоские source metadata в asset register и plural identifiers в proposals.
+Обе ссылки Library (исходный пакет и V4.1 supplement) по-прежнему возвращают HTTP
+403. В Cloud проверены **синтетические** fixtures с этой схемой, собственными RGB
+и честно вычисленными SHA; полный реальный пакет здесь ещё не проверен.
+
+Независимая диагностическая нормализация реального пакета, по сообщению владельца,
+проверила 41 изображение и 39 панелей без ошибок. Ожидаемая структура: 13 pending
+строк, восемь строк ссылаются на семь существующих вопросов, пять shortlist rows
+остаются unresolved. Fixture воспроизводит эти количества; импортёр их не навязывает.
+
+Владелец также подтвердил реальный `www audit`: **48 строк = 44 completed,
+3 error, 1 abstained**. Отсутствующие изображения при независимой проверке были
+связаны с недоступными WSL-путями. Эта правка не меняет references, factual audit
+или inference; повторный инференс для исправления путей не нужен.
 
 Все 16 объектов решений в ранее приложенном
 `2026-11-15-www-human-review-handoff.private.json`, включая уточнение case 03,
@@ -31,7 +41,13 @@ review, а не включение в когорту.
   или `proposals`; непустой уникальный `review_id`, список `panels`;
 - `2026-11-16-asset-register.private.json`: mapping asset-key → запись либо
   `{"assets": mapping}`. Запись содержит `sha256`, целочисленные `width`, `height`
-  и `provenance`;
+  и либо непустой `provenance`, либо реальные плоские поля: `label`, `evidence_id`,
+  `capture_date`, `precision`, `source_url`, `note`, `source_workspace_path`,
+  `delivery_location`. Плоские source fields копируются во внутренний
+  `provenance.source_fields` с меткой `schema:flat_asset_register`. Все исходные
+  поля, включая дополнительные, остаются в записи, а register сохраняется
+  byte-for-byte. Пустой provenance не подставляется; требуется непустой source
+  locator/evidence ID. Переписывать исходный ZIP не нужно;
 - `2026-11-16-side-by-side-gallery.private.html`: один inert
   `<script id="asset-data" type="application/json">` с mapping asset-key →
   PNG/JPEG data URL либо `{"data_url": ...}`;
@@ -60,6 +76,27 @@ SHA `71f5cc65595b59ebe4aba53f4abef462d441b72acc2dfbb321dc5991bec931a3`, и
 provenance сохраняется. Correspondence proposals всегда отделены от event GT;
 рамки приватного extracted photo не подставляются в редактор публичной PDF-page.
 
+### V4.1 — дополнение к оригинальной галерее
+
+`2026-11-16-v4.1-correction-private-handoff.zip` (около 62 КБ) содержит mappings
+и comparison cards, но не изображения галереи. Передавать его через
+`--private-audit-supplement` вместе с
+`--private-audit .../2026-11-16-www-v4-private-region-review.zip`.
+Флаг поддержан в `archive-audit-review`, `review-page` и `review-package`.
+Попытка использовать supplement вместо оригинального пакета выдаёт явную ошибку.
+
+Все файлы дополнения, независимо от имени/суффикса, доступны на отдельной странице
+`supplement/gallery.html`, перечислены в `audit.private.json:supplement_files`
+с SHA и сохранены byte-for-byte под инертными `.txt` именами. HTML показывается
+как экранированный текст; бинарные файлы явно отмечены как доступные без preview.
+На `index.html` есть ссылка на этот раздел и скачивание каждого исходного файла.
+Это **явное предоставление для review**, а не автоматическое применение исправлений:
+`status:exposed_pending_not_applied`, `supplemental_coordinates_applied:false`.
+Даже совпадающее имя register/proposals в supplement не перезаписывает оригинал.
+Mappings не объявляются verified; projected boxes не создаются, все отображённые
+рамки остаются на точном native asset. Для будущего переноса требуется отдельная
+проверка mapping, обоих SHA и обеих решёток. Никаких approvals этот шаг не даёт.
+
 ## Identity, кандидаты и scope
 
 `Voskova_10/Voskova_12` и `baskov_32/baskov_34` остаются pending в существующем
@@ -70,8 +107,19 @@ pending gallery объясняют правило; исходные IDs, splits,
 сохраняются. При передаче inventory используется тот же `--identity-map` по SHA/пути.
 
 Связь с candidate устанавливается только по точным supplied question ID либо
-view+region ID и однозначной записи manifest. Адрес, похожая архитектура, даты или
-alias не заменяют проверку соответствия. При отсутствии IDs показываются
+view+region ID и однозначной записи manifest. Принимаются прежние скаляры
+`building_id/view_id/region_id/question_id` и реальные массивы
+`inventory_ids/local_view_ids/local_region_ids/question_ids` соответственно.
+Внутри массива IDs — альтернативы; между полями ограничения должны согласоваться.
+Скаляр и массив одного поля также должны согласоваться. Несколько оставшихся
+кандидатов дают `ambiguous:true`, без выбора первого; конфликт IDs не обходится.
+`building_group` остаётся proposed display label, а не canonical building ID.
+Исходный `category` сохраняется и не превращается в утверждённую метку.
+
+Точная ссылка помечается `context_only:true`: существующий вопрос служит контекстом
+и не утверждает другой предложенный вопрос, его wording или scope. Исходный вопрос
+не заменяется текстом comparison card. Адрес, похожая архитектура, даты или alias
+не заменяют проверку соответствия. При отсутствии IDs показываются
 доступные кандидаты и `missing_inputs`, без выдуманной связи. Приоритеты ручного
 разрешения остаются такими:
 
@@ -130,9 +178,10 @@ C−A/B−A/C−B, building bootstrap и знаменатели не менял�
 
 ## Foreground WSL: исходные 16 и private audit
 
-Положить **настоящий** скачанный private ZIP в
-`/home/sasha/Downloads/2026-11-16-www-private-archive-audit.zip` либо заменить этот
-единственный путь фактическим. Наличие файла по этому имени не предполагается.
+Положить **настоящие** скачанные ZIP в `/home/sasha/Downloads/`:
+`2026-11-16-www-v4-private-region-review.zip` и
+`2026-11-16-v4.1-correction-private-handoff.zip`, либо заменить каталог фактическим.
+Это реальные имена пакетов, сообщённые владельцем; наличие их в Downloads не предполагается.
 Не запускать содержимое пакета. Все пути ниже абсолютные; shell-global variables
 не используются. Если output уже существует, выбрать новый номер, не удалять старый.
 
@@ -145,18 +194,23 @@ set -o pipefail &&
   --selection /home/sasha/Facade_Change_Benchmark/runs/2026-11-15-www-handoff-001/selection.private.json \
   --handoff /home/sasha/Facade_Change_Benchmark/runs/2026-11-15-www-handoff-001/handoff.private.json \
   --archive-corpus /home/sasha/Facade_Change_Benchmark/runs/2026-11-15-www-archive-v31-001/corpus.json \
-  --private-audit /home/sasha/Downloads/2026-11-16-www-private-archive-audit.zip \
-  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-original-16-audit-003 \
-  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-original-16-audit-003.console.log
+  --private-audit /home/sasha/Downloads/2026-11-16-www-v4-private-region-review.zip \
+  --private-audit-supplement /home/sasha/Downloads/2026-11-16-v4.1-correction-private-handoff.zip \
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-original-16-audit-004 \
+  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-original-16-audit-004.console.log
 ```
 
-Открыть `.../2026-11-16-www-review-original-16-audit-003/review.html`; отдельная
+Открыть `.../2026-11-16-www-review-original-16-audit-004/review.html`; отдельная
 ссылка ведёт в `pending-audit/index.html`. Все shortlist rows останутся доступными,
 даже если исходный candidate manifest не позволяет разрешить их exact IDs.
 Этот раздел использует V3.1 явно; несовпадение заявленного private corpus SHA
 помечается `different_revision_pending_recheck`, без подмены версии.
 
 ## Foreground WSL: настоящий 48-row pilot, без инференса
+
+Реальный экспорт уже выполнен владельцем: 44 completed / 3 error / 1 abstained.
+Для этой правки повторять его не требуется. Только если нужен новый offline export
+на WSL с доступными исходными изображениями, использовать отдельный каталог:
 
 ```bash
 cd /home/sasha/Facade_Change_Benchmark &&
@@ -166,13 +220,13 @@ set -o pipefail &&
   --run /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-models-16-001 \
   --candidates /home/sasha/Facade_Change_Benchmark/runs/2026-11-15-facade-qa-candidates-001/candidates.json \
   --handoff /home/sasha/Facade_Change_Benchmark/runs/2026-11-15-www-handoff-001/handoff.private.json \
-  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-factual-audit-16-001 \
-  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-factual-audit-16-001.console.log
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-factual-audit-16-002 \
+  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-factual-audit-16-002.console.log
 ```
 
-Открыть `.../2026-11-16-www-factual-audit-16-001/factual-review.html`. Число 48 —
-ожидание 16×3; фактические статусы, неполнота и сохранённые outputs проверяются
-при выполнении команды. Сейчас этот реальный экспорт **не выполнен**.
+Открыть `.../2026-11-16-www-factual-audit-16-002/factual-review.html` после нового
+экспорта. Существующий `...-001` сохраняется; ссылки и references не переписываются
+ради отсутствующих в Cloud WSL-путей. Cloud эту реальную команду не выполнял.
 
 ## V4.1 и отдельный all-candidates review
 
@@ -199,9 +253,10 @@ set -o pipefail &&
   --histories /home/sasha/Facade_Change_Benchmark/data/histories \
   --archive-corpus /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-archive-v41-001/corpus.json \
   --exposed-questions /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-public-16-001/questions.json \
-  --private-audit /home/sasha/Downloads/2026-11-16-www-private-archive-audit.zip \
-  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-all-v41-001 \
-  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-all-v41-001.console.log
+  --private-audit /home/sasha/Downloads/2026-11-16-www-v4-private-region-review.zip \
+  --private-audit-supplement /home/sasha/Downloads/2026-11-16-v4.1-correction-private-handoff.zip \
+  --out /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-all-v41-002 \
+  2>&1 | tee /home/sasha/Facade_Change_Benchmark/runs/2026-11-16-www-review-all-v41-002.console.log
 ```
 
 Не считать 100-case cohort готовой до фактического inventory/selection и ручного
@@ -210,32 +265,34 @@ review. Для shortlisted событий всё ещё нужны доступ�
 
 ## Выполненные CPU-проверки
 
-В существующей Cloud CPU-среде, без установки пакетов:
+Для правки совместимости после `c169a28`, в существующей Cloud CPU-среде,
+без установки пакетов:
 
 ```bash
 /workspace/work/facade-venv/bin/python -s -B -m unittest \
-  tests.test_2026_11_16_www_audit \
+  tests.test_2026_11_16_www_audit.PrivateArchiveAuditTests \
   tests.test_2026_11_16_www_review \
-  tests.test_2026_11_15_www_curation \
-  tests.test_2026_11_15_www_archive_review \
-  tests.test_2026_11_10_facade_questions -v
-node tests/test_2026_11_16_www_review_ui.js
-node tests/test_2026_11_16_www_factual_ui.js
+  tests.test_2026_11_15_www_curation -v
 ```
 
-60 Python checks прошли; проверены exact-asset/native bounds, отказ от переноса,
-SHA/dimension mismatch, private/public boundary, pending/zero batch/cross-split,
-сохранение human text и старой цепочки review, paired C−A и новые factual exports.
-Два Node DOM checks проверяют ручной earliest scope и экспорт только введённых
-суждений. Это не browser/GPU/model-quality validation.
+**28 проверок прошли.** В том числе: 41 flat asset / 39 panels / 0 panel errors;
+13 pending / 8 linked rows / 7 unique questions / 5 unresolved / 0 approvals;
+неизменные source fields, register bytes и context questions; отказ на неверном
+SHA, размерах, формате и пустой provenance; ambiguity/conflicting IDs; plural
+inventory IDs с прежним cross-split guard; все supplemental files, включая
+нестандартные имена, HTML и binary, видимы/сохранены без override и projection;
+сохранение human text, отдельного original-16 workflow и paired C−A.
 
-Синтетический interrupted 16×3 fixture экспортировал 48 строк: 39 completed,
-3 error, 3 abstained, 3 missing; все human judgments пустые. Отдельно проверены
-shown-but-uncited evidence и retrieved-but-never-submitted evidence. CLI
-`archive-audit-review` прошёл на 13-row fixture, а `audit` — на ранее сохранённом
-9-row scripted run из `c2f00fc`, без запуска нового inference и без retrospective
-plan. Итоговые stdout — JSON, прогресс — stderr. WSL-блоки проверены `bash -n`.
+Сквозной `www review-page` с обоими синтетическими ZIP и handoff также прошёл:
+те же counts, два видимых supplemental файла, неизменный human target на основной
+странице и в linked context. stdout — корректный JSON, прогресс — stderr.
+WSL-блоки проверены `bash -n`. Реальная схема supplemental файлов недоступна:
+они намеренно предоставляются как исходный материал, а не объявляются проверенными mappings.
 
-Полный repository suite не запускался. Настоящий private package, реальный 48-row
-pilot, candidate shortfalls и данные V4.1 ожидают доступных WSL-файлов. Результатов
+Исторические 60 CPU + 2 JS checks исходного экспортера относятся к `c169a28`.
+Его interrupted 48-row fixture имел другие synthetic statuses; это не результат
+настоящего пилота владельца (44/3/1).
+
+Полный repository suite и GPU не запускались. Проверка настоящих private packages,
+candidate shortfalls и публичного V4.1 по-прежнему требует доступных WSL-файлов. Результатов
 о качестве моделей или готовности реальной 100-case когорты эти проверки не дают.
