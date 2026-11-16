@@ -21,6 +21,7 @@ from .store import reject_forbidden
 qa = importlib.import_module(".2026-11-10_questions", __package__)
 runner = importlib.import_module(".2026-11-15_www_runner", __package__)
 curation = importlib.import_module(".2026-11-15_www_curation", __package__)
+costs = importlib.import_module(".2026-11-16_www_costs", __package__)
 JUDGMENTS = {"target_event_match": ["", "matches", "different_event", "unresolved", "not_applicable"],
              "claim_support": ["", "supported", "contradicted", "unresolved"],
              "citation_support": ["", "supports", "contradicts", "unresolved", "no_citations"]}
@@ -118,7 +119,7 @@ def write_blind(out, rows, items, sections, key):
     (out / "factual-review.html").write_text(template.replace("__REVIEW_DATA__", embedded), encoding="utf-8")
 
 
-def audit(run_path, out, *, questions_path=None, candidates_path=None, handoff_path=None, progress=None):
+def audit(run_path, out, *, questions_path=None, candidates_path=None, handoff_path=None, costs_only=False, progress=None):
     root, fingerprints = Path(run_path).resolve(), Fingerprints()
     questions_path = Path(questions_path).resolve() if questions_path else root / "questions.json"
     record = qa.read_bound(root / "run.json", fingerprints)
@@ -159,17 +160,26 @@ def audit(run_path, out, *, questions_path=None, candidates_path=None, handoff_p
             raise ValueError("Unknown/duplicate saved question-condition")
         results[key] = result
     journal = new_run(out, {"inference_run": str(root), "questions_sha256": sha256(questions_path),
-        "source_contract_sha256": digest(contract), "scope": "unscored_offline_human_audit; no retrospective plan"}, "www_factual_audit", progress)
+        "source_contract_sha256": digest(contract), "scope": "saved_costs_only" if costs_only else "unscored_offline_human_audit; no retrospective plan"},
+        "www_costs" if costs_only else "www_factual_audit", progress)
     try:
         (journal.out / "assets").mkdir()
         salt = secrets.token_hex(16)
-        rows, items, sections, key = [], [], [], []
+        rows, items, sections, key, cost_rows = [], [], [], [], []
+        def read_cost(path, expected=None):
+            if expected:
+                fingerprints.add(path, expected)
+            return read_saved(path, fingerprints, root, hashes)
         for n, question in enumerate(questions.values(), 1):
             identifier = question["question_id"]
             journal.event("case_started", case_id=identifier, index=n, total=len(questions))
             for condition in conditions:
                 result = results.get((identifier, condition), {"status": "missing", "answer": None, "costs": {"incomplete": True}})
                 folder = root / "questions" / identifier / condition
+                cost_rows.append({"question_id": identifier, "condition": condition, "status": result.get("status", "missing"),
+                                  "costs": costs.case_costs(result, folder, read_cost)})
+                if costs_only:
+                    continue
                 exposed = read_saved(folder / "exposure.json", fingerprints, root, hashes)["evidence"] if (folder / "exposure.json").is_file() else {}
                 blind_id = digest([salt, identifier, condition])[:16]
                 row, item, section, trace = blind_case(question, result, exposed, folder, journal.out, fingerprints, blind_id,
@@ -178,13 +188,27 @@ def audit(run_path, out, *, questions_path=None, candidates_path=None, handoff_p
                 items.append(item)
                 sections.append(section)
                 key.append({"blind_id": blind_id, "question_id": identifier, "condition": condition, **trace})
-        write_blind(journal.out, rows, items, sections, key)
+        if not costs_only:
+            write_blind(journal.out, rows, items, sections, key)
+        cost_summary = costs.aggregate(cost_rows, conditions)
+        write_json(journal.out / "costs.private.json", qa._private("www_measured_cost_report", conditions=cost_summary,
+            source_contract_sha256=digest(contract), cases=cost_rows,
+            note="Observed current-execution costs; missing measurements stay flagged. Cached source costs are separate. Lower cost is not a quality advantage."))
+        curation.csv_rows(journal.out / "costs.private.csv", [{"question_id": row["question_id"], "condition": row["condition"], "status": row["status"],
+            "retrieval_calls": row["costs"]["retrieval_calls"], "incomplete": row["costs"]["incomplete"],
+            "elapsed_seconds": row["costs"]["elapsed_seconds"], **{role: row["costs"]["roles"][role] for role in ("qwen", "jina")}} for row in cost_rows])
+        if costs_only:
+            write_static_gallery(journal.out, "WWW — saved measured costs, no inference", [
+                {"title": condition, "caption": json.dumps(values, ensure_ascii=False, indent=2)} for condition, values in cost_summary.items()],
+                notes=["Qwen and Jina are separate. Technical retries are counted once via aggregated usage. Errors/missing rows are retained.",
+                       "Incomplete measurements are partial observed totals; cached source usage is not charged again. No method ranking is inferred."])
         summary = {"status": "completed", "questions": len(questions), "conditions": conditions, "expected_rows": len(questions)*len(conditions),
-            "exported_rows": len(rows), "execution_status_counts": dict(Counter(r["execution_status"] for r in rows)),
+            "exported_rows": len(cost_rows), "execution_status_counts": dict(Counter(r["status"] for r in cost_rows)),
             "rows_with_audit_issues": sum(bool(i["audit_issues"]) for i in items), "human_reviewed": 0,
             "models_executed": False, "scoring": "unscored_human_audit; no accuracy or retrospective plan",
             "source_run_status": record.get("status"), "source_contract_sha256": digest(contract),
-            "input_sha256": fingerprints.files, "report_path": str(journal.out / "factual-review.html")}
+            "costs_by_condition": cost_summary,
+            "input_sha256": fingerprints.files, "report_path": str(journal.out / ("gallery.html" if costs_only else "factual-review.html"))}
         write_json(journal.out / "summary.json", summary)
         fingerprints.verify()
         complete_run(journal, "completed", summary=summary)

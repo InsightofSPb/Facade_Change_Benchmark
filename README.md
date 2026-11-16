@@ -24,6 +24,8 @@ CPU-пример проверяет SIFT/SSIM/LZMA, историю и отчёт
 
 Три режима WWW QA, импорт публичного архива, расширение review и структурная оценка:
 [`2026-11-15: WWW QA и точные WSL-команды`](docs/2026-11-15-www-qa.md).
+Новая согласованная RGB QA-политика, отбор по физическим зданиям и расходы по ролям:
+[`2026-11-16: подготовка review v2`](docs/2026-11-16-www-rgb-qa-policy.md).
 Вход `python -m facade_change.agentic www --help`; `www demo` — только CPU fixture,
 без реальных моделей. Приватные метки читаются только при curation/offline scoring.
 

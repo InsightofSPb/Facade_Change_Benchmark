@@ -18,6 +18,7 @@ def module(name):
 
 
 def parser():
+    policies = module("curation").rgb_policy
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="action", required=True)
     imp = commands.add_parser("archive-import", help="Validate/copy the shared public archive package; CPU")
@@ -43,6 +44,7 @@ def parser():
     inventory.add_argument("--addresses", help="Optional sourced address metadata; never infer an address from an ID")
     inventory.add_argument("--identity-map")
     inventory.add_argument("--exposed-questions", action="append", default=[])
+    inventory.add_argument("--qa-policy", choices=policies.POLICIES, default=policies.LEGACY)
     batch = commands.add_parser("batch", help="Select a deterministic batch before model outcomes")
     batch.add_argument("--candidates", required=True)
     batch.add_argument("--inventory", required=True)
@@ -50,7 +52,8 @@ def parser():
     batch.add_argument("--per-building", type=int, default=12)
     batch.add_argument("--seed", default="2026-11-15-www-v1")
     batch.add_argument("--max-overlap", type=float, default=.5)
-    batch.add_argument("--cohort", choices=("development", "evaluation"), default="development")
+    batch.add_argument("--cohort", choices=("all", "development", "evaluation"), help="Default: policy-specific; all for the new RGB QA review")
+    batch.add_argument("--qa-policy", choices=policies.POLICIES, help="Must match the saved inventory; defaults to its policy")
     batch.add_argument("--targets", help="JSON provisional review-target counts, not answer labels")
     batch.add_argument("--exposed-questions", action="append", default=[])
     handoff = commands.add_parser("handoff", help="Import all 16 PRIVATE text judgments, with localization pending")
@@ -74,7 +77,10 @@ def parser():
     package = commands.add_parser("review-package", help="CPU inventory, target selection and private local/archive review; no approvals")
     package.add_argument("--candidates", required=True)
     package.add_argument("--histories", required=True)
-    package.add_argument("--archive-corpus", required=True)
+    package.add_argument("--archive-corpus", help="Optional for the new RGB QA preparation; no per-building archive coverage requirement")
+    package.add_argument("--qa-policy", choices=policies.POLICIES, default=policies.LEGACY)
+    package.add_argument("--size", type=int, help="New RGB QA target size (default 100); reference category mix is not a quota")
+    package.add_argument("--archive-coverage-review", help="Optional private, corpus-bound human search/support log; reporting only")
     package.add_argument("--identity-map")
     package.add_argument("--exposure-audit")
     package.add_argument("--exposed-questions", action="append", default=[])
@@ -114,7 +120,10 @@ def parser():
     audit.add_argument("--questions", help="Default: the saved run/questions.json")
     audit.add_argument("--candidates", help="Exact original candidates, only with --handoff")
     audit.add_argument("--handoff", help="Optional original human target text; never automatic factual judgments")
-    for command in (imp, index, run, demo, inventory, batch, handoff, public, review, package, plan, score, pending, audit):
+    costs = commands.add_parser("costs", help="Saved A/B/C costs by Qwen/Jina role; no inference or image reads")
+    costs.add_argument("--run", required=True)
+    costs.add_argument("--questions")
+    for command in (imp, index, run, demo, inventory, batch, handoff, public, review, package, plan, score, pending, audit, costs):
         command.add_argument("--out", required=True)
         command.add_argument("--quiet", action="store_true")
     return root
@@ -138,10 +147,11 @@ def main(argv=None):
             elif args.action == "inventory":
                 result = module("curation").inventory(args.histories, args.out, candidates_path=args.candidates,
                     exposure_path=args.exposure_audit, addresses_path=args.addresses, identity_map=args.identity_map,
-                    exposed_questions=args.exposed_questions)
+                    exposed_questions=args.exposed_questions, qa_policy=args.qa_policy)
             elif args.action == "batch":
                 result = module("curation").batch(args.candidates, args.inventory, args.out, size=args.size,
                     per_building=args.per_building, seed=args.seed, max_overlap=args.max_overlap, cohort=args.cohort,
+                    qa_policy=args.qa_policy,
                     targets=read_json(args.targets) if args.targets else None, exposed_questions=args.exposed_questions)
             elif args.action == "handoff":
                 result = module("curation").handoff(args.bundle, args.out, args.candidates)
@@ -158,7 +168,8 @@ def main(argv=None):
                     identity_map=args.identity_map, exposure_path=args.exposure_audit, exposed_questions=args.exposed_questions,
                     handoff_path=args.handoff, preserved_selection=args.preserved_selection, previous=args.previous,
                     targets=read_json(args.targets) if args.targets else None, per_building=args.per_building, seed=args.seed,
-                    private_audit=args.private_audit, private_audit_supplement=args.private_audit_supplement, progress=progress)
+                    private_audit=args.private_audit, private_audit_supplement=args.private_audit_supplement,
+                    qa_policy=args.qa_policy, size=args.size, archive_coverage_review=args.archive_coverage_review, progress=progress)
             elif args.action == "archive-audit-review":
                 result = importlib.import_module(".2026-11-16_www_private_audit", __package__).export(
                     args.private_audit, args.out, candidates_path=args.candidates, inventory_path=args.inventory,
@@ -168,6 +179,9 @@ def main(argv=None):
                 result = importlib.import_module(".2026-11-16_www_factual", __package__).audit(
                     args.run, args.out, questions_path=args.questions, candidates_path=args.candidates,
                     handoff_path=args.handoff, progress=progress)
+            elif args.action == "costs":
+                result = importlib.import_module(".2026-11-16_www_factual", __package__).audit(
+                    args.run, args.out, questions_path=args.questions, costs_only=True, progress=progress)
             elif args.action == "plan":
                 result = module("evaluation").plan(args.questions, args.answers, args.inventory, load_config(args.config), args.out,
                     archive_index=args.archive_index, allow_empty_archive=args.allow_empty_archive,

@@ -241,6 +241,9 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
         if not candidates_path or handoff.get("source_candidates_sha256") != sha256(candidates_path):
             raise ValueError("Private audit editor must preserve human decisions against their exact original candidate bytes")
     inventory = qa.read_bound(inventory_path, fingerprints) if inventory_path else {}
+    rgb = importlib.import_module(".2026-11-16_www_rgb_policy", __package__)
+    rgb_protocol = inventory.get("qa_policy", {}).get("id") == rgb.POLICY
+    split_policy = rgb.CROSS_SPLIT_POLICY if rgb_protocol else CROSS_SPLIT_POLICY
     corpus = archive.validate_package(qa.read_bound(archive_corpus, fingerprints), Path(archive_corpus).resolve().parent, fingerprints) if archive_corpus else None
     journal = new_run(out, {"private_package": str(Path(package).resolve()),
         "private_supplement": str(Path(supplement_path).resolve()) if supplement_path else None,
@@ -305,7 +308,8 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
                 "candidate_link": linked, "identity_review_pending": any(identities.pending(b) for b in buildings),
                 "building_group": row.get("building_group"), "category": row.get("category"),
                 "original_splits": splits, "eligible": None, "inventory_views": views,
-                "cross_split_consequence": "same_building confirmation blocks BOTH development and evaluation selection; guard unchanged" if len(splits) > 1 else None,
+                "cross_split_consequence": (split_policy if rgb_protocol else "same_building confirmation blocks BOTH development and evaluation selection; guard unchanged") if len(splits) > 1 else None,
+                "qa_development_evaluation_overlap": any(v.get("qa_development_evaluation_overlap") for v in views),
                 "event_category": row.get("event_category", "unreviewed"), "question_scope": row.get("question_scope", "unreviewed"),
                 "panels": checked}
             panels = []
@@ -354,7 +358,7 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
                 identity_map=identity_map, handoff_path=handoff_path, previous=previous, progress=progress)
         write_static_gallery(journal.out, "PRIVATE — pending archive correspondence and unresolved candidates", sections, notes=[
             "All proposals remain pending, independently of batch eligibility. No aliases, labels or splits are approved here.",
-            CROSS_SPLIT_POLICY,
+            split_policy,
             "Boxes belong to the exact registered image/SHA, not just an evidence ID. No cross-image transfer is performed.",
             "Earliest among supplied observations and earliest supported within the frozen collection are different question scopes.",
             "Architectural alterations are not automatically damage or repair. Use the existing question editor after resolving the exact candidate."])
@@ -365,7 +369,7 @@ def export(package, out, *, candidates_path=None, inventory_path=None, archive_c
             "supplement_files": len(supplement_files), "supplemental_coordinates_applied": False,
             "unresolved_candidate_links": sum(i["candidate_link"]["question_id"] is None for i in items),
             "cross_split_review_rows": sum(i["cross_split_consequence"] is not None for i in items),
-            "cross_split_policy": CROSS_SPLIT_POLICY,
+            "cross_split_policy": split_policy,
             "different_public_assets": sum(p["public_binding"] == "different_public_asset_no_coordinate_transfer" for i in items for p in i["panels"]),
             "invalid_panels": sum(p["box_validation"] == "error" for i in items for p in i["panels"]),
             "archive_corpus_sha256": result["archive_corpus_sha256"], "linked_candidate_review": linked_review,

@@ -78,6 +78,7 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
         "inventory_sha256": sha256(inventory_path), "execution_contract_sha256": digest(contract)}, "www_cohort_freeze")
     try:
         payload = qa._private("www_cohort_plan", created_at=datetime.now(timezone.utc).isoformat(),
+            qa_preparation_policy=inv.get("qa_policy", {"id": curation.rgb_policy.LEGACY}),
             questions_sha256=sha256(questions_path), answers_sha256=sha256(answers_path), inventory_sha256=sha256(inventory_path),
             execution_contract=contract, archive_corpus_sha256=corpus_sha, cases=members,
             aggregation_protocol=AGGREGATION, input_sha256=fingerprints.files)

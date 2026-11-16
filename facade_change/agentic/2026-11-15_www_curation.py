@@ -26,6 +26,7 @@ from .store import temporal_value
 qa = importlib.import_module(".2026-11-10_questions", __package__)
 runner = importlib.import_module(".2026-11-15_www_runner", __package__)
 identity = runner.archive.identity
+rgb_policy = importlib.import_module(".2026-11-16_www_rgb_policy", __package__)
 REVIEW_TARGETS = {"earliest_evidence": 40, "visible_change": 30, "stability": 20, "insufficient_evidence": 10}
 REVIEW_FAMILIES = {"earliest_damage": "earliest_evidence", "possible_change": "visible_change",
                   "stable_control": "stability", "uncertain_control": "insufficient_evidence"}
@@ -44,7 +45,8 @@ def csv_rows(path, rows):
 
 
 def inventory(histories, out, *, candidates_path=None, exposure_path=None, addresses_path=None,
-              identity_map=None, exposed_questions=()):
+              identity_map=None, exposed_questions=(), qa_policy=rgb_policy.LEGACY):
+    policy = rgb_policy.contract(qa_policy)
     root, fingerprints = Path(histories).resolve(), Fingerprints()
     identities = identity.Identities(identity_map, fingerprints)
     exposed = {}
@@ -61,7 +63,8 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
         raise ValueError("Expected an explicit www_exposure_audit; unknown exposure is not untouched evaluation")
     audits = {r["building_id"]: r for r in exposure.get("buildings", [])}
     for row in audits.values():
-        if row.get("cohort") == "evaluation":
+        if (row.get("cohort") == "evaluation" or qa_policy == rgb_policy.POLICY and
+                exposure.get("exposure_domain") == "rgb_qa" and row.get("prior_exposure") == "none_found"):
             protocol_source = exposure.get("protocol_source", {})
             if not protocol_source.get("path") or protocol_source.get("sha256") != exposure.get("protocol_sha256"):
                 raise ValueError("Evaluation exposure audit needs the actual frozen protocol file/hash")
@@ -83,7 +86,7 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
                     "sha256": manifest_sha, "field": f"views[{index}].anchor.address"},
                 "verification": anchor.get("address_status", "source_metadata_not_independently_verified")}
     journal = new_run(out, {"history_manifest_sha256": manifest_sha, "exposure_audit": exposure,
-        "candidate_sha256": sha256(candidates_path) if candidates_path else None}, "www_cpu_inventory")
+        "qa_policy": policy, "candidate_sha256": sha256(candidates_path) if candidates_path else None}, "www_cpu_inventory")
     try:
         (journal.out / "assets").mkdir()
         groups, preview_cache, originals, owners = defaultdict(list), {}, {}, defaultdict(set)
@@ -117,6 +120,7 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
                     refs.append(ref)
             if any(r["status"] != "verified_bytes" for r in refs):
                 reasons.append("some_original_frames_unavailable_for_identity_audit")
+            technical_reasons = list(reasons)
             audit = audits.get(building, {})
             aliases = sorted(name for name in set(audits) | set(exposed) if identities.physical(name) == identities.physical(building))
             alias_exposure = [source for name in aliases for source in exposed.get(name, [])]
@@ -156,15 +160,23 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
                 "known_exposure_manifests": alias_exposure,
                 "reviewed_alias_exposure_audits": {name: audits[name] for name in aliases if name in audits},
                 "eligible": eligible, "exclusion_reasons": reasons}
+            if qa_policy == rgb_policy.POLICY:
+                row.update(technical_exclusion_reasons=technical_reasons,
+                    original_sha_cross_physical_building=any(len({b for b, s in owners[r["image_sha256"]]}) > 1 for r in observations))
             rows.append(row)
             sections.append({"title": str(building) + " / " + str(view), "caption": json.dumps(row, ensure_ascii=False),
                 "panels": [{"src": preview, "label": "Original-frame preview; full bytes referenced in inventory"}] if preview else []})
         audited = {name for name, row in audits.items() if row.get("cohort") == "evaluation" and
                    row.get("prior_exposure") == "none_found" and row.get("reviewer") and row.get("audit_sources") and exposure.get("protocol_sha256")}
-        identities.annotate_inventory(rows, audited_buildings=audited)
+        if qa_policy == rgb_policy.POLICY:
+            rgb_policy.annotate_inventory(rows, identities, exposure, exposed)
+        else:
+            identities.annotate_inventory(rows, audited_buildings=audited)
         for section, row in zip(sections, rows):
             section["caption"] = json.dumps(row, ensure_ascii=False)
         result = {"schema_version": 1, "kind": "www_history_inventory", "history_manifest_sha256": manifest_sha,
+            "qa_policy": policy, "physical_building_ids": {b: identities.physical(b) for b in
+                set(identities.by_id) | {r["building_id"] for r in rows} if b},
             "identity_source": identities.source,
             "candidate_sha256": sha256(candidates_path) if candidates_path else None, "views": rows,
             "unexported_frames": [{"building_id": v["building_id"], "view_id": v["view_id"],
@@ -179,11 +191,18 @@ def inventory(histories, out, *, candidates_path=None, exposure_path=None, addre
         fingerprints.verify()
         counts = Counter(r["cohort"] for r in rows)
         summary = {"status": "completed", "tracks": len(document["tracks"]), "views": len(rows),
+            "qa_policy": policy,
             "buildings": len({r["building_id"] for r in rows if r["building_id"]}), "views_by_cohort": dict(counts),
             "physical_buildings": len({r["physical_building_id"] for r in rows if r["physical_building_id"]}),
             "eligible_views": sum(r["eligible"] for r in rows), "excluded_views": sum(not r["eligible"] for r in rows),
             "exclusion_reasons": dict(Counter(reason for r in rows for reason in r["exclusion_reasons"])),
             "report_path": str(journal.out / "gallery.html")}
+        if qa_policy == rgb_policy.POLICY:
+            summary.update(original_splits=dict(Counter(r["split"] for r in rows)),
+                qa_exposure=dict(Counter(r["qa_exposure_status"] for r in rows)),
+                evaluation_eligible_views=sum(r["evaluation_eligible"] for r in rows),
+                segmentation_split_overlap_buildings=len({r["physical_building_id"] for r in rows if r["segmentation_split_overlap"]}),
+                qa_partition_overlap_buildings=len({r["physical_building_id"] for r in rows if r["qa_development_evaluation_overlap"]}))
         write_json(journal.out / "summary.json", summary)
         complete_run(journal, "completed", summary=summary)
         return summary
@@ -209,7 +228,17 @@ def same_event_candidate(a, b, max_overlap):
 
 
 def select_batch(cases, inventory_document, *, size=100, per_building=12, seed="2026-11-15-www-v1", max_overlap=.5,
-                 cohort="development", targets=None, excluded_cases=()):
+                 cohort=None, targets=None, excluded_cases=(), qa_policy=None):
+    policy = qa_policy or inventory_document.get("qa_policy", {}).get("id", rgb_policy.LEGACY)
+    rgb_policy.contract(policy)
+    if policy != inventory_document.get("qa_policy", {}).get("id", rgb_policy.LEGACY):
+        raise ValueError("Selection policy must match the recorded inventory; create a new inventory")
+    cohort = cohort or ("all" if policy == rgb_policy.POLICY else "development")
+    if policy == rgb_policy.POLICY:
+        if targets is not None and (set(targets) != set(REVIEW_TARGETS) or any(type(v) is not int or v < 0 for v in targets.values())):
+            raise ValueError("Reference mix must contain four nonnegative counts; it is not a quota")
+        return rgb_policy.select(cases, inventory_document, size=size, per_building=per_building, seed=seed,
+            max_overlap=max_overlap, cohort=cohort, excluded_cases=excluded_cases, families=REVIEW_FAMILIES, same_event=same_event_candidate)
     if size < 1 or per_building < 1 or not 0 <= max_overlap <= 1 or cohort not in {"development", "evaluation"}:
         raise ValueError("Invalid frozen batch selection limits")
     views = {(r["building_id"], r["view_id"]): r for r in inventory_document["views"]}
@@ -274,14 +303,19 @@ def batch(candidates_path, inventory_path, out, *, exposed_questions=(), **optio
     for path in exposed_questions:
         old_cases.extend(qa.validate_public(qa.read_bound(path, fingerprints))["questions"])
     selected, excluded = select_batch(candidates["candidates"], inv, excluded_cases=old_cases, **options)
+    policy = inv.get("qa_policy", {"id": rgb_policy.LEGACY})
     journal = new_run(out, {"candidate_sha256": sha256(candidates_path), "inventory_sha256": sha256(inventory_path), **options}, "www_batch")
     try:
         result = qa._private("www_question_selection", candidate_sha256=sha256(candidates_path),
+            qa_policy=policy,
             question_ids=[r["question_id"] for r in selected], excluded=excluded, policy={**options,
                 "order": "round robin building/family; most dates/span first; SHA256(seed,question_id) ties",
                 "physical_event_deduplication": "same-anchor/view/date overlap suppression; physical event_id still requires human review"},
             identity_source=inv.get("identity_source"), selected_at=datetime.now(timezone.utc).isoformat(),
             provisional_targets={r["question_id"]: REVIEW_FAMILIES.get(r["candidate_type"]) for r in selected}, input_sha256=fingerprints.files)
+        if policy["id"] == rgb_policy.POLICY:
+            result["policy"]["order"] = policy["selection"]
+            result["policy"]["hard_category_quotas"] = False
         write_json(journal.out / "selection.private.json", result)
         summary = {"status": "completed", "selected": len(selected), "buildings": len({r["building_id"] for r in selected}),
             "candidate_families": dict(Counter(r["candidate_type"] for r in selected)), "approved": 0,
@@ -294,6 +328,21 @@ def batch(candidates_path, inventory_path, out, *, exposed_questions=(), **optio
             provisional_target_counts=dict(counts), target_shortfalls={k: max(0, v-counts[k]) for k, v in (targets or {}).items()},
             target_semantics="review sampling targets only, never imposed answer labels")
         summary["eligibility_reasons"] = dict(Counter(reason for row in excluded for reason in row.get("details", [])))
+        summary["qa_policy"] = policy
+        if policy["id"] == rgb_policy.POLICY:
+            composition = rgb_policy.composition(selected, inv, REVIEW_FAMILIES)
+            budgets = [rgb_policy.image_budget(c) for c in candidates["candidates"]]
+            write_json(journal.out / "composition.private.json", qa._private("www_rgb_qa_composition", **composition,
+                excluded=excluded, image_budget=budgets, selection_sha256=sha256(journal.out / "selection.private.json")))
+            csv_rows(journal.out / "composition.private.csv", composition["cases"])
+            csv_rows(journal.out / "image-budget.private.csv", budgets)
+            summary.update(distributions=composition["distributions"], building_types=composition["building_types"],
+                target_shortfalls={}, hard_category_quotas=False,
+                reference_mix_deviation={k: counts[k]-v for k, v in (targets or REVIEW_TARGETS).items()},
+                image_budget_compatible=sum(r["compatible"] for r in budgets),
+                image_budget_incompatible=sum(not r["compatible"] for r in budgets),
+                image_budget_reasons=dict(Counter(reason for r in budgets for reason in r["reasons"])),
+                report_path=str(journal.out / "composition.private.json"))
         write_json(journal.out / "summary.json", summary)
         fingerprints.verify()
         complete_run(journal, "completed", summary=summary)
@@ -379,6 +428,7 @@ def selected_cases(candidates_path, selection_path, fingerprints):
 def public_candidates(candidates_path, selection_path, out, *, limit=None, knowledge_cutoff=None):
     fingerprints = Fingerprints()
     _, rows = selected_cases(candidates_path, selection_path, fingerprints)
+    selection_policy = qa.read_bound(selection_path, fingerprints).get("qa_policy")
     if limit is not None and limit < 1:
         raise ValueError("Smoke subset limit must be positive")
     if limit is None:
@@ -410,6 +460,9 @@ def public_candidates(candidates_path, selection_path, out, *, limit=None, knowl
     try:
         payload = qa.validate_public({"schema_version": 1, "kind": "facade_qa_questions", "protocol": qa.PROTOCOL,
             "questions": public, "retrieval_contract": {"encoder": "jina-clip-v2", "comparison_variants": list(runner.CONDITIONS)}})
+        if selection_policy and selection_policy["id"] == rgb_policy.POLICY:
+            payload["retrieval_contract"]["qa_preparation_policy"] = {"id": selection_policy["id"], "sha256": digest(selection_policy)}
+            qa.validate_public(payload)
         write_json(journal.out / "questions.json", payload)
         write_json(journal.out / "selection.json", {"selected_question_ids": [r["question_id"] for r in chosen],
             "omitted_question_ids": [r["question_id"] for r in rows if r not in chosen],
@@ -599,20 +652,27 @@ def review_page(candidates_path, selection_path, out, *, handoff_path=None, prev
 def review_package(candidates_path, histories, archive_corpus, out, *, identity_map=None, exposure_path=None,
                    exposed_questions=(), handoff_path=None, preserved_selection=None, previous=None,
                    targets=None, per_building=12, seed="2026-11-16-www-review-v1", private_audit=None,
-                   private_audit_supplement=None, progress=None):
+                   private_audit_supplement=None, qa_policy=rgb_policy.LEGACY, size=None,
+                   archive_coverage_review=None, progress=None):
     """CPU orchestration of the existing inventory/batch/editor; never reads model outcomes."""
     if private_audit_supplement and not private_audit:
         raise ValueError("--private-audit-supplement requires the original --private-audit gallery package")
     targets = dict(REVIEW_TARGETS if targets is None else targets)
+    policy = rgb_policy.contract(qa_policy)
+    requested = (100 if qa_policy == rgb_policy.POLICY else sum(targets.values())) if size is None else size
+    if qa_policy == rgb_policy.LEGACY and (not archive_corpus or requested != sum(targets.values())):
+        raise ValueError("Legacy review-package retains its archive and target-count contract")
     if bool(handoff_path) != bool(preserved_selection):
         raise ValueError("Preserve the original human handoff together with its bound selection")
     fingerprints = Fingerprints()
     fingerprints.add(candidates_path)
-    fingerprints.add(archive_corpus)
-    journal = new_run(out, {"candidate_sha256": sha256(candidates_path), "archive_corpus_sha256": sha256(archive_corpus),
-        "targets": targets, "per_building": per_building, "seed": seed,
+    if archive_corpus:
+        fingerprints.add(archive_corpus)
+    journal = new_run(out, {"candidate_sha256": sha256(candidates_path), "archive_corpus_sha256": sha256(archive_corpus) if archive_corpus else None,
+        "qa_policy": policy, "size": requested, "targets": targets, "per_building": per_building, "seed": seed,
         "selection_basis": "public inputs and annotation drafting families before new model outcomes"}, "www_review_package", progress)
     try:
+        write_json(journal.out / "qa-policy.json", policy)
         if identity_map:
             identity.Identities(identity_map, fingerprints)
             shutil.copyfile(identity_map, journal.out / "identity-review.json")
@@ -636,11 +696,19 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
             exposed_paths.append(journal.out / "preserved-public/questions.json")
         journal.event("review_stage", stage="инвентаризация identity, split и прежней экспозиции")
         inventory(histories, journal.out / "inventory", candidates_path=candidates_path,
-            exposure_path=exposure_path, identity_map=identity_path, exposed_questions=exposed_paths)
-        journal.event("review_stage", stage="отбор новых вопросов по целевым квотам до просмотра ответов моделей")
+            exposure_path=exposure_path, identity_map=identity_path, exposed_questions=exposed_paths, qa_policy=qa_policy)
+        journal.event("review_stage", stage="отбор новых вопросов по физическим зданиям и типам до просмотра ответов моделей")
         selected = batch(candidates_path, journal.out / "inventory/inventory.json", journal.out / "batch",
-            size=sum(targets.values()), targets=targets, per_building=per_building, seed=seed, max_overlap=.5,
-            cohort="development", exposed_questions=exposed_paths)
+            size=requested, targets=targets, per_building=per_building, seed=seed, max_overlap=.5,
+            cohort="all" if qa_policy == rgb_policy.POLICY else "development", exposed_questions=exposed_paths)
+        coverage = None
+        if qa_policy == rgb_policy.POLICY:
+            journal.event("review_stage", stage="отчёт об архивном покрытии: источники, поиск и человеческая полезность отдельно")
+            candidate_document, selected_rows = selected_cases(candidates_path, journal.out / "batch/selection.private.json", fingerprints)
+            coverage = rgb_policy.archive_coverage(candidate_document["candidates"], qa.read_bound(journal.out / "inventory/inventory.json", fingerprints),
+                archive_corpus, identity.Identities(identity_path, fingerprints), fingerprints, archive_coverage_review,
+                selected_ids=[c["question_id"] for c in selected_rows])
+            write_json(journal.out / "archive-coverage.private.json", coverage)
         journal.event("review_stage", stage="экспорт датированных RGB и архивных источников для приватного review")
         reviewed = review_page(candidates_path, journal.out / "batch/selection.private.json", journal.out / "review",
             archive_corpus=archive_corpus, identity_map=identity_path, private_audit=private_audit,
@@ -654,7 +722,11 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
             "review_path": reviewed["report_path"], "preserved_review": preserved,
             "pending_private_audit": reviewed["pending_private_audit"],
             "identity_review": str(identity_path), "report_path": str(journal.out / "index.html"),
-            "full_target_cohort_created": selected["selected"] == sum(targets.values()),
+            "full_target_cohort_created": selected["selected"] == requested,
+            "archive_coverage": {"physical_buildings_with_sources": sum(bool(r["source_evidence_ids"]) for r in coverage["buildings"]),
+                "questions_with_human_confirmed_useful_evidence": sum(bool(r["human_confirmed_useful_ids"]) for r in coverage["questions"] if r["selected"]),
+                "questions_without_human_support_review": sum(r["human_usefulness_status"] == "unreviewed" for r in coverage["questions"] if r["selected"]),
+                "absence_of_sources_is_not_a_selection_exclusion": True} if coverage else None,
             "preserved_cases_scope": "separate original review; not counted toward new provisional targets"}
         write_json(journal.out / "summary.json", summary)
         write_static_gallery(journal.out, "PRIVATE — new review selection and preserved human decisions", [], notes=[
@@ -663,6 +735,8 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
             "identity-review.json is a proposal: review a separate copy, then create a new inventory/selection with that reviewed map.",
             "Archive correspondence proposals are separate from change-event GT. No labels are approved by this exporter."])
         links = '<li><a href="review/review.html">Новые вопросы и архивные источники</a></li>'
+        if coverage:
+            links += '<li><a href="batch/composition.private.json">Состав, исключения и совместимость с шестью изображениями</a></li><li><a href="archive-coverage.private.json">Архив: источники, история поиска и human support отдельно</a></li>'
         if reviewed["pending_private_audit"]:
             links += '<li><a href="review/pending-audit/index.html">Pending-аудит: все предложения, включая исключённые из batch</a></li>'
         if preserved:
@@ -670,7 +744,8 @@ def review_package(candidates_path, histories, archive_corpus, out, *, identity_
         links += '<li><a href="inventory/gallery.html">Исходные IDs, split и exposure</a></li><li><a href="identity-review.json" download>Копия identity mapping для отдельного review</a></li>'
         (journal.out / "index.html").write_text('<!doctype html><meta charset="utf-8"><title>PRIVATE WWW review</title>'
             '<h1>Приватный review, без автоматических одобрений</h1><ul>' + links + '</ul>'
-            '<p>Квоты — цели просмотра. Недобор не заполняется повторяющимися событиями или неаудированными зданиями.</p>'
+            '<p>' + ('RGB QA: приоритет разнообразию физических зданий; 40/30/20/10 — ориентир, без квот. Unknown QA exposure не означает независимую evaluation.'
+                       if qa_policy == rgb_policy.POLICY else 'Квоты — цели просмотра. Недобор не заполняется повторяющимися событиями или неаудированными зданиями.') + '</p>'
             '<pre>' + html.escape(json.dumps(summary, ensure_ascii=False, indent=2)) + '</pre>', encoding="utf-8")
         fingerprints.verify()
         complete_run(journal, "completed", summary=summary)
