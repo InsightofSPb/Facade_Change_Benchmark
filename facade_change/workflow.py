@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from importlib import import_module
+import json
 import subprocess
 import sys
 
@@ -123,6 +124,12 @@ def parser():
         epilog="Use STAGE TASK --help for the existing task options. "
                "See docs/2026-10-24-main-workflow.md for inputs and outputs.")
     stages = result.add_subparsers(dest="stage", required=True)
+    result.add_argument(
+        "--dry-run", action="store_true",
+        help="Print dispatch without importing a backend; place before STAGE")
+    stages.add_parser(
+        "agentic", add_help=False,
+        help="Pair tools, QA, WWW and inspection through the existing agentic CLI")
     for stage, commands in COMMANDS.items():
         group = stages.add_parser(stage, help=STAGES[stage], description=STAGES[stage], allow_abbrev=False)
         tasks = group.add_subparsers(dest="task", required=True)
@@ -131,9 +138,29 @@ def parser():
     return result
 
 
+def _plan(stage, task, module, arguments):
+    print(json.dumps({
+        "stage": stage, "task": task, "backend": module,
+        "arguments": arguments, "execution": "not_started",
+        "validation": (
+            "dispatch_only; use backend check/preflight "
+            "for data and model compatibility"),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    dry_run = argv[:1] == ["--dry-run"]
+    if dry_run:
+        argv = argv[1:]
     cli = parser()
+    if argv[:1] == ["agentic"]:
+        module = "facade_change.agentic.cli"
+        if dry_run:
+            return _plan("agentic", None, module, argv[1:])
+        result = import_module(module).main(argv[1:])
+        return 0 if result is None else result
     # Only consume the stage/task here: their owner parses every remaining flag,
     # including --help, repeated options and values with spaces, exactly once.
     selected = cli.parse_args(argv[:2])
@@ -148,6 +175,8 @@ def main(argv=None):
         if forbidden:
             cli.error(f"Options belong to a different stage: {', '.join(sorted(forbidden))}")
     forwarded = [*command.prefix, *arguments]
+    if dry_run:
+        return _plan(selected.stage, selected.task, command.module, forwarded)
     if command.legacy_process:
         # These saved-evaluator sources are fingerprinted by frozen analyses.
         # Preserve their no-argument main() and ordinary process exit behavior.

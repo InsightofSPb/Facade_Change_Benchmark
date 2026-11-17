@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from ..history_features import Fingerprints, digest
-from ..io import read_json, sha256, write_json
+from ..io import read_json, sha256, strict_json_decoder, write_json
 from ..visualization import write_static_gallery
 from .config import ROOT
 from .coordinates import REGION_CROP
@@ -248,24 +248,7 @@ def parse_reply(raw, normalizations=None):
             text = text[fence.end():-3].strip()
             changes.append("removed_single_json_fence")
 
-        def unique(pairs):
-            result = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ValueError("Duplicate JSON field: " + key)
-                result[key] = value
-            return result
-
-        def constant(value):
-            raise ValueError("Non-finite JSON number: " + value)
-
-        def finite(value):
-            number = float(value)
-            if not math.isfinite(number):
-                constant(value)
-            return number
-
-        value, end = json.JSONDecoder(object_pairs_hook=unique, parse_constant=constant, parse_float=finite).raw_decode(text)
+        value, end = strict_json_decoder().raw_decode(text)
         tail = text[end:]
         if tail.strip():
             if not fence or any(c not in " \t\r\n`" for c in tail):
@@ -881,7 +864,11 @@ def execution_contract(path, config, archive_sha, conditions, protocol, budgets,
             "choose_action_sha256": digest(ACTION_SYSTEM), "answer_sha256": digest(FINAL_SYSTEM)},
         "agentic_action_protocol": "model-selected retrieve/answer/abstain or complete final; final-only after retrieval cap; all calls charged to unchanged budgets",
         "action_transport_revision": "2026-11-17-null-unused-query-v6",
-        "implementation_sha256": {p.name: sha256(p) for p in source_files},
+        # Keys are relative to agentic/, also for the shared transport decoder.
+        "implementation_sha256": {
+            **{p.name: sha256(p) for p in source_files},
+            "../io.py": sha256(Path(__file__).parents[1] / "io.py"),
+        },
         "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []},
         **({"identity_source": identity_source} if identity_source else {})}
 

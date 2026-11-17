@@ -1,4 +1,4 @@
-"""Reviewed physical identities shared by WWW selection, retrieval and aggregation.
+"""Physical identities shared by WWW, QA and inspection.
 
 Original building/view IDs and split/exposure records are never rewritten.
 Pending aliases are review work, not permission to merge buildings or views.
@@ -18,9 +18,12 @@ def template():
 
 
 class Identities:
-    def __init__(self, path=None, fingerprints=None, expected=None):
+    def __init__(self, path=None, fingerprints=None, expected=None, *,
+                 pending_candidates=False):
         self.source, self.groups, self.by_id = None, [], {}
         if path is None:
+            if pending_candidates:
+                self._pending_candidates()
             return
         path = Path(path).resolve()
         fingerprints.add(path, expected)
@@ -53,7 +56,16 @@ class Identities:
                     raise ValueError("Identity provenance requires a source path and actual SHA-256")
                 fingerprints.add(source["path"], source["sha256"])
             self.groups.append(group)
+        if pending_candidates:
+            self._pending_candidates()
         self.source = {"path": str(path), "sha256": sha256(path)}
+
+    def _pending_candidates(self):
+        # Inspection requires a decision for known pending aliases even when
+        # the supplied review omits them. WWW retains its explicit-map policy.
+        for group in template()["groups"]:
+            for name in group["building_ids"]:
+                self.by_id.setdefault(name, group)
 
     def physical(self, building):
         group = self.by_id.get(building)
@@ -65,6 +77,19 @@ class Identities:
     def candidate_members(self, building):
         group = self.by_id.get(building)
         return group["building_ids"] if group and group["decision"] != "distinct" else [building]
+
+    def problem(self, building, tracks, *, require_members=True):
+        if self.pending(building):
+            return "physical_identity_review_pending"
+        members = set(self.candidate_members(building))
+        found = {r["building_id"] for r in tracks if r["building_id"] in members}
+        if require_members and found != members:
+            return "physical_identity_member_missing_from_history_audit"
+        splits = {r["split"] for r in tracks
+                  if self.physical(r["building_id"]) == self.physical(building)}
+        if len(splits) > 1:
+            return "physical_building_crosses_original_splits"
+        return None
 
     def compatible(self, record, question):
         # Building identity never implies that a different known view is comparable.

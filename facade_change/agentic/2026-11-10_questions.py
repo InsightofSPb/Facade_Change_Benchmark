@@ -494,7 +494,7 @@ def validate_public(document):
     return document
 
 
-def export(review_path, out, *, question_ids=None):
+def export(review_path, out, *, question_ids=None, preserve_selection_order=False):
     fingerprints = Fingerprints()
     _verify_recorded_artifacts(Path(review_path).resolve().parent, fingerprints.files)
     reviewed = read_bound(review_path, fingerprints)
@@ -504,19 +504,29 @@ def export(review_path, out, *, question_ids=None):
         fingerprints.add(item["path"], item["sha256"])
     fingerprints.add(reviewed["candidates_path"], reviewed["candidate_sha256"])
     candidates = _load_candidates(reviewed["candidates_path"], fingerprints)
-    selected = set(question_ids) if question_ids is not None else None
+    selected_ids = set(question_ids) if question_ids is not None else None
     approved = {key for key, state in reviewed["states"].items() if state.get("status") == "approved"}
-    if selected is not None and (not selected or not selected <= approved):
-        raise ValueError("Export selection must contain only existing human-approved question IDs")
+    lookup = {row["question_id"]: row for row in candidates["candidates"]}
+    if selected_ids is not None and (
+            not selected_ids or len(selected_ids) != len(question_ids)
+            or not selected_ids <= approved or not selected_ids <= set(lookup)):
+        raise ValueError("Subset IDs must be distinct existing human-approved question IDs")
+    if preserve_selection_order and question_ids is not None:
+        selected = [lookup[qid] for qid in question_ids]
+    else:
+        selected = [row for row in candidates["candidates"]
+                    if selected_ids is None or row["question_id"] in selected_ids]
     journal = new_run(out, {"review": str(Path(review_path).resolve()), "review_sha256": sha256(review_path),
-                           "selected_question_ids": sorted(selected) if selected is not None else None}, "facade_qa_export")
+                           "selected_question_ids": sorted(selected_ids) if selected_ids is not None else None}, "facade_qa_export")
     try:
         questions, labels = [], []
-        for case in candidates["candidates"]:
+        for case in selected:
             decision = reviewed["states"].get(case["question_id"], {})
-            if decision.get("status") != "approved" or selected is not None and case["question_id"] not in selected:
+            if decision.get("status") != "approved":
                 continue
             label = _checked_label(case, decision["label"], fingerprints)
+            if question_ids is not None and label != decision["label"]:
+                raise ValueError("Subset export cannot normalize or change the approved label")
             for observation in case["observations"]:
                 for name in ("rgb", "support"):
                     fingerprints.add(observation[name + "_path"], observation[name + "_sha256"])
@@ -532,6 +542,14 @@ def export(review_path, out, *, question_ids=None):
         private = _private("facade_qa_answers", model_manifest_sha256=sha256(journal.out / "questions.json"),
             review_source={"path": str(Path(review_path).resolve()), "sha256": sha256(review_path)}, cases=labels)
         write_json(journal.out / "answers.private.json", private)
+        if question_ids is not None:
+            write_json(journal.out / "selection.private.json", _private(
+                "facade_qa_subset", question_ids=[row["question_id"] for row in questions],
+                order="explicit_allowlist" if preserve_selection_order else "candidate_order",
+                review_source=private["review_source"],
+                candidate_source={"path": reviewed["candidates_path"], "sha256": reviewed["candidate_sha256"]},
+                questions_sha256=private["model_manifest_sha256"],
+                answers_sha256=sha256(journal.out / "answers.private.json")))
         fingerprints.verify()
         summary = {"status": "completed", "approved_questions": len(questions), "protocol": PROTOCOL,
                    "model_manifest": str(journal.out / "questions.json"), "private_labels": str(journal.out / "answers.private.json")}

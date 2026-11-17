@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import subprocess
@@ -25,6 +26,33 @@ def sha256(path: str | Path) -> str:
 
 def read_json(path: str | Path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def strict_json_decoder():
+    """Decode untrusted JSON without duplicate keys or non-finite numbers.
+
+    Transport wrappers, text limits and response schemas belong to callers.
+    Ordinary saved-file reads retain their existing compatibility contract.
+    """
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON field: " + key)
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError("Non-finite JSON number: " + value)
+
+    def finite(value):
+        number = float(value)
+        if not math.isfinite(number):
+            constant(value)
+        return number
+
+    return json.JSONDecoder(object_pairs_hook=unique, parse_constant=constant,
+                            parse_float=finite)
 
 
 def sync_directory(path: str | Path) -> None:

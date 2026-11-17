@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,33 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkflowCLITests(unittest.TestCase):
+    def test_agentic_route_keeps_backend_arguments_and_exit_status(self):
+        backend = Mock()
+        backend.main.return_value = 3
+        arguments = ["www", "run", "--questions", "path with spaces", "--out", "new"]
+        with patch.object(workflow, "import_module", return_value=backend) as load:
+            self.assertEqual(cli.main(["workflow", "agentic", *arguments]), 3)
+        load.assert_called_once_with("facade_change.agentic.cli")
+        backend.main.assert_called_once_with(arguments)
+
+    def test_dry_run_never_imports_or_executes_backend(self):
+        for arguments, expected in (
+                (["benchmark", "real", "--prepared", "missing", "--out", "new"],
+                 ["run", "--prepared", "missing", "--out", "new"]),
+                (["agentic", "inspection", "run", "--out", "new"],
+                 ["inspection", "run", "--out", "new"]),
+                (["benchmark", "metrics", "--run", "saved", "--out", "new"],
+                 ["--run", "saved", "--out", "new"])):
+            with self.subTest(arguments=arguments), \
+                    patch.object(workflow, "import_module") as load, \
+                    patch.object(workflow.subprocess, "run") as run, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(workflow.main(["--dry-run", *arguments]), 0)
+            self.assertEqual(json.loads(output.getvalue())["arguments"], expected)
+            self.assertEqual(json.loads(output.getvalue())["execution"], "not_started")
+            load.assert_not_called()
+            run.assert_not_called()
+
     def test_stage_help_is_lazy_and_invalid_stage_never_loads_models(self):
         for argv, expected in ((["--help"], 0), (["prepare", "--help"], 0),
                                (["train", "--help"], 0), (["unknown", "dataset"], 2)):
@@ -86,8 +114,8 @@ class WorkflowSyntheticTests(unittest.TestCase):
             self.assertEqual(cli.main(["workflow", "prepare", "synthetic", "--crop-run", str(fixture.parent),
                                        "--config", str(fixture.config), "--out", str(data)]), 0)
             self.assertEqual(cli.main(["workflow", "benchmark", "synthetic", "--dataset-run", str(data),
-                                       "--methods", "rgb_diff", "--out", str(result)]), 0)
-            run_hypothesis_benchmark(data, legacy, methods=["rgb_diff"])
+                                       "--methods", "rgb_diff", "ssim", "--out", str(result)]), 0)
+            run_hypothesis_benchmark(data, legacy, methods=["rgb_diff", "ssim"])
         self.assertEqual(read_json(result / "threshold_selection.json"), read_json(legacy / "threshold_selection.json"))
         new_rows, old_rows = (read_json(p / "metrics.json")["cases"] for p in (result, legacy))
         keys = ("method", "case_id", "building_id", "split", "threshold", "tp", "fp", "fn", "tn",
@@ -101,11 +129,18 @@ class WorkflowSyntheticTests(unittest.TestCase):
 
 def load_tests(loader, tests, pattern):
     # unittest discovery skips ISO-dated filenames because '-' is not an identifier.
-    path = Path(__file__).with_name("test_2026-11-04_history_benchmark.py")
-    spec = importlib.util.spec_from_file_location("canonical_history_benchmark_tests", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    tests.addTests(loader.loadTestsFromModule(module))
+    filenames = (
+        "test_2026-11-04_history_benchmark.py",
+        "test_2026-11-10_inspection.py",
+        "test_2026-11-16_inspection.py",
+        "test_2026-11-16_resource_verification.py",
+    )
+    for filename in filenames:
+        path = Path(__file__).with_name(filename)
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tests.addTests(loader.loadTestsFromModule(module))
     return tests
 
 

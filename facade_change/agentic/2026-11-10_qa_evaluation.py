@@ -238,6 +238,7 @@ def _aggregate(questions, labels, predictions, thresholds):
         status = prediction["status"]
         assessment = label["assessment"]
         cases.append({"question_id": identifier, "building_id": case["building_id"], "assessment": assessment,
+            "physical_building_id": case.get("physical_building_id", case["building_id"]),
             "status": status, "decision": prediction.get("decision"), "available_predictions": len(prediction["regions"]),
             "error": prediction.get("error"),
             "supplied_predictions": prediction["supplied_prediction_count"], "ranking_source": prediction["ranking_source"],
@@ -309,6 +310,8 @@ def approved_cohort(questions_path, answers_path, fingerprints):
     reviewed = _file(review_source["path"], fingerprints, review_source["sha256"])
     if private.get("model_manifest_sha256") != model_sha:
         raise ValueError("Answers must bind the identical fixed model-question cohort")
+    for item in reviewed["history"]:
+        fingerprints.add(item["path"], item["sha256"])
     questions = {r["question_id"]: r for r in public["questions"]}
     if len(private["cases"]) != len(questions) or {r["question_id"] for r in private["cases"]} != set(questions):
         raise ValueError("Private answers must cover the exact approved cohort once")
@@ -316,6 +319,8 @@ def approved_cohort(questions_path, answers_path, fingerprints):
     candidates = {r["question_id"]: r for r in qa._load_candidates(reviewed["candidates_path"], fingerprints)["candidates"]}
     labels = {}
     for row in private["cases"]:
+        if row["building_id"] != questions[row["question_id"]]["building_id"]:
+            raise ValueError("Private answer building ownership differs from the public question")
         if row["review"].get("status") != "approved" or not row["review"].get("reviewer"):
             raise ValueError("Unapproved cases cannot enter scored evaluation")
         if row["review"] != reviewed["states"].get(row["question_id"]):
@@ -352,7 +357,12 @@ def evaluate(questions_path, answers_path, predictions_path, out, thresholds=(.2
     if saved.get("model_manifest_sha256") != model_sha:
         raise ValueError("Answers and predictions must bind the identical fixed model-question cohort")
     questions = {r["question_id"]: r for r in public["questions"]}
-    identities = importlib.import_module(".2026-11-16_www_identity", __package__).Identities(identity_map, fingerprints)
+    identities = importlib.import_module(".2026-11-16_inspection_identity", __package__).Identities(identity_map, fingerprints)
+    if identity_map:
+        for row in questions.values():
+            problem = identities.problem(row["building_id"], list(questions.values()), require_members=False)
+            if problem:
+                raise ValueError(problem)
     questions = {k: {**r, "physical_building_id": identities.physical(r["building_id"])} for k, r in questions.items()}
     predictions = _predictions(saved, questions, Path(predictions_path).resolve().parent, fingerprints)
     protocol = {"k": list(K_VALUES), "iou_thresholds": list(thresholds), "matching": "deterministic_maximum_cardinality_one_to_one",
