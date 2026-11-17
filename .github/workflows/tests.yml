@@ -7,7 +7,8 @@ permissions:
   contents: read
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    # Keep an image with setup-python builds for the supported Python 3.9.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
