@@ -1,4 +1,7 @@
 # Cloud/CI reference versions; do not install into an existing research env before auditing it.
+--extra-index-url https://download.pytorch.org/whl/cpu
+# History preflight/follow-up contract tests require CPU Torch; no model weights.
+torch==2.5.1+cpu
 numpy==2.0.2; python_version < "3.10"
 numpy==2.2.6; python_version >= "3.10"
 Pillow==11.3.0

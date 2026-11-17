@@ -491,5 +491,22 @@ class CachedAnalysisTests(unittest.TestCase):
         self.assertTrue((output / "analysis_contract.json").is_file())
 
 
+def load_tests(loader, suite, pattern):
+    # Standard discovery skips ISO-dated filenames. Keep the existing component
+    # tests together, including the main-workflow memory follow-up regression.
+    import importlib
+
+    paths = sorted(Path(__file__).parent.glob("test_2026-11-08_history_scenarios_*.py"))
+    for filename in (
+            "test_2026-11-06_history_fusion.py",
+            "test_2026-11-08_variability_memory.py",
+            "test_2026-11-08_memory_evaluate.py",
+            "test_2026-11-08_memory_followups.py"):
+        paths.append(Path(__file__).with_name(filename))
+    for path in paths:
+        suite.addTests(loader.loadTestsFromModule(importlib.import_module(path.stem)))
+    return suite
+
+
 if __name__ == "__main__":
     unittest.main()
