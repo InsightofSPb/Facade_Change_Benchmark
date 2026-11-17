@@ -14,6 +14,12 @@ from pathlib import Path
 
 import numpy as np
 
+if __package__:
+    from .real_gt_metrics import _metrics as binary_metrics
+else:
+    # Historical standalone commands also import this sibling outside checkout.
+    from real_gt_metrics import _metrics as binary_metrics
+
 
 METRICS = ("precision", "recall", "f1", "iou", "fpr", "marked_fraction")
 COUNTS = ("tp", "fp", "fn", "tn", "valid_pixels", "positive_pixels", "negative_pixels")
@@ -31,12 +37,9 @@ def _sha256(path):
 
 
 def _metrics(counts):
-    tp, fp, fn, tn = (counts[key] for key in ("tp", "fp", "fn", "tn"))
-    ratio = lambda numerator, denominator: numerator / denominator if denominator else None
-    return dict(precision=ratio(tp, tp + fp) if tp + fp else (0.0 if fn else None),
-                recall=ratio(tp, tp + fn), f1=ratio(2 * tp, 2 * tp + fp + fn),
-                iou=ratio(tp, tp + fp + fn), fpr=ratio(fp, fp + tn),
-                marked_fraction=ratio(tp + fp, tp + fp + fn + tn))
+    total = sum(counts[key] for key in ("tp", "fp", "fn", "tn"))
+    marked = (counts["tp"] + counts["fp"]) / total if total else None
+    return {**binary_metrics(counts), "marked_fraction": marked}
 
 
 def _evaluate(prediction, positive, negative):
