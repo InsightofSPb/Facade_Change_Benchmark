@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "kind": "synthetic_cross_checkout_parity_v2",
+  "status": "passed",
+  "commits": {
+    "baseline": "bf4f4c47e321259a8023812776c21252c006fd27",
+    "candidate": "db262be2e5644b52bd6f0bf681675c3ac1a718dd"
+  },
+  "driver_sha256": "87467fc1305b172866b6d9bf38ef614bb5612b9a4f6ad817ec2f2b760bff8a81",
+  "environment": {
+    "python": "3.12.14",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+    "packages": {
+      "numpy": "2.2.6",
+      "Pillow": "11.3.0",
+      "opencv-python-headless": "4.12.0.88",
+      "scipy": "1.13.1",
+      "torch": "2.5.1+cpu"
+    }
+  },
+  "parameters": {
+    "fixture_source": "bf4f4c47e321259a8023812776c21252c006fd27",
+    "python_hash_seed": 0,
+    "random_seed": 0,
+    "numpy_seed": 0,
+    "numerical_tolerance": 0,
+    "methods": [
+      "rgb_diff",
+      "ssim"
+    ],
+    "model_pool": "ScriptedPool (fake)",
+    "network": "blocked in workers",
+    "gpu": "disabled",
+    "crop_config": {
+      "schema_version": 1,
+      "selection": {
+        "splits": [
+          "train",
+          "val",
+          "test"
+        ],
+        "crops_per_building": 2,
+        "max_buildings_per_split": 0,
+        "min_valid_fraction": 0.95
+      },
+      "states": [
+        "unchanged",
+        "crack",
+        "paint_patch",
+        "self_paste"
+      ],
+      "scenarios": [
+        {
+          "id": "identity",
+          "kind": "identity"
+        },
+        {
+          "id": "shadow",
+          "kind": "shadow",
+          "strength": 0.35
+        },
+        {
+          "id": "occluded",
+          "kind": "occlusion",
+          "rectangle": [
+            0.0,
+            0.0,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    "history": {
+      "seed": 42,
+      "crops_per_building": 1,
+      "max_buildings_per_split": 0,
+      "splits": [
+        "train",
+        "val"
+      ],
+      "final_event": "mixed",
+      "frames_per_history": 5,
+      "selection": "stable SHA ranking on reviewed building and native crop identity; no labels",
+      "label_scope": "known procedural state edits only; not real facade damage or real temporal change ground truth",
+      "geometry": "identity on native RGB crop; no rescaling",
+      "observation_policy": "independent timewise nuisance draws shared by clean/event arms; no blur",
+      "evaluation_target": "step event since preceding latent state, not difference from earliest image",
+      "context_policy": "earliest, previous, all past frames on identical target frames 2–5"
+    },
+    "www_conditions": [
+      "photos_only",
+      "fixed_retrieval",
+      "bounded_agentic_retrieval"
+    ],
+    "www_protocol": {
+      "max_local_images": 6,
+      "max_archive_records": 4,
+      "max_archive_images": 2,
+      "max_retrieval_rounds": 2,
+      "max_event_boxes": 4,
+      "max_query_chars": 500
+    },
+    "www_budgets": {
+      "max_actions": 4,
+      "max_model_calls": 5,
+      "max_images": 8,
+      "max_total_images": 32,
+      "max_input_tokens": 4096,
+      "max_total_input_tokens": 16384,
+      "max_output_tokens": 1024,
+      "max_total_output_tokens": 4096,
+      "max_seconds": 300,
+      "max_invalid_replies": 1,
+      "max_same_action": 1,
+      "history_limit": 3,
+      "retrieval_limit": 5,
+      "max_map_images": 2
+    }
+  },
+  "comparison_scope": {
+    "json": [
+      "rgb/metrics.json",
+      "rgb/threshold_selection.json",
+      "history/manifest.json",
+      "agent/results.json",
+      "score/metrics.private.json",
+      "agent/questions/*/*/exposure.json",
+      "agent/questions/*/*/messages.json",
+      "agent/questions/*/*/calls/*.json",
+      "agent/questions/*/*/retrieval-*.json",
+      "agent/questions/*/*/reply-*.json"
+    ],
+    "binary_sha256": [
+      "rgb/scores/**/*.npy",
+      "rgb/predictions/**/*.png",
+      "rgb/heatmaps/**/*.png",
+      "history/**/*.png",
+      "agent/**/*.png",
+      "agent/**/*.npy"
+    ]
+  },
+  "exclusions": [
+    [
+      "rgb/metrics.json",
+      "cases/*/scoring_seconds",
+      "wall_clock"
+    ],
+    [
+      "agent/results.json",
+      "contract_sha256",
+      "source_contract"
+    ],
+    [
+      "agent/results.json",
+      "results/*/costs/elapsed_seconds",
+      "wall_clock"
+    ],
+    [
+      "agent/results.json",
+      "results/*/costs/calls/*/sha256",
+      "raw_call_hash"
+    ],
+    [
+      "score/metrics.private.json",
+      "input_sha256",
+      "run_provenance"
+    ],
+    [
+      "score/metrics.private.json",
+      "cases/*/costs/elapsed_seconds",
+      "wall_clock"
+    ],
+    [
+      "score/metrics.private.json",
+      "cases/*/costs/calls/*/sha256",
+      "raw_call_hash"
+    ],
+    [
+      "score/metrics.private.json",
+      "summaries/*/*/cost_totals/elapsed_seconds",
+      "wall_clock"
+    ],
+    [
+      "score/metrics.private.json",
+      "summaries/*/*/families/*/cost_totals/elapsed_seconds",
+      "wall_clock"
+    ],
+    [
+      "agent/questions/*/*/exposure.json",
+      "tools/*/result/calls/*/request/timeout_seconds",
+      "remaining_wall_clock"
+    ],
+    [
+      "agent/questions/*/*/calls/*.json",
+      "request/timeout_seconds",
+      "remaining_wall_clock"
+    ],
+    [
+      "agent/questions/*/*/calls/*.json",
+      "request/geometry/www_contract_sha256",
+      "source_contract"
+    ],
+    [
+      "agent/questions/*/*/retrieval-*.json",
+      "result/calls/*/request/timeout_seconds",
+      "remaining_wall_clock"
+    ],
+    [
+      "agent/questions/*/*/reply-*.json",
+      "source_call_sha256",
+      "raw_call_hash"
+    ]
+  ],
+  "path_normalization": "Only absolute output/fixture prefixes become <output>/<fixtures>; list order stays exact.",
+  "limits": "Synthetic contract check, not real-data or model quality. HTML existence only; lifecycle journals and unrelated artifacts are outside comparison_scope.",
+  "comparison": {
+    "status": "passed",
+    "numerical_tolerance": 0,
+    "rgb_rows": 72,
+    "history_sequences": 6,
+    "history_png_files": 56,
+    "agent_outcomes": 15,
+    "exposure_records": 15,
+    "compared_json_artifacts": 91,
+    "compared_binary_artifacts": 233,
+    "immutable_input_files": 299,
+    "inputs_unchanged": true,
+    "fixture_manifest_sha256": "1581675b04eba046595a0a0ad1192177fec8c88cefbaf833c33d8530669dfe61",
+    "normalized_artifacts_sha256": "ed92c093ef878c507c877c686ab01cf3ffb0e2c2b359cdab752551e8ffd095e4"
+  }
+}
