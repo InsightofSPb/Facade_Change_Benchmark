@@ -78,8 +78,8 @@ def plan(questions_path, answers_path, inventory_path, config, out, *, archive_i
                         "evaluation_eligible": view.get("evaluation_eligible", view["cohort"] == "evaluation")})
         if archive:
             archive.eligible(question)
-    if len(conditions) != len(runner.CONDITIONS) or set(conditions) != set(runner.CONDITIONS):
-        raise ValueError("A paired plan must retain all three conditions, in the declared execution order")
+    if not conditions or len(set(conditions)) != len(conditions) or set(conditions) - set(runner.CONDITIONS):
+        raise ValueError("A plan requires distinct supported conditions; pairing needs both predeclared conditions")
     contract = runner.execution_contract(questions_path, config, archive.sha256 if archive else None,
                                          conditions, protocol, budgets, synthetic, identities.source, condition_major)
     journal = new_run(out, {"questions_sha256": sha256(questions_path), "answers_sha256": sha256(answers_path),
@@ -262,6 +262,9 @@ def score(questions_path, answers_path, run_path, plan_path, out):
     _verify_recorded_artifacts(root, fingerprints.files)
     record = qa.read_bound(root / "run.json", fingerprints)
     contract = qa.read_bound(root / "contract.json", fingerprints)
+    conditions = contract["conditions"]
+    if not conditions or len(set(conditions)) != len(conditions) or set(conditions) - set(runner.CONDITIONS):
+        raise ValueError("Unknown/duplicate conditions in the saved execution contract")
     if record.get("status") not in {"completed", "completed_with_errors", "failed", "interrupted"}:
         raise ValueError("Score only a terminal immutable inference run")
     if (plan_doc.get("kind") != "www_cohort_plan" or plan_doc["questions_sha256"] != sha256(questions_path)
@@ -290,7 +293,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
     results = {}
     for result in saved:
         key = (result["question_id"], result["condition"])
-        if key in results or key[0] not in questions or key[1] not in runner.CONDITIONS:
+        if key in results or key[0] not in questions or key[1] not in conditions:
             raise ValueError("Duplicate/unknown saved question-condition; no result-based cohort selection")
         results[key] = result
     journal = new_run(out, {"questions_sha256": sha256(questions_path), "answers_sha256": sha256(answers_path),
@@ -315,7 +318,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                 images.append({"src": path.relative_to(gold_root).as_posix(), "label": "PRIVATE REVIEWED / " + event["event_id"]})
             if images:
                 gold_panels.append({"title": identifier, "caption": "Reviewed events on saved region_crop_pixels; geometric support is not localization accuracy.", "panels": images})
-            for condition in runner.CONDITIONS:
+            for condition in conditions:
                 result = results.get((identifier, condition), {"status": "missing", "answer": None, "costs": {"incomplete": True}}).copy()
                 exposed, tool_ids = {}, set()
                 folder = root / "questions" / identifier / condition
@@ -366,12 +369,16 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                           and (stratum == "all" or r["archival_stratum"])]
                 key = cohort + "/" + stratum
                 summaries[key] = {}
-                for condition in runner.CONDITIONS:
+                for condition in conditions:
                     selected = [r for r in subset if r["condition"] == condition]
                     summaries[key][condition] = {**aggregate(selected), "families": {
                         family: aggregate([r for r in selected if r["family"] == family]) for family in sorted({r["family"] for r in selected})}}
                 paired[key] = []
                 for a, b in PAIRED_CONTRASTS:
+                    if not {a, b} <= set(conditions):
+                        paired[key].append({"contrast": b + " minus " + a, "status": "not_planned_in_this_execution",
+                                            "mean_paired_difference": None, "paired_confidence_intervals": None})
+                        continue
                     observed = {r["condition"] for r in subset if r["status"] != "missing"}
                     if subset and contract.get("execution_order") == "conditions_first" and not {a, b} <= observed:
                         paired[key].append({"contrast": b + " minus " + a, "status": "pending_condition",
@@ -383,7 +390,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
                         "independent_buildings": len(differences), "mean_paired_difference": ratio(sum(differences.values()), len(differences)),
                         "paired_confidence_intervals": paired_intervals(subset, a, b, plan_doc.get("aggregation_protocol", AGGREGATION))})
         localization, localization_strata = {}, {}
-        for condition in runner.CONDITIONS:
+        for condition in conditions:
             wrapped = []
             for identifier in questions:
                 result = normalized[identifier, condition]
@@ -433,7 +440,7 @@ def score(questions_path, answers_path, run_path, plan_path, out):
         curation.csv_rows(journal.out / "structured-cases.private.csv", rows)
         factual.write_blind(journal.out, blind, blind_items, panels, blind_key)
         fingerprints.verify()
-        summary = {"status": "completed", "questions": len(questions), "conditions": list(runner.CONDITIONS),
+        summary = {"status": "completed", "questions": len(questions), "conditions": list(conditions),
             "cohort_condition_rows": len(rows), "report_path": str(journal.out / "gallery.html"),
             "synthetic_fixture": contract["synthetic_fixture"],
             "metrics": str(journal.out / "metrics.private.json"), "statistical_unit": "physical_building"}

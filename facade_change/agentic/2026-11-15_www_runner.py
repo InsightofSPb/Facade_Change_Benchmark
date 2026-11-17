@@ -91,6 +91,25 @@ coordinate_system, bbox_xyxy=[left,top,right,bottom]: четыре конечн�
 Учитывай показанные остатки бюджета. Текстовые совпадения и корректные citation IDs не доказывают истинность вывода.
 """
 
+# Keep A/B's recorded system text unchanged. C receives only the contract for its
+# current stage, with the same factual/evidence rules taken from that text.
+_CHOICE_PARAGRAPH = ("На этапе choose_action выбери retrieve (выполнить поиск), answer (свидетельств достаточно для ответа)\n"
+    "или abstain (обоснованно отказаться). Полный final по публичной схеме также завершает ответ.\n")
+ACTION_SYSTEM = (SYSTEM.split("Верни один компактный JSON", 1)[0]
+    + "Только archival_qa" + SYSTEM.split("Только archival_qa", 1)[1].split("На этапе answer", 1)[0]
+    + 'Сейчас только choose_action. Верни один JSON с type="retrieve", "answer" или "abstain" по action_contract.\n'
+      'query и необязательный observation_id относятся только к retrieve. Для answer достаточно {"type":"answer"}; '
+      'для abstain добавь reason. Не заполняй final, response, response_contract, даты, citations или boxes: '
+      'финальный ответ будет запрошен на отдельном этапе. Учитывай доступные действия и остаток бюджета.\n')
+FINAL_SYSTEM = SYSTEM.replace(_CHOICE_PARAGRAPH, "")
+AGENTIC_PROMPT_REVISION = "2026-11-17-stage-scoped-contract-v6"
+
+
+def stage_system(condition, stage):
+    if condition != "bounded_agentic_retrieval":
+        return SYSTEM
+    return ACTION_SYSTEM if stage == "choose_action" else FINAL_SYSTEM
+
 
 def protocol_config(config, overrides=None):
     values = dict(overrides or {})
@@ -328,6 +347,12 @@ def normalize_action(value, normalizations=None):
     action = value.get("type")
     if not isinstance(action, str) or action not in {"retrieve", "answer", "abstain"}:
         raise ValueError(f"Expected retrieve, answer or abstain; received type={action!r}, fields={sorted(value)}")
+    if action != "retrieve" and "query" in value:
+        if value["query"] is not None:
+            raise ValueError(f"{action}.query must be absent or null; a non-null query conflicts with the chosen action. "
+                             "Choose the intended action explicitly; no automatic retrieval is performed")
+        del value["query"]
+        changes.append("removed_null_query_from_" + action)
     required = {"type", "query"} if action == "retrieve" else {"type", "reason"} if action == "abstain" else {"type"}
     optional = {"reason", "observation_id"} if action == "retrieve" else {"reason"}
     if action == "answer":
@@ -396,6 +421,19 @@ def normalize_final(value, normalizations=None):
             value["boxes"] = []
             changes.append("defaulted_omitted_optional_boxes")
     return value
+
+
+def normalize_stage_reply(value, stage, normalizations=None):
+    """A final at choice time must stay final, never fall through to an action."""
+    final = (value.get("type") == "final" or "final" in value or
+             value.get("stage") == "answer" and "decision" in value)
+    if stage == "answer" or final:
+        value = normalize_final(value, normalizations)
+        if stage == "choose_action" and value.get("type") != "final":
+            raise ValueError(f"An explicit final envelope requires type='final', received {value.get('type')!r}; "
+                             "put an action choice outside final, or provide the complete final answer")
+        return value, "final"
+    return normalize_action(value, normalizations), "action"
 
 
 def validate_answer(value, question, evidence, preparation, common, support_record, protocol, *, normalizations=None):
@@ -603,7 +641,9 @@ def _condition(question, condition, prepared, local, common, support_record, sea
             value["output_instruction"] = (
                 'Выбери действие одним компактным объектом из action_contract с полем type. '
                 'Для retrieve передай query, для abstain — reason. Не возвращай черновик в response_contract: '
-                'полный ответ будет запрошен отдельно после выбора answer или abstain.')
+                'полный ответ будет запрошен отдельно после выбора answer или abstain. '
+                'У answer/abstain query не нужен; если указан, допустим только null. '
+                'Не копируй весь action_contract и не добавляй поля финального ответа.')
             value["selection_rules"] = {
                 "retrieve": ("Для archival_qa запроси необходимые архивные свидетельства; "
                              if question["task"] == "archival_qa" else
@@ -626,6 +666,11 @@ def _condition(question, condition, prepared, local, common, support_record, sea
             if abstention_reason is not None:
                 value["selected_abstention_reason"] = abstention_reason
                 value["required_decisions"] = ["insufficient_data", "incomparable"]
+            if condition == "bounded_agentic_retrieval":
+                value["output_instruction"] += (
+                    ' decision — одна строка из допустимых значений; citations, observation_ids, boxes и limitations — JSON-массивы, '
+                    'date_interval — объект со всеми четырьмя полями или null при отказе. '
+                    'Это значения ответа, не описание схемы. Кавычки внутри строк экранируй по правилам JSON.')
         return value
 
     def persist():
@@ -732,6 +777,7 @@ def _condition(question, condition, prepared, local, common, support_record, sea
                     or costs["budget_images"] + images > budgets["max_total_images"]):
                 raise RuntimeError("QA token/image budget exhausted; context was not silently truncated")
             allowance = control()
+            messages[0]["content"][0]["text"] = stage_system(condition, stage)
             messages.append(_text(json.dumps(allowance, ensure_ascii=False)))
             request = {"op": "generate", "messages": copy.deepcopy(messages), "max_images": budgets["max_images"],
                 "max_input_tokens": min(budgets["max_input_tokens"], remaining_input),
@@ -754,19 +800,14 @@ def _condition(question, condition, prepared, local, common, support_record, sea
             messages.append({"role": "assistant", "content": [{"type": "text", "text": raw}]})
             persist()
             parsing = {"stage": stage, "source_call": costs["calls"][-1]["artifact"], "source_call_sha256": costs["calls"][-1]["sha256"],
+                       "generation": response.get("generation"), "allowed_action": allowance["allowed_action"],
                        "normalizations": [], "parsed": None, "normalized_action": None,
                        "normalized_final": None, "validation_error": None}
             try:
                 value = parse_reply(raw, parsing["normalizations"])
                 parsing["parsed"] = value
-                final_reply = (value.get("type") == "final" or "final" in value or
-                               (value.get("stage") == "answer" and "decision" in value))
-                if stage == "answer" or final_reply:
-                    value = normalize_final(value, parsing["normalizations"])
-                    parsing["normalized_final"] = value
-                else:
-                    value = normalize_action(value, parsing["normalizations"])
-                    parsing["normalized_action"] = value
+                value, reply_kind = normalize_stage_reply(value, stage, parsing["normalizations"])
+                parsing["normalized_" + reply_kind] = value
                 if isinstance(value, dict) and value.get("type") == "final":
                     if abstention_reason is not None and value.get("decision") not in {"insufficient_data", "incomparable"}:
                         raise ValueError("The selected abstention requires insufficient_data or incomparable")
@@ -836,8 +877,10 @@ def execution_contract(path, config, archive_sha, conditions, protocol, budgets,
         "conditions": list(conditions), "protocol": protocol, "budgets": budgets, "config": config,
         "execution_order": "conditions_first" if condition_major else "questions_first",
         "prompt_revision": PROMPT_REVISION, "prompt_sha256": digest(SYSTEM),
+        "agentic_stage_prompts": {"revision": AGENTIC_PROMPT_REVISION,
+            "choose_action_sha256": digest(ACTION_SYSTEM), "answer_sha256": digest(FINAL_SYSTEM)},
         "agentic_action_protocol": "model-selected retrieve/answer/abstain or complete final; final-only after retrieval cap; all calls charged to unchanged budgets",
-        "action_transport_revision": "2026-11-17-consistent-action-discriminators-v5",
+        "action_transport_revision": "2026-11-17-null-unused-query-v6",
         "implementation_sha256": {p.name: sha256(p) for p in source_files},
         "synthetic_fixture": synthetic, "answer_schema": sorted(ANSWER_KEYS), "optional_answer_fields": {"boxes": []},
         **({"identity_source": identity_source} if identity_source else {})}

@@ -50,7 +50,9 @@ class WWWRunnerTest(unittest.TestCase):
                     self.assertTrue(all(r["origin"] == "local_photo" for r in exposed.values()))
         for question in read_json(self.questions)["questions"]:
             messages = [read_json(self.root / "run/questions" / question["question_id"] / c / "messages.json") for c in runner.CONDITIONS]
-            self.assertTrue(all(m[:2] == messages[0][:2] for m in messages))
+            self.assertTrue(all(m[1] == messages[0][1] for m in messages))  # Same public question and RGB.
+            self.assertEqual(messages[0][0], messages[1][0])  # A/B's shared system is unchanged.
+            self.assertEqual(messages[2][0]["content"][0]["text"], runner.FINAL_SYSTEM)
         self.run_fixture("resume", resume_from=self.root / "run")
         self.run_fixture("resume-again", resume_from=self.root / "resume")
         self.assertTrue(all(r["costs"]["model_calls"] == 0 for r in read_json(self.root / "resume/results.json")["results"]))
@@ -97,7 +99,7 @@ class WWWRunnerTest(unittest.TestCase):
             self.assertTrue(all(r["origin"] == "local_photo" for r in exposed["evidence"].values()))
         for question in read_json(self.questions)["questions"]:
             messages = [read_json(self.root / "run/questions" / question["question_id"] / c / "messages.json") for c in modes]
-            self.assertEqual(messages[0][:2], messages[1][:2])  # Same factual instructions, question and RGB.
+            self.assertEqual(messages[0][1], messages[1][1])  # Same question, scope and RGB; C has stage-scoped formatting.
             controls = [json.loads(m[2]["content"][0]["text"]) for m in messages]
             self.assertEqual([c["allowed_action"] for c in controls], ["final", "retrieve_or_decide"])
             self.assertEqual([c["remaining_retrieval_rounds"] for c in controls], [0, 2])
