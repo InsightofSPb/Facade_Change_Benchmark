@@ -19,7 +19,8 @@ BOOTSTRAP = SCRIPT.read_text().split("<<'PY'\n", 1)[1].split("try:\n    lpips_ve
 
 
 class SetupBootstrapTests(unittest.TestCase):
-    def _run(self, available=False, torch_version="2.6.0+cu118", broken=False):
+    def _run(self, available=False, torch_version="2.6.0+cu118", broken=False,
+             python_version=(3, 10, 0)):
         state = {"available": available, "commands": [], "nms_called": False}
         torch = types.ModuleType("torch")
         torch.tensor = lambda values: values
@@ -52,7 +53,10 @@ class SetupBootstrapTests(unittest.TestCase):
             self.assertIn("--no-deps", command)
             state["available"] = True
 
-        with patch.dict(sys.modules, {"torch": torch, "torchvision": torchvision, "torchvision.ops": operations}), \
+        # This fixture models the optional competitor environment (Python 3.10+),
+        # independently of the project's supported CPU test interpreter.
+        with patch.object(sys, "version_info", python_version), \
+                patch.dict(sys.modules, {"torch": torch, "torchvision": torchvision, "torchvision.ops": operations}), \
                 patch.object(metadata, "version", side_effect=versions.__getitem__), \
                 patch.object(importlib, "import_module", side_effect=import_module), \
                 patch("subprocess.run", side_effect=pip), contextlib.redirect_stdout(io.StringIO()):
@@ -71,6 +75,8 @@ class SetupBootstrapTests(unittest.TestCase):
         self.assertEqual(state["commands"], [])
 
     def test_unsupported_core_and_broken_existing_dependency_remain_explicit(self):
+        with self.assertRaisesRegex(SystemExit, "Python >= 3.10"):
+            self._run(python_version=(3, 9, 25))
         with self.assertRaisesRegex(SystemExit, "Torch >= 2.6"):
             self._run(torch_version="1.12.1")
         with self.assertRaisesRegex(ImportError, "installation is broken"):

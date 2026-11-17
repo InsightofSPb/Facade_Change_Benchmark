@@ -8,7 +8,7 @@ permissions:
 jobs:
   tests:
     # Keep an image with setup-python builds for the supported Python 3.9.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
