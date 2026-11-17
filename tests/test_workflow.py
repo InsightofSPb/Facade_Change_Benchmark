@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -97,6 +98,68 @@ class WorkflowCLITests(unittest.TestCase):
             self.assertEqual(workflow.main(["benchmark", "metrics", "--run", "a run", "--out", "new"]), 7)
         run.assert_called_once_with([sys.executable, "-m", "scripts.real_eval.real_gt_metrics",
                                      "--run", "a run", "--out", "new"], check=False)
+
+
+class CrossCheckoutParityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = ROOT / "scripts/2026-11-17-compare-parity.py"
+        spec = importlib.util.spec_from_file_location("cross_checkout_parity", path)
+        cls.parity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.parity)
+
+    def test_only_declared_timing_is_excluded_from_metrics(self):
+        artifact = "rgb/metrics.json"
+        left = {"cases": [{"scoring_seconds": 1.0, "f1": 0.5,
+                           "source_year": 2010, "score_sha256": "original"}]}
+        right = json.loads(json.dumps(left))
+        right["cases"][0]["scoring_seconds"] = 2.0
+        expected = self.parity.normalize(left, artifact, ())
+        self.assertEqual(expected, self.parity.normalize(right, artifact, ()))
+        for key, changed in (("f1", 0.6), ("source_year", 2020),
+                             ("score_sha256", "different")):
+            altered = json.loads(json.dumps(right))
+            altered["cases"][0][key] = changed
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                self.parity.require_equal(
+                    expected, self.parity.normalize(altered, artifact, ()), "metrics")
+
+    def test_full_exposure_preserves_order_geometry_and_pixel_identity(self):
+        artifact = "agent/questions/q/policy/exposure.json"
+        value = {"evidence": {"photo": {
+            "image_sha256": "pixels", "observation_ids": ["2009", "2015"],
+            "geometry": {"crop_shape": [10, 20]}}}, "tools": []}
+        expected = self.parity.normalize(value, artifact, ())
+        for key, replacement in (("image_sha256", "other pixels"),
+                                 ("observation_ids", ["2015", "2009"]),
+                                 ("geometry", {"crop_shape": [20, 10]})):
+            altered = json.loads(json.dumps(value))
+            altered["evidence"]["photo"][key] = replacement
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                self.parity.require_equal(
+                    expected, self.parity.normalize(altered, artifact, ()), "exposure")
+
+    def test_saved_verification_fails_for_modified_added_or_deleted_fixture(self):
+        for mutation in ("modify", "add", "delete"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                fixtures = out / "fixtures"
+                fixtures.mkdir()
+                source = fixtures / "rgb.png"
+                source.write_bytes(b"immutable fixture")
+                self.parity.write(out / "fixture-sha256.json",
+                                  self.parity.file_snapshot(fixtures))
+                self.parity.write(out / self.parity.REPORT, {"commits": {}})
+                if mutation == "modify":
+                    source.write_bytes(b"changed pixels")
+                elif mutation == "add":
+                    (fixtures / "unexpected.png").write_bytes(b"extra")
+                else:
+                    source.unlink()
+                with contextlib.redirect_stderr(io.StringIO()) as error:
+                    status = self.parity.main(["--out", str(out), "--verify-only"])
+                self.assertEqual(status, 1)
+                self.assertIn("fixture mutation", error.getvalue())
 
 
 @unittest.skipUnless(importlib.util.find_spec("cv2"), "OpenCV required for the established RGB fixture")
